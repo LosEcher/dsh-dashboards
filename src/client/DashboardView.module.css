@@ -2,7 +2,8 @@
 
 .root {
   padding: 4px 2px 24px;
-  max-width: 980px;
+  /* 看板用满会话区宽度（列数由 column-width 自适应，宽屏更多列） */
+  max-width: none;
 }
 
 .header {
@@ -39,12 +40,12 @@
   outline-offset: 1px;
 }
 
+/* 瀑布流：CSS 多列（column-width 自动列数）。原生 grid masonry 仅 Firefox
+   支持、Chrome/WebKit 未落地（2026），多列是唯一全浏览器纯 CSS 方案，
+   且对实时刷新友好（无 JS 重排、卡片高度变化不抖动）。 */
 .grid {
-  display: grid;
-  /* min(320px,100%)：窄容器时轨道收缩而非溢出 */
-  grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr));
-  gap: 10px;
-  align-items: start;
+  column-width: 320px;
+  column-gap: 10px;
 }
 
 .card {
@@ -55,6 +56,9 @@
   min-width: 0;
   /* 内容（宽表格）永不溢出到相邻卡片——重叠根因修复 */
   overflow: hidden;
+  /* 瀑布流：卡片不跨列拆断；列内垂直间距用 margin 替代 gap */
+  break-inside: avoid;
+  margin-bottom: 10px;
 }
 
 .cardHeader {
