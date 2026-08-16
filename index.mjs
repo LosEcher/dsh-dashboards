@@ -674,7 +674,8 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/macos') { const s = await macos.get(); if (cfg.macos.enabled && !s.data) await macos.refresh(); sendJson(res, 200, s); return }
         if (method === 'GET' && path === '/dashboards/macos/history') {
           pushHistory(macos.snapshot())
-          sendJson(res, 200, { ts: new Date().toISOString(), points: history.slice(-60) })
+          // 与其它端点同构的 {ts, data, error} 快照包装（client 按 snap.data 取数）
+          sendJson(res, 200, { ts: new Date().toISOString(), data: { points: history.slice(-60) }, error: null })
           return
         }
         if (method === 'GET' && path === '/dashboards/probe') { sendJson(res, 200, await probe.get()); return }

@@ -163,9 +163,9 @@ function NodeMatrix({ data, t }: { data: unknown; t: (k: string) => string }) {
       <tbody>
         {rows.map((n) => (
           <tr key={n.nodeId}>
-            <td>
+            <td className={css.wrap}>
               <span className={css.mono}>{n.nodeId}</span>
-              {n.hostLabel ? <span className={css.muted}> · {n.hostLabel}</span> : null}
+              {n.hostLabel ? <span className={`${css.muted} ${css.hostSub}`}>{n.hostLabel}</span> : null}
             </td>
             <td>
               <span className={css.rowDot}><StateDot state={dot(n.status ?? '?')} size={8} /></span>
