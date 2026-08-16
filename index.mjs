@@ -87,7 +87,7 @@ const DEFAULT_TARGETS = [
   { name: 'kimi-bridge', port: 10086 },
   { name: 'herdr-web', port: 8777 },
   { name: 'node34-forgejo', url: 'http://100.68.106.96:8080' },
-  { name: 'node34-kuma', url: 'http://100.68.106.96:3001' },
+  { name: 'node34-kuma', url: 'http://100.68.106.96:3312' },
 ]
 
 const DEFAULT_WIDGETS = [
@@ -316,6 +316,41 @@ async function collectLosNodes(cfg, tokens) {
   }))
 }
 
+/** ── Kuma 2.x：Prometheus /metrics → monitors（无旧版 /api/v1 REST，Basic auth 取 metrics） ── */
+function parseKumaMetrics(text) {
+  const rows = {}
+  for (const line of text.split('\n')) {
+    const m = line.match(/^(\w+)(?:\{([^}]*)\})?\s+(\S+)$/)
+    if (!m) continue
+    const name = m[1]
+    const labels = {}
+    if (m[2]) {
+      for (const kv of m[2].split(',')) {
+        const eq = kv.indexOf('=')
+        if (eq === -1) continue
+        labels[kv.slice(0, eq)] = kv.slice(eq + 1).replace(/^"|"$/g, '')
+      }
+    }
+    const value = Number(m[3])
+    // 只关心 monitor_* 指标；其它指标（process_*/nodejs_*/http_* 等）无 monitor 标签，跳过避免幻影行
+    if (!name.startsWith('monitor_')) continue
+    const id = labels.monitor_id ?? labels.monitor_name ?? '?'
+    if (!rows[id]) {
+      rows[id] = { id, name: labels.monitor_name ?? id, type: labels.monitor_type ?? null, status: null, latencyMs: null, uptime: null, certDays: null }
+    }
+    if (name === 'monitor_status') rows[id].status = value
+    else if (name === 'monitor_response_time') rows[id].latencyMs = value
+    else if (name === 'monitor_uptime_ratio' && labels.window === '30d') rows[id].uptime = value * 100
+    else if (name === 'monitor_cert_days_remaining') rows[id].certDays = value
+  }
+  const STATUS = { 0: 'down', 1: 'up', 2: 'pending', 3: 'maintenance' }
+  return Object.values(rows).map((r) => ({
+    id: r.id, name: r.name, type: r.type,
+    status: STATUS[r.status] ?? 'unknown',
+    latency: r.latencyMs, uptime: r.uptime, certDays: r.certDays,
+  }))
+}
+
 /** ── macOS 原生探针（零安装，spawnSync 系统命令） ──────────────────── */
 function runSync(cmd, args, timeoutMs = 4000) {
   try {
@@ -533,20 +568,17 @@ export function apply(ctx, config) {
     return { enabled: true, cpu: d.cpu ?? null, mem: d.mem ?? null, load: d.load ?? null, fs: d.fs ?? [], net: d.net ?? null }
   }, cfg.glances.pollMs)
   const kuma = makePoller(async () => {
-    if (!cfg.kuma.enabled) return { enabled: false, reason: 'kuma 未启用（Config.kuma.enabled；Z4Nas 排查完成后配置 url+token）' }
+    if (!cfg.kuma.enabled) return { enabled: false, reason: 'kuma 未启用（Config.kuma.enabled；配置 url+token 后启用）' }
     if (!cfg.kuma.url || !cfg.kuma.token) return { enabled: true, error: 'kuma 缺 url/token' }
-    const res = await fetch(`${cfg.kuma.url.replace(/\/+$/, '')}/api/v1/monitors`, {
-      headers: { Authorization: `Bearer ${cfg.kuma.token}` },
+    // Kuma 2.x 无 /api/v1 REST；唯一鉴权数据端点 = /metrics（Prometheus 文本）。
+    // API key 以 Basic auth 密码传入（username 任意，kuma apiAuthorizer 取 password）。
+    const auth = `Basic ${Buffer.from(`apikey:${cfg.kuma.token}`).toString('base64')}`
+    const res = await fetch(`${cfg.kuma.url.replace(/\/+$/, '')}/metrics`, {
+      headers: { Authorization: auth },
       signal: AbortSignal.timeout(8000),
     })
-    if (!res.ok) return { enabled: true, error: `kuma /api/v1/monitors HTTP ${res.status}` }
-    const d = await res.json()
-    const monitors = (d.monitors ?? []).map((m) => ({
-      id: m.id, name: m.name, active: !!m.active,
-      status: (m.active && (m.status === 1 || m.status === 'up')) ? 'up' : ((m.active && m.status === 0) ? 'down' : 'inactive'),
-      latency: m.latency ?? null, uptime: m.uptime ?? null,
-    }))
-    return { enabled: true, monitors }
+    if (!res.ok) return { enabled: true, error: `kuma /metrics HTTP ${res.status}` }
+    return { enabled: true, monitors: parseKumaMetrics(await res.text()) }
   }, cfg.kuma.pollMs)
 
   // macOS 滚动短趋势（内存缓冲）
