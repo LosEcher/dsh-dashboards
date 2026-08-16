@@ -80,6 +80,9 @@ function useWidgetFetch(endpoint: string, refreshMs: number) {
 /** ── 渲染器 ──────────────────────────────────────────────────────── */
 
 function StatCard({ data, t }: { data: unknown; t: (k: string) => string }) {
+  if (data == null || typeof data !== 'object') {
+    return <p className={css.muted}>—</p>
+  }
   const d = data as {
     totals?: { estimatedCostUsd?: number; totalTokens?: number; cacheHitRate?: number | null; modelResponseCount?: number; sessionCount?: number; cacheSavingsUsd?: number }
     memory?: { totalMb?: number | null; freeMb?: number | null; availMb?: number | null; usedPct?: number | null }
@@ -224,6 +227,9 @@ function Sparkline({ series }: { series: { name: string; color: string; values: 
 }
 
 function TrendChart({ data }: { data: unknown }) {
+  if (data == null || typeof data !== 'object') {
+    return <p className={css.muted}>—</p>
+  }
   const d = data as { series?: { provider?: string; model?: string; points?: { day?: string; avgDurationMs?: number | null }[] }[]; points?: { ts?: string; load1?: number | null; memUsedPct?: number | null }[] }
   const COLORS = [
     'color-mix(in srgb, var(--dsw-alias-brand-primary) 80%, transparent)',
@@ -261,6 +267,9 @@ interface ListRow {
 }
 
 function ListCard({ data }: { data: unknown }) {
+  if (data == null || typeof data !== 'object') {
+    return <p className={css.muted}>—</p>
+  }
   const d = data as { results?: ListRow[]; monitors?: ListRow[]; down?: number; total?: number; enabled?: boolean; reason?: string }
   if (d.reason && !d.results && !d.monitors) return <p className={css.muted}>{d.reason}</p>
   if (d.monitors) {
