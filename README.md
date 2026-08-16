@@ -7,6 +7,7 @@ DSH 看板插件：在会话区注册「看板」tab（`conversation.view`），
 - **服务探活**：本机 + node34 关键服务 HTTP/TCP
 - **Uptime Kuma**（可选，默认关）：Z4Nas 排查完成后配置 `kuma.url` + `kuma.token` 即启用（REST v1 `/api/v1/monitors`）
 - **Glances**（可选，默认关）：`brew install glances && glances -w` 后配置 `glances.url`
+- **feed 采集摘要**：读 `~/.dsh/scheduler-reports/feed-digest-*.md`（scheduler job「多平台 feed 采集摘要」落盘）最新 5 份，卡片内点击展开正文
 
 ## 架构
 
@@ -20,6 +21,7 @@ GET /dashboards/status        后端健康 + widget 数
 GET /dashboards/los/usage      GET /dashboards/los/trends   GET /dashboards/los/metrics
 GET /dashboards/los/nodes      GET /dashboards/macos        GET /dashboards/macos/history
 GET /dashboards/probe          GET /dashboards/glances      GET /dashboards/kuma
+GET /dashboards/feed/digests  feed 采集摘要报告（scheduler-reports/feed-digest-*.md）
 GET/PUT /dashboards/widgets   widget 配置（PUT 需带 {widgets:[{id,type,endpoint,title,refreshMs}]}）
 ```
 
