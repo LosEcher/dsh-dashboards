@@ -13,7 +13,7 @@ import css from './DashboardView.module.css'
 
 export interface WidgetConfig {
   id: string
-  type: 'stat' | 'matrix' | 'chart' | 'list'
+  type: 'stat' | 'matrix' | 'chart' | 'list' | 'feed'
   endpoint: string
   title: string
   refreshMs: number
@@ -296,6 +296,57 @@ function ListCard({ data }: { data: unknown }) {
   )
 }
 
+/** feed 采集摘要报告（host 读 ~/.dsh/scheduler-reports/feed/ 最新 N 份）。 */
+interface FeedDigest {
+  file?: string
+  at?: string | null
+  title?: string
+  lines?: number
+  size?: number
+  text?: string
+}
+
+function FeedCard({ data, t }: { data: unknown; t: (k: string) => string }) {
+  const [open, setOpen] = useState<string | null>(null)
+  if (data == null || typeof data !== 'object') {
+    return <p className={css.muted}>—</p>
+  }
+  const d = data as { dir?: string; count?: number; digests?: FeedDigest[]; error?: string }
+  if (d.error && !(d.digests?.length)) return <p className={css.muted}>{d.error}</p>
+  const digests = d.digests ?? []
+  if (!digests.length) return <p className={css.muted}>{t('feed.empty')}</p>
+  return (
+    <div>
+      <div className={css.pillRow}>
+        <span className={`${css.pill} ${css.pillDim}`}>{t('feed.latest')} {digests.length}</span>
+      </div>
+      {digests.map((g) => {
+        const key = g.file ?? g.at ?? ''
+        const expanded = open === key
+        return (
+          <div key={key} className={css.feedItem}>
+            <button
+              type="button"
+              className={css.feedToggle}
+              onClick={() => setOpen(expanded ? null : key)}
+              aria-expanded={expanded}
+            >
+              <span className={css.feedTitle}>{g.title ?? g.file ?? '—'}</span>
+              <span className={css.feedTime}>
+                {g.at ? new Date(g.at).toLocaleString() : '—'}
+                {g.lines != null ? ` · ${g.lines} 行` : ''}
+              </span>
+            </button>
+            {expanded && g.text ? (
+              <pre className={css.feedBody}>{g.text}</pre>
+            ) : null}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 function WidgetCard({ widget, snap, t }: { widget: WidgetConfig; snap?: Snapshot; t: (k: string) => string }) {
   const d = snap?.data as unknown
   const hasError = !!(snap?.error || (d as { error?: string } | null)?.error)
@@ -318,6 +369,8 @@ function WidgetCard({ widget, snap, t }: { widget: WidgetConfig; snap?: Snapshot
           <TrendChart data={d} />
         ) : widget.type === 'list' ? (
           <ListCard data={d} />
+        ) : widget.type === 'feed' ? (
+          <FeedCard data={d} t={t} />
         ) : (
           <p className={css.muted}>{t('noData')}</p>
         )}

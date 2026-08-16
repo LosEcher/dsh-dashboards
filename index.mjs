@@ -13,6 +13,7 @@
  *   GET /dashboards/probe              端口/HTTP 服务探活
  *   GET /dashboards/glances            Glances /api/4/all（可选后端，默认关）
  *   GET /dashboards/kuma               Uptime Kuma /api/v1/monitors（可选后端，默认关）
+ *   GET /dashboards/feed/digests       feed 采集摘要报告（~/.dsh/scheduler-reports/feed/）
  *   GET  /dashboards/widgets           看板 widget 配置（host 侧存储）
  *   PUT  /dashboards/widgets           保存 widget 配置（校验 endpoint 白名单）
  *
@@ -21,7 +22,7 @@
 
 import Schema from '@deepseek-ai/schemastery'
 import { execFile } from 'node:child_process'
-import { readFileSync, mkdirSync, writeFileSync, existsSync } from 'node:fs'
+import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { createConnection } from 'node:net'
@@ -72,11 +73,14 @@ const HOME = process.env.DSH_HOME ?? `${homedir()}/.dsh`
 const CRED_FILE = join(HOME, '.credentials.yaml')
 const WIDGETS_FILE = join(HOME, 'storages/dsh-dashboards/widgets.json')
 const DEFAULTS_DIR = join(HOME, 'storages/dsh-dashboards')
+/** feed 采集摘要报告目录（scheduler job「多平台 feed 采集摘要」落盘：feed-digest-*.md 在 scheduler-reports 根目录；feed/ 子目录是原始 JSON，feed-profile/ 是画像）。 */
+const FEED_DIR = join(HOME, 'scheduler-reports')
 
 /** widget endpoint 白名单（防 PUT 注入任意路径）。 */
 const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/los/usage', '/dashboards/los/trends', '/dashboards/los/metrics', '/dashboards/los/nodes',
   '/dashboards/macos', '/dashboards/macos/history', '/dashboards/probe', '/dashboards/glances', '/dashboards/kuma',
+  '/dashboards/feed/digests',
 ])
 
 /** 活动门控：超过此时长无 /dashboards 请求，后台轮询暂停（看板未打开时不空转采集）。 */
@@ -103,6 +107,7 @@ const DEFAULT_WIDGETS = [
   { id: 'mbp-mem', type: 'stat', endpoint: '/dashboards/macos', title: 'MBP 内存', refreshMs: 15000 },
   { id: 'svc-probe', type: 'list', endpoint: '/dashboards/probe', title: '关键服务', refreshMs: 30000 },
   { id: 'kuma-status', type: 'list', endpoint: '/dashboards/kuma', title: '服务状态 (Z4Nas)', refreshMs: 30000 },
+  { id: 'feed-digests', type: 'feed', endpoint: '/dashboards/feed/digests', title: 'feed 采集摘要', refreshMs: 60000 },
 ]
 
 /** ── 配置解析：defaulting happens here, never inline ─────────────────── */
@@ -561,6 +566,54 @@ async function collectProbe(cfg) {
   return { total: results.length, ok, down: results.length - ok, results }
 }
 
+/** ── feed 采集摘要报告（scheduler 落盘文件，只读，零持久化） ──────────
+ * 读 ~/.dsh/scheduler-reports/feed/feed-digest-*.md 最新 N 份。
+ * 文件名即时间戳（feed-digest-YYYYMMDD-HHMM.md，本地时区）；正文截断返回，
+ * 卡片展开显示。目录缺失/无产出时降级为空列表 + 提示（不报错）。
+ */
+const FEED_MAX_DIGESTS = 5
+const FEED_MAX_TEXT = 8000
+
+function parseFeedTimestamp(file) {
+  const m = String(file).match(/^feed-digest-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})\.md$/)
+  if (!m) return null
+  const [, y, mo, d, h, mi] = m
+  // 无时区 ISO：浏览器端按本地时区解析，与文件名（本地时间）一致
+  return `${y}-${mo}-${d}T${h}:${mi}:00`
+}
+
+function collectFeedDigests() {
+  let files = []
+  try {
+    files = readdirSync(FEED_DIR)
+      .filter((f) => /^feed-digest-\d{8}-\d{4}\.md$/.test(f))
+      .sort()
+      .reverse()
+      .slice(0, FEED_MAX_DIGESTS)
+  } catch {
+    return { dir: FEED_DIR, count: 0, digests: [], error: 'feed 报告目录不可读（尚无 job 产出？）' }
+  }
+  const digests = files.map((file) => {
+    let text = ''
+    try {
+      text = readFileSync(join(FEED_DIR, file), 'utf8').replace(/^\uFEFF/, '')
+    } catch {
+      text = ''
+    }
+    const first = (text.split('\n')[0] ?? '').trim()
+    const title = first.startsWith('#') ? first.replace(/^#+\s*/, '') : (first || file)
+    return {
+      file,
+      at: parseFeedTimestamp(file),
+      title: title.slice(0, 120),
+      lines: text.split('\n').filter((l) => l.trim()).length,
+      size: text.length,
+      text: text.slice(0, FEED_MAX_TEXT),
+    }
+  })
+  return { dir: FEED_DIR, count: digests.length, digests }
+}
+
 /** ── widget 配置存取 ──────────────────────────────────────────────── */
 function loadWidgets() {
   try {
@@ -621,6 +674,8 @@ export function apply(ctx, config) {
     if (!res.ok) return { enabled: true, error: `kuma /metrics HTTP ${res.status}` }
     return { enabled: true, monitors: parseKumaMetrics(await res.text()) }
   }, cfg.kuma.pollMs)
+  // feed 摘要（读本机报告文件，成本低；60s 节奏 + 快照缓存即可）
+  const feedDigests = makePoller(collectFeedDigests, 60000)
 
   // macOS 滚动短趋势（内存缓冲；按 ts 去重，30s 采样节奏 → 120 点 = 1h 窗口）
   const history = []
@@ -661,6 +716,7 @@ export function apply(ctx, config) {
     '/dashboards/probe': probe,
     '/dashboards/glances': glances,
     '/dashboards/kuma': kuma,
+    '/dashboards/feed/digests': feedDigests,
   }
 
   const timers = [
@@ -672,6 +728,7 @@ export function apply(ctx, config) {
     startPoller(probe, cfg.probe.pollMs),
     startPoller(glances, cfg.glances.pollMs),
     startPoller(kuma, cfg.kuma.pollMs),
+    startPoller(feedDigests, 60000),
   ]
 
   ctx.webServer.register({
@@ -711,6 +768,7 @@ export function apply(ctx, config) {
               probe: s(probe),
               glances: { enabled: cfg.glances.enabled, ...s(glances) },
               kuma: { enabled: cfg.kuma.enabled, ...s(kuma) },
+              feed: s(feedDigests),
             },
             widgets: loadWidgets().length,
           })
@@ -730,6 +788,7 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/probe') { sendJson(res, 200, await probe.get()); return }
         if (method === 'GET' && path === '/dashboards/glances') { sendJson(res, 200, await glances.get()); return }
         if (method === 'GET' && path === '/dashboards/kuma') { sendJson(res, 200, await kuma.get()); return }
+        if (method === 'GET' && path === '/dashboards/feed/digests') { sendJson(res, 200, await feedDigests.get()); return }
         if (method === 'GET' && path === '/dashboards/widgets') {
           sendJson(res, 200, { ts: new Date().toISOString(), widgets: loadWidgets() })
           return
