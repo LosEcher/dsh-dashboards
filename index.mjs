@@ -20,7 +20,7 @@
  */
 
 import Schema from '@deepseek-ai/schemastery'
-import { spawnSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { readFileSync, mkdirSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -351,16 +351,43 @@ function parseKumaMetrics(text) {
   }))
 }
 
-/** ── macOS 原生探针（零安装，spawnSync 系统命令） ──────────────────── */
-function runSync(cmd, args, timeoutMs = 4000) {
-  try {
-    const r = spawnSync(cmd, args, { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 })
-    if (r.error) return { error: String(r.error) }
-    if (r.status !== 0) return { error: (r.stderr || `exit ${r.status}`).slice(0, 200) }
-    return { out: r.stdout }
-  } catch (e) {
-    return { error: String(e) }
-  }
+/** ── macOS 原生探针（零安装，异步 execFile，绝不阻塞事件循环） ──────
+ * 2026-08-16 修复：原 spawnSync 链在 SMB/NFS 挂载 stall 时会以 D 态子进程
+ * 同步卡死事件循环（曾冻住协调重启的 force-exit 定时器 3.5 分钟）。
+ * 现改异步 execFile + SIGKILL 硬上限 + 看门狗（withTimeout），单命令失败
+ * 只降级该字段，不拖垮整次采集。
+ */
+const PROBE_CMD_TIMEOUT_MS = 3000
+/** 单次采集整体硬上限（看门狗；超时记 error，下一拍重试）。 */
+const PROBE_TOTAL_TIMEOUT_MS = 12000
+
+function runExec(cmd, args, timeoutMs = PROBE_CMD_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, {
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+      maxBuffer: 4 * 1024 * 1024,
+      encoding: 'utf8',
+      windowsHide: true,
+    }, (err, stdout) => {
+      if (err) {
+        // D 态子进程 SIGKILL 也可能被延迟到 I/O 返回——异步等待不会阻塞事件循环。
+        resolve({ error: String(err.message ?? err.code ?? err).slice(0, 200) })
+        return
+      }
+      resolve({ out: stdout })
+    })
+  })
+}
+
+/** 看门狗：整体超时兜底（无论底层卡多久，这里按时 reject，由 poller 记 error）。 */
+function withTimeout(promise, ms, label) {
+  let timer
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} 超时 ${ms}ms`)), ms)
+  })
+  timer?.unref?.()
+  return Promise.race([promise, timeout])
 }
 
 function parseLoadavg(text) {
@@ -415,17 +442,20 @@ function parseNetstatIb(text) {
 let prevNet = null
 let prevNetAt = 0
 
-function collectMacos(cfg) {
-  const load = runSync('sysctl', ['-n', 'vm.loadavg'])
-  const memsize = runSync('sysctl', ['-n', 'hw.memsize'])
-  const ncpu = runSync('sysctl', ['-n', 'hw.ncpu'])
-  const model = runSync('sysctl', ['-n', 'hw.model'])
-  const pagesize = runSync('sysctl', ['-n', 'hw.pagesize'])
-  const vmstat = runSync('vm_stat')
-  const iostat = runSync('iostat', ['-c', '2', '-w', '1'])
-  const df = runSync('df', ['-h', '/', '/System/Volumes/Data'])
-  const netstat = runSync('netstat', ['-ib'])
-  const ps = runSync('ps', ['-ax', '-o', 'pid='])
+async function collectMacos(cfg) {
+  // 各命令并行执行：总耗时 = max(单命令) 而非累加；df 卡住不影响 load/mem/cpu。
+  const [load, memsize, ncpu, model, pagesize, vmstat, iostat, df, netstat, ps] = await Promise.all([
+    runExec('sysctl', ['-n', 'vm.loadavg']),
+    runExec('sysctl', ['-n', 'hw.memsize']),
+    runExec('sysctl', ['-n', 'hw.ncpu']),
+    runExec('sysctl', ['-n', 'hw.model']),
+    runExec('sysctl', ['-n', 'hw.pagesize']),
+    runExec('vm_stat'),
+    runExec('iostat', ['-c', '2', '-w', '1']),
+    runExec('df', ['-h', '/', '/System/Volumes/Data']),
+    runExec('netstat', ['-ib']),
+    runExec('ps', ['-ax', '-o', 'pid=']),
+  ])
 
   const loadavg = load.out ? parseLoadavg(load.out) : null
   const pages = vmstat.out ? parseVmStat(vmstat.out) : {}
@@ -558,7 +588,8 @@ export function apply(ctx, config) {
   const losTrends = makePoller(() => collectLosTrends(cfg, tokens), Math.max(cfg.losPollMs, 120000))
   const losMetrics = makePoller(() => collectLosMetrics(cfg, tokens), Math.max(cfg.losPollMs, 120000))
   const losNodes = makePoller(() => collectLosNodes(cfg, tokens), Math.max(cfg.losPollMs, 30000))
-  const macos = makePoller(() => collectMacos(cfg), cfg.macos.pollMs)
+  // 看门狗：单次采集整体 12s 硬上限，df/iostat 卡挂载也只降级该拍，不拖住 get()。
+  const macos = makePoller(() => withTimeout(collectMacos(cfg), PROBE_TOTAL_TIMEOUT_MS, 'macos 探针'), cfg.macos.pollMs)
   const probe = makePoller(() => collectProbe(cfg), cfg.probe.pollMs)
   const glances = makePoller(async () => {
     if (!cfg.glances.enabled) return { enabled: false, reason: 'glances 未启用（Config.glances.enabled）' }
