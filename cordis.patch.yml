@@ -1,0 +1,8 @@
+# dsh-dashboards bundle patch: host row (mounts /dashboards API).
+# Client half (conversation.view 看板 tab) is loaded automatically via dsh.client.
+# Install: dsh plugin --profile web add github:LosEcher/dsh-dashboards#main
+# (requires dsh web restart; HMR only covers config edits)
+- insert:
+    - id: dashboards
+      name: dsh-dashboards
+      config: {}
