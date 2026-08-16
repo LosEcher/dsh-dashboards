@@ -337,12 +337,13 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
   const [widgets, setWidgets] = useState<SnapshotWidget[] | null>(null)
   const [configError, setConfigError] = useState<string | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // 单 ticker：15s 拉一次 /dashboards/snapshot（host 侧按各后端 interval 决定真正采集，
-  // client 不再逐卡 fetch——往返 7→1；无活动时 host 暂停后台采集，此请求即活动信号）
+  // client 不再逐卡 fetch——往返 7→1）。可见性门控：浏览器标签页隐藏时停 ticker，
+  // 避免后台 tab 里挂着的看板让 host 8 个 poller 永活（配合 host 侧 180s 活动门控）。
   useEffect(() => {
     let alive = true
+    let timer: ReturnType<typeof setInterval> | null = null
     const load = async () => {
       try {
         const res = await fetch('/dashboards/snapshot', { signal: AbortSignal.timeout(10000) })
@@ -353,12 +354,21 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
         if (alive) setConfigError(String(e))
       }
     }
-    void load()
-    if (timerRef.current) clearInterval(timerRef.current)
-    timerRef.current = setInterval(() => { void load() }, 15000)
+    const sync = () => {
+      if (document.visibilityState === 'visible') {
+        void load()
+        if (!timer) timer = setInterval(() => { void load() }, 15000)
+      } else if (timer) {
+        clearInterval(timer)
+        timer = null
+      }
+    }
+    sync()
+    document.addEventListener('visibilitychange', sync)
     return () => {
       alive = false
-      if (timerRef.current) clearInterval(timerRef.current)
+      if (timer) clearInterval(timer)
+      document.removeEventListener('visibilitychange', sync)
     }
   }, [reloadKey])
 
