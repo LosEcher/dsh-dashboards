@@ -79,6 +79,12 @@ const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/macos', '/dashboards/macos/history', '/dashboards/probe', '/dashboards/glances', '/dashboards/kuma',
 ])
 
+/** 活动门控：超过此时长无 /dashboards 请求，后台轮询暂停（看板未打开时不空转采集）。 */
+const IDLE_PAUSE_MS = 180_000
+let lastActivityAt = Date.now()
+function touchActivity() { lastActivityAt = Date.now() }
+function isIdle() { return Date.now() - lastActivityAt > IDLE_PAUSE_MS }
+
 const DEFAULT_TARGETS = [
   { name: 'dsh-web', url: 'http://127.0.0.1:3080' },
   { name: 'los-gateway', url: 'http://127.0.0.1:8080' },
@@ -86,8 +92,7 @@ const DEFAULT_TARGETS = [
   { name: 'wechat-bridge', port: 18013 },
   { name: 'kimi-bridge', port: 10086 },
   { name: 'herdr-web', port: 8777 },
-  { name: 'node34-forgejo', url: 'http://100.68.106.96:8080' },
-  { name: 'node34-kuma', url: 'http://100.68.106.96:3312' },
+  // node34 服务状态由 kuma 后端覆盖（1panel 全家桶 monitor），probe 聚焦本机
 ]
 
 const DEFAULT_WIDGETS = [
@@ -111,7 +116,8 @@ function resolveConfig(config) {
     losPollMs: c.losPollMs ?? 60000,
     macos: {
       enabled: c.macos?.enabled ?? true,
-      pollMs: c.macos?.pollMs ?? 15000,
+      // 30s：与 los 节点心跳（30-45s）同频，图表粒度足够；los 已含同源 load/内存快照
+      pollMs: c.macos?.pollMs ?? 30000,
       historyPoints: c.macos?.historyPoints ?? 120,
     },
     glances: {
@@ -205,7 +211,11 @@ function makePoller(fn, intervalMs) {
 
 function startPoller(poller, intervalMs) {
   void poller.refresh()
-  const timer = setInterval(() => void poller.refresh(), intervalMs)
+  const timer = setInterval(() => {
+    // 活动门控：看板未打开（无 /dashboards 请求）时跳过本轮，零采集开销
+    if (isIdle()) return
+    void poller.refresh()
+  }, intervalMs)
   timer.unref?.()
   return timer
 }
@@ -587,7 +597,7 @@ export function apply(ctx, config) {
   const losUsage = makePoller(() => collectLosUsage(cfg, tokens), cfg.losPollMs)
   const losTrends = makePoller(() => collectLosTrends(cfg, tokens), Math.max(cfg.losPollMs, 120000))
   const losMetrics = makePoller(() => collectLosMetrics(cfg, tokens), Math.max(cfg.losPollMs, 120000))
-  const losNodes = makePoller(() => collectLosNodes(cfg, tokens), Math.max(cfg.losPollMs, 30000))
+  const losNodes = makePoller(() => collectLosNodes(cfg, tokens), Math.max(cfg.losPollMs, 90000))
   // 看门狗：单次采集整体 12s 硬上限，df/iostat 卡挂载也只降级该拍，不拖住 get()。
   const macos = makePoller(() => withTimeout(collectMacos(cfg), PROBE_TOTAL_TIMEOUT_MS, 'macos 探针'), cfg.macos.pollMs)
   const probe = makePoller(() => collectProbe(cfg), cfg.probe.pollMs)
@@ -612,11 +622,12 @@ export function apply(ctx, config) {
     return { enabled: true, monitors: parseKumaMetrics(await res.text()) }
   }, cfg.kuma.pollMs)
 
-  // macOS 滚动短趋势（内存缓冲）
+  // macOS 滚动短趋势（内存缓冲；按 ts 去重，30s 采样节奏 → 120 点 = 1h 窗口）
   const history = []
   const pushHistory = (snap) => {
     const d = snap?.data
     if (!d) return
+    if (history.length && history[history.length - 1].ts === snap.ts) return
     history.push({
       ts: snap.ts,
       load1: d.loadavg?.load1 ?? null,
@@ -627,14 +638,36 @@ export function apply(ctx, config) {
     })
     if (history.length > cfg.macos.historyPoints) history.shift()
   }
-  const macosTimer = setInterval(() => pushHistory(macos.snapshot()), 2000)
+  const macosTimer = setInterval(() => {
+    if (isIdle()) return
+    pushHistory(macos.snapshot())
+  }, 3000)
   macosTimer.unref?.()
+  // history 端点（非 makePoller；聚合端点同构快照）
+  const historyPoller = {
+    get: async () => {
+      pushHistory(macos.snapshot())
+      return { ts: new Date().toISOString(), data: { points: history.slice(-60) }, error: null }
+    },
+  }
+  // endpoint → poller 映射（/dashboards/snapshot 聚合用）
+  const pollerByEndpoint = {
+    '/dashboards/los/usage': losUsage,
+    '/dashboards/los/trends': losTrends,
+    '/dashboards/los/metrics': losMetrics,
+    '/dashboards/los/nodes': losNodes,
+    '/dashboards/macos': macos,
+    '/dashboards/macos/history': historyPoller,
+    '/dashboards/probe': probe,
+    '/dashboards/glances': glances,
+    '/dashboards/kuma': kuma,
+  }
 
   const timers = [
     startPoller(losUsage, cfg.losPollMs),
     startPoller(losTrends, Math.max(cfg.losPollMs, 120000)),
     startPoller(losMetrics, Math.max(cfg.losPollMs, 120000)),
-    startPoller(losNodes, Math.max(cfg.losPollMs, 30000)),
+    startPoller(losNodes, Math.max(cfg.losPollMs, 90000)),
     startPoller(macos, cfg.macos.pollMs),
     startPoller(probe, cfg.probe.pollMs),
     startPoller(glances, cfg.glances.pollMs),
@@ -648,7 +681,23 @@ export function apply(ctx, config) {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1')
       const method = req.method ?? 'GET'
       const path = url.pathname
+      // 任何 /dashboards 请求 = 活动信号（活动门控据此续命后台轮询）
+      touchActivity()
       try {
+        // 聚合快照：一次请求返回全部 widget 的配置+数据（client 单 ticker 15s 拉一次，往返 7→1）
+        if (method === 'GET' && path === '/dashboards/snapshot') {
+          const widgets = loadWidgets()
+          const items = await Promise.all(widgets.map(async (w) => {
+            const p = pollerByEndpoint[w.endpoint]
+            if (!p) {
+              return { id: w.id, type: w.type, endpoint: w.endpoint, title: w.title, refreshMs: w.refreshMs, snap: { ts: null, data: null, error: `未知 endpoint ${w.endpoint}` } }
+            }
+            const snap = await p.get()
+            return { id: w.id, type: w.type, endpoint: w.endpoint, title: w.title, refreshMs: w.refreshMs, snap }
+          }))
+          sendJson(res, 200, { ts: new Date().toISOString(), widgets: items })
+          return
+        }
         if (method === 'GET' && path === '/dashboards/status') {
           const s = (p) => {
             const snap = p.snapshot()

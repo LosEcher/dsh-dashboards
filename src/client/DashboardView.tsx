@@ -47,36 +47,6 @@ const fmtDur = (ms: number | null | undefined): string => {
 }
 const pct = (v: number | null | undefined): string => (v == null ? '—' : `${v.toFixed(1)}%`)
 
-/** 每 widget 独立轮询（endpoint + refreshMs），卸载清理。 */
-function useWidgetFetch(endpoint: string, refreshMs: number) {
-  const [snap, setSnap] = useState<Snapshot>({})
-  const [loading, setLoading] = useState(false)
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
-
-  const load = useCallback(async (force = false) => {
-    setLoading(true)
-    try {
-      const res = await fetch(endpoint, { signal: AbortSignal.timeout(10000) })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const d = await res.json() as Snapshot
-      setSnap(force ? { ...d } : d)
-    } catch (e) {
-      setSnap((s) => ({ ...s, error: String(e) }))
-    } finally {
-      setLoading(false)
-    }
-  }, [endpoint])
-
-  useEffect(() => {
-    void load()
-    if (timerRef.current) clearInterval(timerRef.current)
-    timerRef.current = setInterval(() => { void load() }, Math.max(refreshMs, 5000))
-    return () => { if (timerRef.current) clearInterval(timerRef.current) }
-  }, [load, refreshMs])
-
-  return { snap, loading, reload: () => void load(true) }
-}
-
 /** ── 渲染器 ──────────────────────────────────────────────────────── */
 
 function StatCard({ data, t }: { data: unknown; t: (k: string) => string }) {
@@ -326,22 +296,20 @@ function ListCard({ data }: { data: unknown }) {
   )
 }
 
-function WidgetCard({ widget, t }: { widget: WidgetConfig; t: (k: string) => string }) {
-  const { snap, loading, reload } = useWidgetFetch(widget.endpoint, widget.refreshMs)
-  const d = snap.data as unknown
-  const hasError = !!(snap.error || (d as { error?: string } | null)?.error)
+function WidgetCard({ widget, snap, t }: { widget: WidgetConfig; snap?: Snapshot; t: (k: string) => string }) {
+  const d = snap?.data as unknown
+  const hasError = !!(snap?.error || (d as { error?: string } | null)?.error)
   return (
     <section className={css.card}>
       <header className={css.cardHeader}>
         <p className={css.cardTitle}>{widget.title}</p>
         <span className={css.cardMeta}>
-          {snap.ts ? <span className={css.muted}>{t('updated')} {new Date(snap.ts).toLocaleTimeString()}</span> : null}
-          <button className={css.btn} onClick={reload} disabled={loading}>{loading ? '…' : t('refresh')}</button>
+          {snap?.ts ? <span className={css.muted}>{t('updated')} {new Date(snap.ts).toLocaleTimeString()}</span> : null}
         </span>
       </header>
       <div className={css.cardBody}>
         {hasError ? (
-          <p className={css.error}>⚠️ {snap.error || (d as { error?: string }).error}</p>
+          <p className={css.error}>⚠️ {snap?.error || (d as { error?: string }).error}</p>
         ) : widget.type === 'stat' ? (
           <StatCard data={d} t={t} />
         ) : widget.type === 'matrix' ? (
@@ -358,26 +326,40 @@ function WidgetCard({ widget, t }: { widget: WidgetConfig; t: (k: string) => str
   )
 }
 
+/** 聚合快照 widget（配置+数据一次返回）。 */
+interface SnapshotWidget extends WidgetConfig {
+  snap?: Snapshot
+}
+
 export function DashboardView(props: ConvViewProps): React.JSX.Element {
   const { t } = props as { t?: (k: string) => string }
   const localeT = (k: string) => (t ? t(k) : k)
-  const [widgets, setWidgets] = useState<WidgetConfig[] | null>(null)
+  const [widgets, setWidgets] = useState<SnapshotWidget[] | null>(null)
   const [configError, setConfigError] = useState<string | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
+  // 单 ticker：15s 拉一次 /dashboards/snapshot（host 侧按各后端 interval 决定真正采集，
+  // client 不再逐卡 fetch——往返 7→1；无活动时 host 暂停后台采集，此请求即活动信号）
   useEffect(() => {
     let alive = true
-    void (async () => {
+    const load = async () => {
       try {
-        const res = await fetch('/dashboards/widgets', { signal: AbortSignal.timeout(8000) })
+        const res = await fetch('/dashboards/snapshot', { signal: AbortSignal.timeout(10000) })
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const d = await res.json() as { widgets?: WidgetConfig[] }
+        const d = await res.json() as { widgets?: SnapshotWidget[] }
         if (alive) { setWidgets(d.widgets ?? []); setConfigError(null) }
       } catch (e) {
         if (alive) setConfigError(String(e))
       }
-    })()
-    return () => { alive = false }
+    }
+    void load()
+    if (timerRef.current) clearInterval(timerRef.current)
+    timerRef.current = setInterval(() => { void load() }, 15000)
+    return () => {
+      alive = false
+      if (timerRef.current) clearInterval(timerRef.current)
+    }
   }, [reloadKey])
 
   return (
@@ -391,7 +373,7 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
       {widgets && widgets.length === 0 && <p className={css.muted}>{localeT('widgets.empty')}</p>}
       {widgets && widgets.length > 0 && (
         <div className={css.grid}>
-          {widgets.map((w) => <WidgetCard key={w.id} widget={w} t={localeT} />)}
+          {widgets.map((w) => <WidgetCard key={w.id} widget={w} snap={w.snap} t={localeT} />)}
         </div>
       )}
     </div>
