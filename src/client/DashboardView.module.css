@@ -260,13 +260,165 @@
 .feedBody {
   margin: 0;
   padding: 8px 10px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.6;
   color: var(--dsw-alias-label-secondary);
   background: var(--dsw-alias-bg-layer-1);
-  white-space: pre-wrap;
   word-break: break-word;
   max-height: 320px;
   overflow-y: auto;
+}
+
+/* Feed 正文里的 Markdown 元素：缩小标题/代码块，保持紧凑看板卡片风格 */
+.feedBody :global(h1),
+.feedBody :global(h2),
+.feedBody :global(h3) {
+  font-size: 13px;
+  margin: 8px 0 4px;
+  color: var(--dsw-alias-label-primary);
+}
+.feedBody :global(h4),
+.feedBody :global(h5),
+.feedBody :global(h6) {
+  font-size: 12px;
+  margin: 6px 0 3px;
+  color: var(--dsw-alias-label-primary);
+}
+.feedBody :global(p) {
+  margin: 4px 0;
+}
+.feedBody :global(ul),
+.feedBody :global(ol) {
+  margin: 4px 0;
+  padding-left: 18px;
+}
+.feedBody :global(pre) {
+  margin: 6px 0;
+  padding: 6px 8px;
+  font-size: 11px;
+  overflow-x: auto;
+}
+.feedBody :global(code) {
+  font-size: 11px;
+}
+.feedBody :global(table) {
+  margin: 6px 0;
+  font-size: 11px;
+}
+
+/* ── 编辑模式 ─────────────────────────────────────────────────────── */
+
+.btnPrimary {
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 18%, var(--dsw-alias-bg-layer-2));
+  border-color: var(--dsw-alias-brand-primary);
+  font-weight: 600;
+}
+
+.btnPrimary:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.editPanel {
+  border: 1px dashed var(--dsw-alias-border-l3);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.editPanelHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.editPanelTitle {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--dsw-alias-label-primary);
+}
+
+.targetRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+}
+
+.targetAddr {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.removeBtn {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-3);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.removeBtn:hover {
+  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 14%, var(--dsw-alias-bg-layer-3));
+  color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 60%, var(--dsw-alias-label-primary));
+}
+
+.removeBtn:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
+}
+
+.addForm {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 6px;
+}
+
+.input {
+  box-sizing: border-box;
+  height: 30px;
+  min-width: 0;
+  flex: 1 1 130px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.input::placeholder {
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--dsw-alias-brand-primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--dsw-alias-brand-primary) 18%, transparent);
+}
+
+.hint {
+  font-size: 12px;
+  color: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 60%, var(--dsw-alias-label-primary));
+  margin: 4px 0 8px;
+}
+
+.cardRemoving {
+  opacity: 0.45;
+  border-style: dashed;
 }

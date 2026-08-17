@@ -7,7 +7,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ConvViewProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
+import { MarkdownText, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
 import css from './DashboardView.module.css'
 
@@ -17,6 +17,14 @@ export interface WidgetConfig {
   endpoint: string
   title: string
   refreshMs: number
+}
+
+/** 服务探活目标（host 侧 store 可编辑，PUT /dashboards/probe-targets）。 */
+export interface ProbeTarget {
+  name: string
+  url?: string
+  host?: string
+  port?: number
 }
 
 interface Snapshot<T = unknown> {
@@ -338,7 +346,9 @@ function FeedCard({ data, t }: { data: unknown; t: (k: string) => string }) {
               </span>
             </button>
             {expanded && g.text ? (
-              <pre className={css.feedBody}>{g.text}</pre>
+              <div className={css.feedBody}>
+                <MarkdownText text={g.text} />
+              </div>
             ) : null}
           </div>
         )
@@ -347,15 +357,33 @@ function FeedCard({ data, t }: { data: unknown; t: (k: string) => string }) {
   )
 }
 
-function WidgetCard({ widget, snap, t }: { widget: WidgetConfig; snap?: Snapshot; t: (k: string) => string }) {
+function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
+  widget: WidgetConfig
+  snap?: Snapshot
+  t: (k: string) => string
+  editing?: boolean
+  removing?: boolean
+  onRemove?: () => void
+}) {
   const d = snap?.data as unknown
   const hasError = !!(snap?.error || (d as { error?: string } | null)?.error)
   return (
-    <section className={css.card}>
+    <section className={`${css.card} ${removing ? css.cardRemoving : ''}`}>
       <header className={css.cardHeader}>
         <p className={css.cardTitle}>{widget.title}</p>
         <span className={css.cardMeta}>
           {snap?.ts ? <span className={css.muted}>{t('updated')} {new Date(snap.ts).toLocaleTimeString()}</span> : null}
+          {editing ? (
+            <button
+              type="button"
+              className={css.removeBtn}
+              onClick={onRemove}
+              aria-label={`移除 ${widget.title}`}
+              title={removing ? '取消移除' : '移除该 widget'}
+            >
+              {removing ? '↩' : '✕'}
+            </button>
+          ) : null}
         </span>
       </header>
       <div className={css.cardBody}>
@@ -390,6 +418,128 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
   const [widgets, setWidgets] = useState<SnapshotWidget[] | null>(null)
   const [configError, setConfigError] = useState<string | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
+
+  // ── 编辑模式：widget 移除 + 探针目标增删（PUT /dashboards/widgets + /probe-targets） ──
+  const [editing, setEditing] = useState(false)
+  const [removedIds, setRemovedIds] = useState<Set<string>>(new Set())
+  const [probeTargets, setProbeTargets] = useState<ProbeTarget[] | null>(null)
+  const [probeSource, setProbeSource] = useState<string>('default')
+  const [probeDirty, setProbeDirty] = useState(false)
+  const [editMsg, setEditMsg] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [addName, setAddName] = useState('')
+  const [addUrl, setAddUrl] = useState('')
+  const [addPort, setAddPort] = useState('')
+
+  const toggleEdit = async () => {
+    if (editing) {
+      setEditing(false)
+      setRemovedIds(new Set())
+      setProbeTargets(null)
+      setProbeDirty(false)
+      setEditMsg(null)
+      setAddName(''); setAddUrl(''); setAddPort('')
+      return
+    }
+    setEditing(true)
+    setEditMsg(null)
+    try {
+      const res = await fetch('/dashboards/probe-targets', { signal: AbortSignal.timeout(8000) })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const d = await res.json() as { targets?: ProbeTarget[]; source?: string }
+      setProbeTargets(d.targets ?? [])
+      setProbeSource(d.source ?? 'default')
+    } catch (e) {
+      setEditMsg(`探针目标读取失败: ${String(e)}`)
+    }
+  }
+
+  const toggleRemove = (id: string) => {
+    setRemovedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const addTarget = () => {
+    const name = addName.trim()
+    if (!name) { setEditMsg('名称必填'); return }
+    const url = addUrl.trim()
+    const port = addPort.trim()
+    if (!url && !port) { setEditMsg('URL 或端口至少填一项'); return }
+    const t: ProbeTarget = { name }
+    if (url) t.url = url
+    if (port) t.port = Number(port)
+    setProbeTargets((prev) => [...(prev ?? []), t])
+    setProbeDirty(true)
+    setAddName(''); setAddUrl(''); setAddPort('')
+    setEditMsg(null)
+  }
+
+  const removeTarget = (i: number) => {
+    setProbeTargets((prev) => (prev ?? []).filter((_, idx) => idx !== i))
+    setProbeDirty(true)
+  }
+
+  const resetProbe = async () => {
+    setSaving(true)
+    try {
+      const res = await fetch('/dashboards/probe-targets', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targets: [] }),
+        signal: AbortSignal.timeout(8000),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const d = await res.json() as { targets?: ProbeTarget[] }
+      setProbeTargets(d.targets ?? [])
+      setProbeSource('default')
+      setProbeDirty(false)
+      setEditMsg('已重置为默认探针目标')
+    } catch (e) {
+      setEditMsg(`重置失败: ${String(e)}`)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const saveAll = async () => {
+    setSaving(true)
+    setEditMsg(null)
+    try {
+      if (removedIds.size > 0 && widgets) {
+        const remaining = widgets.filter((w) => !removedIds.has(w.id))
+        const res = await fetch('/dashboards/widgets', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ widgets: remaining }),
+          signal: AbortSignal.timeout(8000),
+        })
+        if (!res.ok) throw new Error(`widgets HTTP ${res.status}`)
+      }
+      if (probeDirty && probeTargets) {
+        const res = await fetch('/dashboards/probe-targets', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ targets: probeTargets }),
+          signal: AbortSignal.timeout(8000),
+        })
+        if (!res.ok) throw new Error(`probe-targets HTTP ${res.status}`)
+      }
+      setEditing(false)
+      setRemovedIds(new Set())
+      setProbeTargets(null)
+      setProbeDirty(false)
+      setAddName(''); setAddUrl(''); setAddPort('')
+      setReloadKey((k) => k + 1)
+    } catch (e) {
+      setEditMsg(`保存失败: ${String(e)}`)
+    } finally {
+      setSaving(false)
+    }
+  }
 
   // 单 ticker：15s 拉一次 /dashboards/snapshot（host 侧按各后端 interval 决定真正采集，
   // client 不再逐卡 fetch——往返 7→1）。可见性门控：浏览器标签页隐藏时停 ticker，
@@ -429,14 +579,66 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
     <div className={css.root}>
       <header className={css.header}>
         <span className={css.title}>📊 {localeT('view.dashboard')}</span>
-        <button className={css.btn} onClick={() => setReloadKey((k) => k + 1)}>↻</button>
+        <button className={css.btn} onClick={() => setReloadKey((k) => k + 1)} aria-label="刷新">↻</button>
+        {editing ? (
+          <>
+            <button className={`${css.btn} ${css.btnPrimary}`} onClick={() => void saveAll()} disabled={saving}>
+              {saving ? '保存中…' : '保存'}
+            </button>
+            <button className={css.btn} onClick={() => void toggleEdit()} disabled={saving}>取消</button>
+          </>
+        ) : (
+          <button className={css.btn} onClick={() => void toggleEdit()}>编辑</button>
+        )}
       </header>
+      {editing && (
+        <section className={css.editPanel}>
+          <div className={css.editPanelHead}>
+            <span className={css.editPanelTitle}>服务探活目标</span>
+            <span className={css.muted}>
+              来源: {probeSource === 'store' ? 'UI 编辑' : probeSource === 'config' ? '静态配置' : '默认'}
+            </span>
+          </div>
+          {probeTargets && probeTargets.length > 0 ? (
+            <div>
+              {probeTargets.map((tg, i) => (
+                <div key={`${tg.name}-${i}`} className={css.targetRow}>
+                  <span className={css.mono}>{tg.name}</span>
+                  <span className={`${css.muted} ${css.targetAddr}`}>{tg.url ?? `${tg.host ?? '127.0.0.1'}:${tg.port}`}</span>
+                  <button type="button" className={css.removeBtn} onClick={() => removeTarget(i)} aria-label={`移除 ${tg.name}`}>✕</button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className={css.muted}>暂无探针目标（保存空列表将重置为默认）</p>
+          )}
+          <div className={css.addForm}>
+            <input className={css.input} placeholder="名称" value={addName} onChange={(e) => setAddName(e.target.value)} />
+            <input className={css.input} placeholder="URL http://…" value={addUrl} onChange={(e) => setAddUrl(e.target.value)} />
+            <input className={css.input} placeholder="端口" type="number" min={1} max={65535} value={addPort} onChange={(e) => setAddPort(e.target.value)} />
+            <button type="button" className={css.btn} onClick={addTarget}>添加</button>
+            <button type="button" className={css.btn} onClick={() => void resetProbe()} disabled={saving}>重置为默认</button>
+          </div>
+          <p className={css.muted}>编辑模式下可点卡片右上角 ✕ 移除 widget；点「保存」一并生效。</p>
+        </section>
+      )}
+      {editMsg && <p className={css.hint}>{editMsg}</p>}
       {configError && <p className={css.error}>⚠️ {configError}</p>}
       {!configError && !widgets && <p className={css.muted}>{localeT('pending')}</p>}
       {widgets && widgets.length === 0 && <p className={css.muted}>{localeT('widgets.empty')}</p>}
       {widgets && widgets.length > 0 && (
         <div className={css.grid}>
-          {widgets.map((w) => <WidgetCard key={w.id} widget={w} snap={w.snap} t={localeT} />)}
+          {widgets.map((w) => (
+            <WidgetCard
+              key={w.id}
+              widget={w}
+              snap={w.snap}
+              t={localeT}
+              editing={editing}
+              removing={removedIds.has(w.id)}
+              onRemove={() => toggleRemove(w.id)}
+            />
+          ))}
         </div>
       )}
     </div>
