@@ -23,7 +23,10 @@ GET /dashboards/los/nodes      GET /dashboards/macos        GET /dashboards/maco
 GET /dashboards/probe          GET /dashboards/glances      GET /dashboards/kuma
 GET /dashboards/feed/digests  feed 采集摘要报告（scheduler-reports/feed-digest-*.md）
 GET/PUT /dashboards/widgets   widget 配置（PUT 需带 {widgets:[{id,type,endpoint,title,refreshMs}]}）
+GET/PUT /dashboards/probe-targets  服务探活目标（PUT 带 {targets:[{name,url?|port?}]}；空数组=重置回默认）
 ```
+
+探针目标解析链：UI 编辑 store（`~/.dsh/storages/dsh-dashboards/probe-targets.json`，PUT 落盘）→ `Config.probe.targets`（cordis.patch.yml）→ `DEFAULT_TARGETS`（index.mjs）。看板 tab 右上角「编辑」可增删探针目标与移除 widget，保存即时生效（client bundle 需刷新页面加载）。
 
 ## 安装
 

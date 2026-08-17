@@ -11,6 +11,8 @@
  *   GET /dashboards/macos              macOS 原生探针快照（loadavg/mem/disk/net/cpu）
  *   GET /dashboards/macos/history      macOS 滚动短趋势（内存缓冲）
  *   GET /dashboards/probe              端口/HTTP 服务探活
+ *   GET /dashboards/probe-targets      探针目标（store 优先 → Config.probe.targets → DEFAULT_TARGETS）
+ *   PUT /dashboards/probe-targets      保存探针目标（空数组 = 重置回默认；持久化 ~/.dsh/storages/dsh-dashboards/probe-targets.json）
  *   GET /dashboards/glances            Glances /api/4/all（可选后端，默认关）
  *   GET /dashboards/kuma               Uptime Kuma /api/v1/monitors（可选后端，默认关）
  *   GET /dashboards/feed/digests       feed 采集摘要报告（~/.dsh/scheduler-reports/feed/）
@@ -22,7 +24,7 @@
 
 import Schema from '@deepseek-ai/schemastery'
 import { execFile } from 'node:child_process'
-import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync } from 'node:fs'
+import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { createConnection } from 'node:net'
@@ -46,6 +48,12 @@ export const Config = Schema.object({
     pollMs: Schema.number(),
     /** 滚动历史点数（短趋势）。 */
     historyPoints: Schema.number(),
+    /** 磁盘水位告警阈值 %（0=关闭；仅 /System/Volumes/Data 数据卷）。 */
+    diskAlertPct: Schema.number(),
+    /** 同一水位区间内的告警冷却 ms（防止每拍重复推送）。 */
+    diskAlertCooldownMs: Schema.number(),
+    /** 磁盘水位独立检查间隔 ms（不受看板 idle 门控，看板未打开也告警）。 */
+    diskAlertCheckMs: Schema.number(),
   }),
   glances: Schema.object({
     enabled: Schema.boolean(),
@@ -72,6 +80,8 @@ export const Config = Schema.object({
 const HOME = process.env.DSH_HOME ?? `${homedir()}/.dsh`
 const CRED_FILE = join(HOME, '.credentials.yaml')
 const WIDGETS_FILE = join(HOME, 'storages/dsh-dashboards/widgets.json')
+/** 探针目标 store：UI 编辑（PUT /dashboards/probe-targets）落盘于此，优先于 Config.probe.targets 与 DEFAULT_TARGETS。 */
+const PROBE_FILE = join(HOME, 'storages/dsh-dashboards/probe-targets.json')
 const DEFAULTS_DIR = join(HOME, 'storages/dsh-dashboards')
 /** feed 采集摘要报告目录（scheduler job「多平台 feed 采集摘要」落盘：feed-digest-*.md 在 scheduler-reports 根目录；feed/ 子目录是原始 JSON，feed-profile/ 是画像）。 */
 const FEED_DIR = join(HOME, 'scheduler-reports')
@@ -93,10 +103,10 @@ const DEFAULT_TARGETS = [
   { name: 'dsh-web', url: 'http://127.0.0.1:3080' },
   { name: 'los-gateway', url: 'http://127.0.0.1:8080' },
   { name: 'los-otel', port: 4318 },
-  { name: 'wechat-bridge', port: 18013 },
   { name: 'kimi-bridge', port: 10086 },
   { name: 'herdr-web', port: 8777 },
-  // node34 服务状态由 kuma 后端覆盖（1panel 全家桶 monitor），probe 聚焦本机
+  // wechat-bridge(18013) 已随 weclaw 全面停用移除（2026-08-17）；node34 服务状态由 kuma 后端覆盖
+  // （1panel 全家桶 monitor），probe 聚焦本机。
 ]
 
 const DEFAULT_WIDGETS = [
@@ -124,6 +134,10 @@ function resolveConfig(config) {
       // 30s：与 los 节点心跳（30-45s）同频，图表粒度足够；los 已含同源 load/内存快照
       pollMs: c.macos?.pollMs ?? 30000,
       historyPoints: c.macos?.historyPoints ?? 120,
+      // 磁盘水位告警：>85% 触发，冷却 6h（同区间不重复推），检查间隔 5min
+      diskAlertPct: c.macos?.diskAlertPct ?? 85,
+      diskAlertCooldownMs: c.macos?.diskAlertCooldownMs ?? 6 * 3600_000,
+      diskAlertCheckMs: c.macos?.diskAlertCheckMs ?? 300_000,
     },
     glances: {
       enabled: c.glances?.enabled ?? false,
@@ -561,7 +575,8 @@ async function probeOne(target) {
 }
 
 async function collectProbe(cfg) {
-  const results = await Promise.all(cfg.probe.targets.map((t) => probeOne(t)))
+  const targets = loadProbeTargets(cfg)
+  const results = await Promise.all(targets.map((t) => probeOne(t)))
   const ok = results.filter((r) => r.ok).length
   return { total: results.length, ok, down: results.length - ok, results }
 }
@@ -634,6 +649,57 @@ function saveWidgets(widgets) {
   mkdirSync(DEFAULTS_DIR, { recursive: true })
   writeFileSync(WIDGETS_FILE, JSON.stringify({ updatedAt: new Date().toISOString(), widgets: cleaned }, null, 2) + '\n')
   return cleaned
+}
+
+/** ── 探针目标配置存取（UI 可编辑；store 优先于 Config.probe.targets 与 DEFAULT_TARGETS） ── */
+function sanitizeTarget(t) {
+  if (!t || typeof t !== 'object') return null
+  const name = String(t.name ?? '').trim()
+  const url = t.url ? String(t.url).trim() : ''
+  const port = Number(t.port)
+  const host = (t.host ? String(t.host).trim() : '') || '127.0.0.1'
+  if (!name) return null
+  if (url) return { name, url }
+  if (Number.isInteger(port) && port > 0 && port <= 65535) return { name, host, port }
+  return null
+}
+
+function loadProbeTargets(cfg) {
+  try {
+    const raw = JSON.parse(readFileSync(PROBE_FILE, 'utf8'))
+    if (Array.isArray(raw.targets)) {
+      const targets = raw.targets.map(sanitizeTarget).filter(Boolean)
+      if (targets.length) return targets
+    }
+  } catch { /* 缺失/损坏 → 下一级 */ }
+  if (Array.isArray(cfg.probe?.targets) && cfg.probe.targets.length) {
+    return cfg.probe.targets.map(sanitizeTarget).filter(Boolean)
+  }
+  return DEFAULT_TARGETS.map((t) => ({ ...t }))
+}
+
+function saveProbeTargets(targets) {
+  const cleaned = (Array.isArray(targets) ? targets : []).map(sanitizeTarget).filter(Boolean)
+  if (!cleaned.length) {
+    // 空列表 = 重置回默认（删除 store，回落 Config.probe.targets / DEFAULT_TARGETS）
+    try { rmSync(PROBE_FILE, { force: true }) } catch { /* ignore */ }
+    return []
+  }
+  mkdirSync(DEFAULTS_DIR, { recursive: true })
+  writeFileSync(PROBE_FILE, JSON.stringify({ updatedAt: new Date().toISOString(), targets: cleaned }, null, 2) + '\n')
+  return cleaned
+}
+
+/** 读请求 JSON body（失败 → 空对象，与 widgets PUT 同语义）。 */
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    let acc = ''
+    req.on('data', (chunk) => { acc += chunk })
+    req.on('end', () => {
+      try { resolve(acc ? JSON.parse(acc) : {}) } catch { resolve({}) }
+    })
+    req.on('error', () => resolve({}))
+  })
 }
 
 function sendJson(res, status, json) {
@@ -731,6 +797,41 @@ export function apply(ctx, config) {
     startPoller(feedDigests, 60000),
   ]
 
+  // ── 磁盘水位告警（独立于看板 idle 门控：看板未打开也持续检查，主动推飞书） ──
+  // 状态：{ lastAlertAt, lastAlertPct } —— 冷却期内同水位区间不重复推；水位再升
+  // 3pp 跨档也触发（避免高水位下完全静默）；显著回落（< 阈值-3）复位冷却。
+  const diskAlertState = { lastAlertAt: 0, lastAlertPct: 0 }
+  async function checkDiskAlert() {
+    const threshold = cfg.macos.diskAlertPct
+    if (!cfg.macos.enabled || !threshold || threshold <= 0) return
+    const df = await runExec('df', ['-h', '/System/Volumes/Data'])
+    if (df.error || !df.out) return
+    const disk = parseDf(df.out).find((d) => d.mount === '/System/Volumes/Data')
+    if (!disk) return
+    const pct = parseInt(String(disk.capacity).replace('%', ''), 10)
+    if (!Number.isFinite(pct)) return
+    const now = Date.now()
+    if (pct >= threshold) {
+      const inCooldown = now - diskAlertState.lastAlertAt < cfg.macos.diskAlertCooldownMs
+      const escalated = pct >= diskAlertState.lastAlertPct + 3
+      if (!inCooldown || escalated) {
+        diskAlertState.lastAlertAt = now
+        diskAlertState.lastAlertPct = pct
+        const text = `[磁盘告警] ${disk.mount} 已用 ${disk.capacity}（${disk.used}/${disk.size}，剩余 ${disk.avail}）。建议运行 mole clean 或 CleanMyMac 清理。`
+        execFile('bash', [join(HOME, 'scripts/feishu-push.sh'), text], { timeout: 20000 }, (err) => {
+          if (err) ctx.logger.warn?.(`[dsh-dashboards] 磁盘告警推送失败: ${err.message}`)
+        })
+        ctx.logger.info?.(`[dsh-dashboards] 磁盘水位告警: ${disk.mount} ${disk.capacity}（阈值 ${threshold}%）`)
+      }
+    } else if (pct < threshold - 3) {
+      diskAlertState.lastAlertAt = 0
+      diskAlertState.lastAlertPct = 0
+    }
+  }
+  const diskAlertTimer = setInterval(() => { void checkDiskAlert() }, cfg.macos.diskAlertCheckMs)
+  diskAlertTimer.unref?.()
+  timers.push(diskAlertTimer)
+
   ctx.webServer.register({
     kind: 'prefix',
     path: '/dashboards',
@@ -786,6 +887,21 @@ export function apply(ctx, config) {
           return
         }
         if (method === 'GET' && path === '/dashboards/probe') { sendJson(res, 200, await probe.get()); return }
+        if (method === 'GET' && path === '/dashboards/probe-targets') {
+          const targets = loadProbeTargets(cfg)
+          const source = existsSync(PROBE_FILE)
+            ? 'store'
+            : (Array.isArray(cfg.probe?.targets) && cfg.probe.targets.length ? 'config' : 'default')
+          sendJson(res, 200, { ts: new Date().toISOString(), targets, source })
+          return
+        }
+        if (method === 'PUT' && path === '/dashboards/probe-targets') {
+          const body = await readJsonBody(req)
+          const targets = saveProbeTargets(body.targets)
+          await probe.refresh()
+          sendJson(res, 200, { ok: true, targets, snap: probe.snapshot() })
+          return
+        }
         if (method === 'GET' && path === '/dashboards/glances') { sendJson(res, 200, await glances.get()); return }
         if (method === 'GET' && path === '/dashboards/kuma') { sendJson(res, 200, await kuma.get()); return }
         if (method === 'GET' && path === '/dashboards/feed/digests') { sendJson(res, 200, await feedDigests.get()); return }
@@ -794,16 +910,7 @@ export function apply(ctx, config) {
           return
         }
         if (method === 'PUT' && path === '/dashboards/widgets') {
-          let body = {}
-          try {
-            const raw = await new Promise((resolve, reject) => {
-              let acc = ''
-              req.on('data', (chunk) => { acc += chunk })
-              req.on('end', () => resolve(acc))
-              req.on('error', reject)
-            })
-            body = raw ? JSON.parse(raw) : {}
-          } catch { /* body 解析失败 → 空 */ }
+          const body = await readJsonBody(req)
           const widgets = Array.isArray(body.widgets) ? body.widgets : (Array.isArray(body) ? body : [])
           sendJson(res, 200, { ok: true, widgets: saveWidgets(widgets) })
           return
