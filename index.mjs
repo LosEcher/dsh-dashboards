@@ -26,7 +26,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { execFile } from 'node:child_process'
 import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
-import { homedir } from 'node:os'
+import { homedir, hostname } from 'node:os'
 import { createConnection } from 'node:net'
 
 export const name = 'dsh-dashboards'
@@ -103,20 +103,18 @@ const DEFAULT_TARGETS = [
   { name: 'dsh-web', url: 'http://127.0.0.1:3080' },
   { name: 'los-gateway', url: 'http://127.0.0.1:8080' },
   { name: 'los-otel', port: 4318 },
-  { name: 'kimi-bridge', port: 10086 },
-  { name: 'herdr-web', port: 8777 },
-  // wechat-bridge(18013) 已随 weclaw 全面停用移除（2026-08-17）；node34 服务状态由 kuma 后端覆盖
-  // （1panel 全家桶 monitor），probe 聚焦本机。
+  // 示例目标（可经 /dashboards/probe-targets 编辑增删；本机服务默认，远程/内部服务按部署配置）
+  { name: 'local-agent', port: 10086 },
 ]
 
 const DEFAULT_WIDGETS = [
   { id: 'los-usage', type: 'stat', endpoint: '/dashboards/los/usage', title: 'LLM 用量 24h', refreshMs: 60000 },
   { id: 'los-nodes', type: 'matrix', endpoint: '/dashboards/los/nodes', title: '执行节点', refreshMs: 30000 },
   { id: 'los-latency', type: 'chart', endpoint: '/dashboards/los/trends', title: 'provider 延迟', refreshMs: 300000 },
-  { id: 'mbp-load', type: 'chart', endpoint: '/dashboards/macos/history', title: 'MBP 负载', refreshMs: 15000 },
-  { id: 'mbp-mem', type: 'stat', endpoint: '/dashboards/macos', title: 'MBP 内存', refreshMs: 15000 },
+  { id: 'mbp-load', type: 'chart', endpoint: '/dashboards/macos/history', title: '本机负载', refreshMs: 15000 },
+  { id: 'mbp-mem', type: 'stat', endpoint: '/dashboards/macos', title: '本机内存', refreshMs: 15000 },
   { id: 'svc-probe', type: 'list', endpoint: '/dashboards/probe', title: '关键服务', refreshMs: 30000 },
-  { id: 'kuma-status', type: 'list', endpoint: '/dashboards/kuma', title: '服务状态 (Z4Nas)', refreshMs: 30000 },
+  { id: 'kuma-status', type: 'list', endpoint: '/dashboards/kuma', title: '服务状态', refreshMs: 30000 },
   { id: 'feed-digests', type: 'feed', endpoint: '/dashboards/feed/digests', title: 'feed 采集摘要', refreshMs: 60000 },
 ]
 
@@ -523,7 +521,7 @@ async function collectMacos(cfg) {
   prevNetAt = now
 
   return {
-    host: 'mbp',
+    host: hostname(),
     platform: 'darwin',
     cpuModel: model.out?.trim() ?? null,
     cores: ncpu.out ? Number(ncpu.out.trim()) : null,

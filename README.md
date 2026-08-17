@@ -4,8 +4,8 @@ DSH 看板插件：在会话区注册「看板」tab（`conversation.view`），
 
 - **los 第一方**：LLM 用量/成本（`/usage/summary`）、provider 延迟趋势（`/metrics/trends`）、任务统计（`/metrics` Prometheus）、**执行节点矩阵**（`/nodes`，含 load/mem 快照与心跳）
 - **macOS 原生探针**（零安装）：loadavg / 内存（vm_stat，含可回收缓存口径）/ CPU（iostat）/ 磁盘（df）/ 网络速率（netstat 差分）/ 进程数，内存滚动 120 点短趋势
-- **服务探活**：本机 + node34 关键服务 HTTP/TCP
-- **Uptime Kuma**（可选，默认关）：Z4Nas 排查完成后配置 `kuma.url` + `kuma.token` 即启用（REST v1 `/api/v1/monitors`）
+- **服务探活**：本机关键服务 HTTP/TCP（目标列表可经 `/dashboards/probe-targets` 编辑）
+- **Uptime Kuma**（可选，默认关）：配置 `kuma.url` + `kuma.token` 即启用（REST v1 `/api/v1/monitors`）
 - **Glances**（可选，默认关）：`brew install glances && glances -w` 后配置 `glances.url`
 - **feed 采集摘要**：读 `~/.dsh/scheduler-reports/feed-digest-*.md`（scheduler job「多平台 feed 采集摘要」落盘）最新 5 份，卡片内点击展开正文
 

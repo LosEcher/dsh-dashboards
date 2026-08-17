@@ -1,8 +1,7 @@
 {
   "name": "dsh-dashboards",
   "version": "0.1.0",
-  "description": "DSH 看板：conversation.view「看板」tab，widget 网格展示 los 用量/节点矩阵 + macOS 原生探针 + 服务探活 +（可选）Glances/Uptime Kuma 后端；host 半包挂 /dashboards 同源聚合 API。",
-  "private": true,
+  "description": "DSH 看板插件：conversation.view「看板」tab，widget 网格展示 LLM 用量/节点矩阵 + 本机 macOS 探针 + 服务探活 +（可选）Glances/Uptime Kuma + feed 采集摘要；host 半包挂 /dashboards 同源聚合 API。",
   "type": "module",
   "main": "index.mjs",
   "exports": {
@@ -13,18 +12,32 @@
   "scripts": {
     "build": "node scripts/build.mjs"
   },
-  "files": ["index.mjs", "cordis.patch.yml", "lib/client.js", "README.md"],
+  "files": [
+    "index.mjs",
+    "cordis.patch.yml",
+    "lib/client.js",
+    "src/",
+    "scripts/",
+    "README.md",
+    "LICENSE"
+  ],
   "license": "MIT",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "inject": ["@deepseek-ai/dsh-client-runtime"],
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ],
       "platform": "web"
     }
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0 <5.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LosEcher/dsh-dashboards.git"
   }
 }
