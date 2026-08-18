@@ -422,3 +422,27 @@
   opacity: 0.45;
   border-style: dashed;
 }
+
+/* Surge 节点信誉：最近事件列表 */
+.eventList {
+  margin-top: 10px;
+  border-top: 1px solid var(--dsw-alias-border-l2);
+  padding-top: 8px;
+}
+
+.eventList > p {
+  margin: 0 0 4px;
+  font-size: 12px;
+}
+
+.eventRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.eventRow .mono {
+  font-size: 11px;
+}

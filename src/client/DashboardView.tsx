@@ -13,7 +13,7 @@ import css from './DashboardView.module.css'
 
 export interface WidgetConfig {
   id: string
-  type: 'stat' | 'matrix' | 'chart' | 'list' | 'feed'
+  type: 'stat' | 'matrix' | 'chart' | 'list' | 'feed' | 'surge'
   endpoint: string
   title: string
   refreshMs: number
@@ -200,6 +200,144 @@ function Sparkline({ series }: { series: { name: string; color: string; values: 
           </span>
         ))}
       </div>
+    </div>
+  )
+}
+
+/** ── Surge 节点信誉（type 'surge'，后端 /dashboards/surge/ai-reputation） ── */
+
+interface SurgeProbe { code: string; ms: number }
+interface SurgeNodeRow {
+  name: string
+  status: string
+  xai?: SurgeProbe | null
+  grok?: SurgeProbe | null
+  openai?: SurgeProbe | null
+  ctrl?: SurgeProbe | null
+  quarantined: boolean
+  quarantineSince?: string | null
+  cooldownUntil?: string | null
+  reason?: string | null
+}
+interface SurgeRepData {
+  updatedAt?: string | null
+  lastApplyAt?: string | null
+  summary?: Record<string, number>
+  nodes: SurgeNodeRow[]
+  recentEvents?: { ts: string; type: string; node: string | null; reason: string | null }[]
+  error?: string | null
+}
+
+const fmtAgo = (iso: string | null | undefined): string => {
+  if (!iso) return '—'
+  const diff = Date.now() - new Date(iso).getTime()
+  if (!Number.isFinite(diff)) return '—'
+  const s = Math.floor(diff / 1000)
+  if (s < 60) return `${s}s 前`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}min`
+  const h = Math.floor(m / 60)
+  if (h < 48) return `${h}h`
+  return `${Math.floor(h / 24)}d`
+}
+
+function SurgeNodeTable({ data, t }: { data: unknown; t: (k: string) => string }) {
+  if (data == null || typeof data !== 'object') {
+    return <p className={css.muted}>—</p>
+  }
+  const d = data as SurgeRepData
+  const summary = d.summary ?? {}
+  const quarantinedCount = summary.quarantined ?? 0
+  const dot = (s: string): StateDotState => {
+    if (s === 'healthy') return 'done'
+    if (s === 'grok_403' || s === 'xai_partial') return 'warning'
+    return 'error' // xai_blocked / xai_banned / dead
+  }
+  const textCls = (s: string) => (
+    s === 'healthy' ? css.okText
+      : s === 'grok_403' || s === 'xai_partial' ? css.warnText
+        : css.errText
+  )
+  const codeCls = (c: string | null | undefined) => (
+    c === '401' || c === '200' || c === '204' ? css.okText
+      : c === '403' ? css.warnText
+        : c === '000' ? css.errText
+          : css.muted
+  )
+  const statusLabel = (s: string) => t(`surge.st.${s}`) || s
+  const eventCls = (type: string) => (
+    type.includes('recover') ? css.okText
+      : type.startsWith('quarantine') ? css.warnText
+        : css.muted
+  )
+  const pill = (label: string, n: number | undefined, warn: boolean) => (
+    <span className={`${css.pill} ${warn ? css.pillWarn : css.pill}`}>{label} {n ?? 0}</span>
+  )
+  return (
+    <div>
+      <div className={css.pillRow}>
+        {pill(t('surge.st.healthy'), summary.healthy, false)}
+        {pill(t('surge.st.grok_403'), summary.grok_403, true)}
+        {pill(t('surge.st.xai_blocked'), summary.xai_blocked, true)}
+        {pill(t('surge.st.xai_banned'), summary.xai_banned, true)}
+        {pill(t('surge.st.dead'), summary.dead, true)}
+        {pill(t('surge.quarantined'), quarantinedCount, quarantinedCount > 0)}
+      </div>
+      {d.error && !d.nodes.length ? <p className={css.muted}>{d.error}</p> : null}
+      <table className={css.table}>
+        <thead>
+          <tr>
+            <th>{t('col.node')}</th><th>{t('col.status')}</th><th>{t('surge.col.probe')}</th>
+            <th className={css.num}>{t('col.latency')}</th><th>{t('surge.col.q')}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {d.nodes.map((n) => (
+            <tr key={n.name}>
+              <td>
+                <span className={css.mono}>{n.name}</span>
+                {n.quarantined ? <span className={`${css.muted} ${css.hostSub}`}>{t('surge.isolated')}</span> : null}
+              </td>
+              <td>
+                <span className={css.rowDot}><StateDot state={dot(n.status)} size={8} /></span>
+                <span className={textCls(n.status)}>{statusLabel(n.status)}</span>
+              </td>
+              <td>
+                <span className={css.mono}>
+                  <span className={codeCls(n.xai?.code)}>{n.xai?.code ?? '—'}</span>
+                  <span className={css.muted}>/</span>
+                  <span className={codeCls(n.grok?.code)}>{n.grok?.code ?? '—'}</span>
+                  <span className={css.muted}>/</span>
+                  <span className={codeCls(n.openai?.code)}>{n.openai?.code ?? '—'}</span>
+                  <span className={css.muted}> c:</span>
+                  <span className={codeCls(n.ctrl?.code)}>{n.ctrl?.code ?? '—'}</span>
+                </span>
+              </td>
+              <td className={css.num}>{fmtDur(n.xai?.ms ?? n.ctrl?.ms ?? null)}</td>
+              <td>
+                {n.quarantined
+                  ? <span title={n.cooldownUntil ?? undefined}>{fmtAgo(n.cooldownUntil)}</span>
+                  : <span className={css.muted}>—</span>}
+              </td>
+            </tr>
+          ))}
+          {!d.nodes.length && !d.error && (
+            <tr><td colSpan={5} className={css.muted}>{t('noData')}</td></tr>
+          )}
+        </tbody>
+      </table>
+      {d.recentEvents && d.recentEvents.length > 0 && (
+        <div className={css.eventList}>
+          <p className={css.muted}>{t('surge.events')}</p>
+          {d.recentEvents.map((e, i) => (
+            <div key={i} className={css.eventRow}>
+              <span className={css.muted}>{fmtAgo(e.ts)}</span>
+              <span className={eventCls(e.type)}>{t(`surge.evt.${e.type}`) || e.type}</span>
+              {e.node ? <span className={css.mono}>{e.node}</span> : null}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -397,6 +535,8 @@ function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
           <TrendChart data={d} />
         ) : widget.type === 'list' ? (
           <ListCard data={d} />
+        ) : widget.type === 'surge' ? (
+          <SurgeNodeTable data={d} t={t} />
         ) : widget.type === 'feed' ? (
           <FeedCard data={d} t={t} />
         ) : (

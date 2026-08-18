@@ -75,6 +75,13 @@ export const Config = Schema.object({
       port: Schema.number(),
     })),
   }),
+  surgeRep: Schema.object({
+    pollMs: Schema.number(),
+    /** ai-node-reputation 状态文件（surge-auto，~/.local/state/surge-auto/ai-reputation-state.json）。 */
+    stateFile: Schema.string(),
+    /** 事件流（与 surge-health-watch 共用）。 */
+    eventsFile: Schema.string(),
+  }),
 })
 
 const HOME = process.env.DSH_HOME ?? `${homedir()}/.dsh`
@@ -90,8 +97,17 @@ const FEED_DIR = join(HOME, 'scheduler-reports')
 const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/los/usage', '/dashboards/los/trends', '/dashboards/los/metrics', '/dashboards/los/nodes',
   '/dashboards/macos', '/dashboards/macos/history', '/dashboards/probe', '/dashboards/glances', '/dashboards/kuma',
-  '/dashboards/feed/digests',
+  '/dashboards/feed/digests', '/dashboards/surge/ai-reputation',
 ])
+
+/** Surge 节点信誉数据源（surge-auto ai-node-reputation 输出）。 */
+const SURGE_STATE_FILE = join(homedir(), '.local/state/surge-auto/ai-reputation-state.json')
+const SURGE_EVENTS_FILE = join(homedir(), '.local/state/surge-auto/health-watch-events.jsonl')
+/** ai-node-reputation 状态 → 看板展示标签（client 侧同样维护一份 locale，这里只用于后端聚合兜底）。 */
+const SURGE_STATUS_LABEL = {
+  healthy: 'healthy', grok_403: 'grok_403', xai_blocked: 'xai_blocked',
+  xai_banned: 'xai_banned', dead: 'dead', xai_partial: 'xai_partial',
+}
 
 /** 活动门控：超过此时长无 /dashboards 请求，后台轮询暂停（看板未打开时不空转采集）。 */
 const IDLE_PAUSE_MS = 180_000
@@ -116,6 +132,7 @@ const DEFAULT_WIDGETS = [
   { id: 'svc-probe', type: 'list', endpoint: '/dashboards/probe', title: '关键服务', refreshMs: 30000 },
   { id: 'kuma-status', type: 'list', endpoint: '/dashboards/kuma', title: '服务状态', refreshMs: 30000 },
   { id: 'feed-digests', type: 'feed', endpoint: '/dashboards/feed/digests', title: 'feed 采集摘要', refreshMs: 60000 },
+  { id: 'surge-ai-rep', type: 'surge', endpoint: '/dashboards/surge/ai-reputation', title: 'Surge 节点信誉', refreshMs: 30000 },
 ]
 
 /** ── 配置解析：defaulting happens here, never inline ─────────────────── */
@@ -151,6 +168,11 @@ function resolveConfig(config) {
     probe: {
       pollMs: c.probe?.pollMs ?? 30000,
       targets: Array.isArray(c.probe?.targets) && c.probe.targets.length ? c.probe.targets : DEFAULT_TARGETS,
+    },
+    surgeRep: {
+      pollMs: c.surgeRep?.pollMs ?? 30000,
+      stateFile: c.surgeRep?.stateFile ?? SURGE_STATE_FILE,
+      eventsFile: c.surgeRep?.eventsFile ?? SURGE_EVENTS_FILE,
     },
   }
 }
@@ -627,6 +649,73 @@ function collectFeedDigests() {
   return { dir: FEED_DIR, count: digests.length, digests }
 }
 
+/** ── Surge AI 节点信誉（surge-auto ai-node-reputation 派生展示） ───── */
+function collectSurgeRep(cfg) {
+  const stateFile = cfg.surgeRep.stateFile
+  const eventsFile = cfg.surgeRep.eventsFile
+  let state = null
+  let stateErr = null
+  try {
+    state = JSON.parse(readFileSync(stateFile, 'utf8'))
+  } catch {
+    stateErr = `状态文件缺失（先运行 ai-node-reputation.mjs run）: ${stateFile}`
+  }
+
+  // 事件流尾部（source=ai-node-reputation，最多 8 条）
+  const recentEvents = []
+  try {
+    const lines = readFileSync(eventsFile, 'utf8').trim().split('\n').filter(Boolean)
+    for (let i = lines.length - 1; i >= 0 && recentEvents.length < 8; i -= 1) {
+      try {
+        const e = JSON.parse(lines[i])
+        if (e.source === 'ai-node-reputation') {
+          recentEvents.push({ ts: e.ts, type: e.type, node: e.node ?? null, reason: e.reason ?? null })
+        }
+      } catch { /* 忽略坏行 */ }
+    }
+  } catch { /* 事件文件缺失 → 空列表 */ }
+
+  const report = state?.lastReport ?? null
+  const nodes = []
+  const summary = { healthy: 0, grok_403: 0, xai_blocked: 0, xai_banned: 0, dead: 0, xai_partial: 0, quarantined: 0 }
+  if (report?.probeResults) {
+    for (const [name, r] of Object.entries(report.probeResults)) {
+      const ai = r.ai ?? {}
+      const control = r.control ?? {}
+      const ctrlEntry = Object.values(control)[0] ?? null
+      const q = state.quarantined?.[name] ?? null
+      const status = r.status in summary ? r.status : 'xai_partial'
+      summary[status] += 1
+      if (q) summary.quarantined += 1
+      nodes.push({
+        name,
+        status,
+        xai: ai['api.x.ai'] ?? null,
+        grok: ai['grok.com'] ?? null,
+        openai: ai['api.openai.com'] ?? null,
+        ctrl: ctrlEntry,
+        quarantined: !!q,
+        quarantineSince: q?.since ?? null,
+        cooldownUntil: q?.cooldownUntil ?? null,
+        reason: q?.reason ?? null,
+      })
+    }
+    nodes.sort((a, b) => {
+      const order = { dead: 0, xai_banned: 1, xai_blocked: 2, grok_403: 3, xai_partial: 4, healthy: 5 }
+      return (order[a.status] ?? 9) - (order[b.status] ?? 9) || a.name.localeCompare(b.name)
+    })
+  }
+
+  return {
+    updatedAt: state?.lastRunAt ?? null,
+    lastApplyAt: state?.lastApplyAt ?? null,
+    summary,
+    nodes,
+    recentEvents,
+    error: stateErr,
+  }
+}
+
 /** ── widget 配置存取 ──────────────────────────────────────────────── */
 function loadWidgets() {
   try {
@@ -740,6 +829,8 @@ export function apply(ctx, config) {
   }, cfg.kuma.pollMs)
   // feed 摘要（读本机报告文件，成本低；60s 节奏 + 快照缓存即可）
   const feedDigests = makePoller(collectFeedDigests, 60000)
+  // Surge AI 节点信誉（读本机 state 文件 + 事件流，成本低）
+  const surgeRep = makePoller(() => collectSurgeRep(cfg), cfg.surgeRep.pollMs)
 
   // macOS 滚动短趋势（内存缓冲；按 ts 去重，30s 采样节奏 → 120 点 = 1h 窗口）
   const history = []
@@ -781,6 +872,7 @@ export function apply(ctx, config) {
     '/dashboards/glances': glances,
     '/dashboards/kuma': kuma,
     '/dashboards/feed/digests': feedDigests,
+    '/dashboards/surge/ai-reputation': surgeRep,
   }
 
   const timers = [
@@ -793,6 +885,7 @@ export function apply(ctx, config) {
     startPoller(glances, cfg.glances.pollMs),
     startPoller(kuma, cfg.kuma.pollMs),
     startPoller(feedDigests, 60000),
+    startPoller(surgeRep, cfg.surgeRep.pollMs),
   ]
 
   // ── 磁盘水位告警（独立于看板 idle 门控：看板未打开也持续检查，主动推飞书） ──
@@ -868,6 +961,7 @@ export function apply(ctx, config) {
               glances: { enabled: cfg.glances.enabled, ...s(glances) },
               kuma: { enabled: cfg.kuma.enabled, ...s(kuma) },
               feed: s(feedDigests),
+              surgeRep: s(surgeRep),
             },
             widgets: loadWidgets().length,
           })
@@ -903,6 +997,7 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/glances') { sendJson(res, 200, await glances.get()); return }
         if (method === 'GET' && path === '/dashboards/kuma') { sendJson(res, 200, await kuma.get()); return }
         if (method === 'GET' && path === '/dashboards/feed/digests') { sendJson(res, 200, await feedDigests.get()); return }
+        if (method === 'GET' && path === '/dashboards/surge/ai-reputation') { sendJson(res, 200, await surgeRep.get()); return }
         if (method === 'GET' && path === '/dashboards/widgets') {
           sendJson(res, 200, { ts: new Date().toISOString(), widgets: loadWidgets() })
           return

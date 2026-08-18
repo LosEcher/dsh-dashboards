@@ -36,6 +36,21 @@ export const zh = {
   'col.latency': '延迟',
   'col.node': '节点',
   'col.detail': '详情',
+  'surge.col.probe': '探测 xai/grok/oai·c',
+  'surge.col.q': '隔离',
+  'surge.quarantined': '隔离',
+  'surge.isolated': '隔离中',
+  'surge.events': '最近事件',
+  'surge.st.healthy': '健康',
+  'surge.st.grok_403': 'Grok拦',
+  'surge.st.xai_blocked': 'xAI拦',
+  'surge.st.xai_banned': '被ban',
+  'surge.st.dead': '死亡',
+  'surge.st.xai_partial': '部分',
+  'surge.evt.quarantine': '隔离',
+  'surge.evt.quarantine_recover': '解隔离',
+  'surge.evt.quarantine_extend': '续隔离',
+  'surge.evt.config_applied': '配置已应用',
 }
 
 export const en = {
@@ -71,6 +86,21 @@ export const en = {
   'col.latency': 'Latency',
   'col.node': 'Node',
   'col.detail': 'Detail',
+  'surge.col.probe': 'Probe xai/grok/oai·c',
+  'surge.col.q': 'Quarantine',
+  'surge.quarantined': 'Quarantine',
+  'surge.isolated': 'isolated',
+  'surge.events': 'Recent events',
+  'surge.st.healthy': 'healthy',
+  'surge.st.grok_403': 'grok 403',
+  'surge.st.xai_blocked': 'xAI blocked',
+  'surge.st.xai_banned': 'banned',
+  'surge.st.dead': 'dead',
+  'surge.st.xai_partial': 'partial',
+  'surge.evt.quarantine': 'quarantine',
+  'surge.evt.quarantine_recover': 'recovered',
+  'surge.evt.quarantine_extend': 'extended',
+  'surge.evt.config_applied': 'config applied',
 }
 
 export type DashboardKey = keyof typeof zh
