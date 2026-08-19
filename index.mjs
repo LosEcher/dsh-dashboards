@@ -929,9 +929,8 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/los/nodes') { sendJson(res, 200, await losNodes.get()); return }
         if (method === 'GET' && path === '/dashboards/macos') { const s = await macos.get(); if (cfg.macos.enabled && !s.data) await macos.refresh(); sendJson(res, 200, s); return }
         if (method === 'GET' && path === '/dashboards/macos/history') {
-          pushHistory(macos.snapshot())
-          // 与其它端点同构的 {ts, data, error} 快照包装（client 按 snap.data 取数）
-          sendJson(res, 200, { ts: new Date().toISOString(), data: { points: history.slice(-60) }, error: null })
+          // 统一走 historyPoller（含 gap 填充 + sampleMs/window 元信息，与 snapshot 聚合同构）
+          sendJson(res, 200, await historyPoller.get())
           return
         }
         if (method === 'GET' && path === '/dashboards/probe') { sendJson(res, 200, await probe.get()); return }
