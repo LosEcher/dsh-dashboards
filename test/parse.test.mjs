@@ -9,7 +9,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   parseIostatCpu, parseNetstatIb, parseLoadavg, parseVmStat, parseDf,
-  parsePrometheus, parseKumaMetrics,
+  parsePrometheus, parseKumaMetrics, fillGapPoints,
 } from '../lib/parsers.mjs'
 
 // ── parseIostatCpu ──────────────────────────────────────────────────────
@@ -142,4 +142,37 @@ test('parseKumaMetrics: monitor_response_time_seconds 变体不误匹配（名�
   // _seconds 行不匹配，latency 保持 null
   assert.equal(r.length, 1)
   assert.equal(r[0].latency, null)
+})
+
+// ── fillGapPoints（macos history 断档标注） ───────────────────────────
+const P = (ts, load1) => ({ ts, load1 })
+
+test('fillGapPoints: 正常连续点不插入', () => {
+  const pts = [P('2026-08-19T10:00:00', 1), P('2026-08-19T10:00:30', 2), P('2026-08-19T10:01:00', 3)]
+  const out = fillGapPoints(pts, 30000)
+  assert.equal(out.length, 3)
+  assert.deepEqual(out, pts)
+})
+
+test('fillGapPoints: >2×sampleMs 间隔插入 null 断档占位（受默认 maxNulls=90 封顶）', () => {
+  // idle 1h 后恢复：10:00 与 11:00 之间应插入 min(119, 90)=90 个 null（30s 采样）
+  const pts = [P('2026-08-19T10:00:00', 1), P('2026-08-19T11:00:00', 2)]
+  const out = fillGapPoints(pts, 30000)
+  assert.equal(out.length, 2 + 90)
+  assert.equal(out[1], null)
+  assert.equal(out[out.length - 2], null)
+  assert.equal(out[out.length - 1].load1, 2)
+})
+
+test('fillGapPoints: maxNulls 上限防超长 idle 撑爆', () => {
+  const pts = [P('2026-08-19T10:00:00', 1), P('2026-08-19T20:00:00', 2)]
+  const out = fillGapPoints(pts, 30000, 10)
+  assert.equal(out.length, 2 + 10)
+})
+
+test('fillGapPoints: 参数异常返回原数组副本', () => {
+  assert.deepEqual(fillGapPoints(null, 30000), [])
+  assert.deepEqual(fillGapPoints([], 30000), [])
+  assert.deepEqual(fillGapPoints([P('2026-08-19T10:00:00', 1)], 30000), [P('2026-08-19T10:00:00', 1)])
+  assert.equal(fillGapPoints([P('2026-08-19T10:00:00', 1), P('2026-08-19T10:01:00', 2)], 0).length, 2)
 })

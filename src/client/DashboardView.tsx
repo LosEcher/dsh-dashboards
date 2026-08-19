@@ -134,7 +134,7 @@ function NodeMatrix({ data, t }: { data: unknown; t: (k: string) => string }) {
     <table className={css.table}>
       <thead>
         <tr>
-          <th>{t('col.node')}</th><th>{t('col.status')}</th><th className={css.num}>{t('col.load')}</th>
+          <th>{t('col.node')}</th><th>{t('col.status')}</th><th className={css.num}>{t('col.loadCore')}</th>
           <th className={css.num}>{t('col.mem')}</th><th>{t('col.platform')}</th><th className={css.num}>{t('col.heartbeat')}</th>
         </tr>
       </thead>
@@ -149,7 +149,11 @@ function NodeMatrix({ data, t }: { data: unknown; t: (k: string) => string }) {
               <span className={css.rowDot}><StateDot state={dot(n.status ?? '?')} size={8} /></span>
               <span className={n.status === 'online' ? css.okText : n.status === 'offline' ? css.errText : css.warnText}>{n.status ?? '?'}</span>
             </td>
-            <td className={css.num}>{n.capacity?.cpuLoad1m != null ? n.capacity.cpuLoad1m.toFixed(2) : '—'}</td>
+            <td className={css.num}>
+              {n.capacity?.cpuLoad1m != null
+                ? `${(n.capacity.cpuLoad1m / Math.max(n.capacity?.cpuCores ?? 1, 1)).toFixed(2)}${n.capacity?.cpuCores ? `/${n.capacity.cpuCores}c` : ''}`
+                : '—'}
+            </td>
             <td className={css.num}>
               {n.capacity?.memoryAvailableMb != null ? `${(n.capacity.memoryAvailableMb / 1024).toFixed(1)}G` : '—'}
               {n.capacity?.memoryTotalMb != null ? `/${(n.capacity.memoryTotalMb / 1024).toFixed(0)}G` : ''}
@@ -169,29 +173,42 @@ function Sparkline({ series }: { series: { name: string; color: string; unit?: '
   const P = 3
   const fmt = (v: number, unit?: 'ms' | 'raw') => (unit === 'ms' ? fmtDur(v) : v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(1))
   const paths = series.map((s) => {
-    const nums = s.values.filter((v): v is number => v != null)
+    const vals = s.values
+    const nums = vals.filter((v): v is number => v != null)
     if (!nums.length) return null
     const max = Math.max(...nums, 1e-6)
     const min = Math.min(...nums, 0)
     const range = max - min || 1
-    const pts = nums.map((v, i) => {
-      const x = P + (i / Math.max(nums.length - 1, 1)) * (W - P * 2)
+    // 按原始索引定位 x（含 null 断档占位）；null 断开曲线 → 分段渲染，段间不直连
+    const segments: string[] = []
+    let cur: string[] = []
+    vals.forEach((v, i) => {
+      if (v == null) {
+        if (cur.length) { segments.push(cur.join(' ')); cur = [] }
+        return
+      }
+      const x = P + (i / Math.max(vals.length - 1, 1)) * (W - P * 2)
       const y = H - P - ((v - min) / range) * (H - P * 2)
-      return `${x.toFixed(1)},${y.toFixed(1)}`
+      cur.push(`${x.toFixed(1)},${y.toFixed(1)}`)
     })
+    if (cur.length) segments.push(cur.join(' '))
     return {
       name: s.name,
       color: s.color,
       unit: s.unit,
       last: nums[nums.length - 1],
-      d: `M${pts.join(' L')}`,
+      segments,
     }
   })
   return (
     <div>
       <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} role="img" aria-label="sparkline">
         {paths.filter((p): p is NonNullable<typeof p> => p !== null).map((p, i) => (
-          <polyline key={i} points={p.d.slice(1)} fill="none" stroke={p.color} strokeWidth="1.6" strokeLinejoin="round" />
+          <g key={i}>
+            {p.segments.map((pts, j) => (
+              <polyline key={j} points={pts} fill="none" stroke={p.color} strokeWidth="1.6" strokeLinejoin="round" />
+            ))}
+          </g>
         ))}
       </svg>
       <div className={css.legend}>
@@ -344,11 +361,11 @@ function SurgeNodeTable({ data, t }: { data: unknown; t: (k: string) => string }
   )
 }
 
-function TrendChart({ data }: { data: unknown }) {
+function TrendChart({ data, t }: { data: unknown; t: (k: string) => string }) {
   if (data == null || typeof data !== 'object') {
     return <p className={css.muted}>—</p>
   }
-  const d = data as { series?: { provider?: string; model?: string; points?: { day?: string; avgDurationMs?: number | null }[] }[]; points?: { ts?: string; load1?: number | null; memUsedPct?: number | null }[] }
+  const d = data as { series?: { provider?: string; model?: string; points?: { day?: string; avgDurationMs?: number | null }[] }[]; points?: ({ ts?: string; load1?: number | null; memUsedPct?: number | null } | null)[]; sampleMs?: number; windowStart?: string | null; windowEnd?: string | null }
   const COLORS = [
     'color-mix(in srgb, var(--dsw-alias-brand-primary) 80%, transparent)',
     'color-mix(in srgb, var(--dsw-alias-state-warn-primary) 80%, transparent)',
@@ -370,18 +387,32 @@ function TrendChart({ data }: { data: unknown }) {
   }
   if (d.points) {
     const pts = d.points
-    if (pts.length < 2) return <p className={css.muted}>等待采样…</p>
+    const real = pts.filter((p): p is NonNullable<typeof p> => p != null)
+    if (real.length < 2) return <p className={css.muted}>等待采样…</p>
     const series = [
-      { name: 'load1', unit: 'raw' as const, color: COLORS[0], values: pts.map((p) => p.load1 ?? null) },
-      { name: 'mem%', unit: 'raw' as const, color: COLORS[1], values: pts.map((p) => p.memUsedPct ?? null) },
+      { name: 'load1', unit: 'raw' as const, color: COLORS[0], values: pts.map((p) => (p == null ? null : p.load1 ?? null)) },
+      { name: 'mem%', unit: 'raw' as const, color: COLORS[1], values: pts.map((p) => (p == null ? null : p.memUsedPct ?? null)) },
     ]
-    return <Sparkline series={series} />
+    // 断档数 = null 占位计数；窗口 = windowStart~windowEnd（idle 停采期间曲线断开，不再直连跳变）
+    const gaps = pts.filter((p) => p == null).length
+    const winMin = d.windowStart && d.windowEnd
+      ? Math.max(1, Math.round((new Date(d.windowEnd).getTime() - new Date(d.windowStart).getTime()) / 60000))
+      : null
+    return (
+      <div>
+        <Sparkline series={series} />
+        <p className={css.muted}>
+          {winMin != null ? `${t('chart.window')} ${winMin}min · ` : ''}{t('chart.points')} {real.length}
+          {gaps > 0 ? ` · ${t('chart.gap')} ${gaps}` : ''}
+        </p>
+      </div>
+    )
   }
   return <p className={css.muted}>无图表数据</p>
 }
 
 interface ListRow {
-  name?: string; ok?: boolean; detail?: string; latencyMs?: number
+  name?: string; ok?: boolean; degraded?: boolean; detail?: string; latencyMs?: number
   status?: string; latency?: number; uptime?: number; active?: boolean
 }
 
@@ -415,12 +446,17 @@ function ListCard({ data }: { data: unknown }) {
     )
   }
   const results = d.results ?? []
-  const down = results.filter((r) => !r.ok)
+  const degraded = results.filter((r) => r.degraded)
+  const down = results.filter((r) => !r.ok && !r.degraded)
+  const upCount = d.ok ?? results.length - down.length - degraded.length
+  const rowDot = (r: ListRow): StateDotState => (r.ok ? 'done' : r.degraded ? 'warning' : 'error')
+  const rowText = (r: ListRow) => (r.ok ? 'up' : r.degraded ? 'degraded' : 'down')
+  const rowCls = (r: ListRow) => (r.ok ? css.okText : r.degraded ? css.warnText : css.errText)
   return (
     <div>
       <div className={css.pillRow}>
-        <span className={`${css.pill} ${down.length ? css.pillWarn : css.pill}`}>
-          {d.ok ?? (results.length - down.length)}/{d.total ?? results.length} up
+        <span className={`${css.pill} ${down.length ? css.pillWarn : degraded.length ? css.pillWarn : css.pill}`}>
+          {upCount}/{d.total ?? results.length} up{degraded.length ? ` · ${degraded.length} degraded` : ''}
         </span>
       </div>
       <table className={css.table}>
@@ -432,8 +468,8 @@ function ListCard({ data }: { data: unknown }) {
             <tr key={i}>
               <td>{r.name ?? '—'}</td>
               <td>
-                <span className={css.rowDot}><StateDot state={r.ok ? 'done' : 'error'} size={8} /></span>
-                <span className={r.ok ? css.okText : css.errText}>{r.ok ? 'up' : 'down'}</span>
+                <span className={css.rowDot}><StateDot state={rowDot(r)} size={8} /></span>
+                <span className={rowCls(r)}>{rowText(r)}</span>
               </td>
               <td className={css.num}>{r.latencyMs != null ? `${r.latencyMs}ms` : '—'}</td>
               <td className={css.muted}>{r.detail ?? '—'}</td>
@@ -535,7 +571,7 @@ function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
         ) : widget.type === 'matrix' ? (
           <NodeMatrix data={d} t={t} />
         ) : widget.type === 'chart' ? (
-          <TrendChart data={d} />
+          <TrendChart data={d} t={t} />
         ) : widget.type === 'list' ? (
           <ListCard data={d} />
         ) : widget.type === 'surge' ? (

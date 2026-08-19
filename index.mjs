@@ -24,11 +24,11 @@
 
 import Schema from '@deepseek-ai/schemastery'
 import { execFile } from 'node:child_process'
-import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync } from 'node:fs'
+import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir, hostname } from 'node:os'
 import { createConnection } from 'node:net'
-import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics } from './lib/parsers.mjs'
+import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints } from './lib/parsers.mjs'
 
 export const name = 'dsh-dashboards'
 export const inject = ['webServer']
@@ -91,6 +91,8 @@ const WIDGETS_FILE = join(HOME, 'storages/dsh-dashboards/widgets.json')
 /** 探针目标 store：UI 编辑（PUT /dashboards/probe-targets）落盘于此，优先于 Config.probe.targets 与 DEFAULT_TARGETS。 */
 const PROBE_FILE = join(HOME, 'storages/dsh-dashboards/probe-targets.json')
 const DEFAULTS_DIR = join(HOME, 'storages/dsh-dashboards')
+/** macOS 滚动趋势持久化（事件溯源风格 jsonl，追加写；重启不清零，2026-08-19）。 */
+const HISTORY_FILE = join(HOME, 'storages/dsh-dashboards/history.jsonl')
 /** feed 采集摘要报告目录（scheduler job「多平台 feed 采集摘要」落盘：feed-digest-*.md 在 scheduler-reports 根目录；feed/ 子目录是原始 JSON，feed-profile/ 是画像）。 */
 const FEED_DIR = join(HOME, 'scheduler-reports')
 
@@ -450,20 +452,31 @@ async function collectMacos(cfg) {
   }
 }
 
-/** ── 服务探活 ──────────────────────────────────────────────────────── */
+/** ── 服务探活 ────────────────────────────────────────────────────────
+ * 2026-08-19 P2：状态三分——ok(<400) / degraded(4xx) / down(≥500 或不可达)；
+ * HEAD 405（方法不允许）自动降级 GET 复测（服务在但 HEAD 未实现）。
+ */
+async function tryProbe(url, method) {
+  try {
+    return await fetch(url, { method, signal: AbortSignal.timeout(3000) })
+  } catch {
+    return null
+  }
+}
+
 async function probeOne(target) {
   const started = Date.now()
   if (target.url) {
-    try {
-      const res = await fetch(target.url, { method: 'HEAD', signal: AbortSignal.timeout(3000) })
-      return { name: target.name, ok: res.status < 500, detail: `HTTP ${res.status}`, latencyMs: Date.now() - started }
-    } catch (e) {
-      try {
-        const res = await fetch(target.url, { method: 'GET', signal: AbortSignal.timeout(3000) })
-        return { name: target.name, ok: res.status < 500, detail: `HTTP ${res.status}`, latencyMs: Date.now() - started }
-      } catch {
-        return { name: target.name, ok: false, detail: 'unreachable', latencyMs: Date.now() - started }
-      }
+    const head = await tryProbe(target.url, 'HEAD')
+    const res = head?.status === 405 ? await tryProbe(target.url, 'GET') : head
+    if (!res) return { name: target.name, ok: false, degraded: false, detail: 'unreachable', latencyMs: Date.now() - started }
+    const status = res.status
+    return {
+      name: target.name,
+      ok: status < 400,
+      degraded: status >= 400 && status < 500,
+      detail: `HTTP ${status}`,
+      latencyMs: Date.now() - started,
     }
   }
   if (target.port) {
@@ -472,27 +485,28 @@ async function probeOne(target) {
       const sock = createConnection({ host, port: target.port })
       const timer = setTimeout(() => {
         sock.destroy()
-        resolve({ name: target.name, ok: false, detail: 'timeout', latencyMs: Date.now() - started })
+        resolve({ name: target.name, ok: false, degraded: false, detail: 'timeout', latencyMs: Date.now() - started })
       }, 3000)
       sock.once('connect', () => {
         clearTimeout(timer)
         sock.end()
-        resolve({ name: target.name, ok: true, detail: 'tcp ok', latencyMs: Date.now() - started })
+        resolve({ name: target.name, ok: true, degraded: false, detail: 'tcp ok', latencyMs: Date.now() - started })
       })
       sock.once('error', (e) => {
         clearTimeout(timer)
-        resolve({ name: target.name, ok: false, detail: String(e.code ?? e.message).slice(0, 60), latencyMs: Date.now() - started })
+        resolve({ name: target.name, ok: false, degraded: false, detail: String(e.code ?? e.message).slice(0, 60), latencyMs: Date.now() - started })
       })
     })
   }
-  return { name: target.name, ok: false, detail: 'no url/port' }
+  return { name: target.name, ok: false, degraded: false, detail: 'no url/port' }
 }
 
 async function collectProbe(cfg) {
   const targets = loadProbeTargets(cfg)
   const results = await Promise.all(targets.map((t) => probeOne(t)))
   const ok = results.filter((r) => r.ok).length
-  return { total: results.length, ok, down: results.length - ok, results }
+  const degraded = results.filter((r) => r.degraded).length
+  return { total: results.length, ok, degraded, down: results.length - ok - degraded, results }
 }
 
 /** ── feed 采集摘要报告（scheduler 落盘文件，只读，零持久化） ──────────
@@ -608,6 +622,41 @@ function collectSurgeRep(cfg) {
     recentEvents,
     error: stateErr,
   }
+}
+
+/** ── macOS 趋势持久化（history.jsonl，事件溯源风格） ─────────────────
+ * 追加写一行/点；启动加载最近 maxPoints 点（重启不清零，2026-08-19 P2）。
+ * 磁盘错误一律静默降级：采集链路不因持久化失败中断。
+ */
+function loadHistoryFromDisk(maxPoints) {
+  try {
+    const lines = readFileSync(HISTORY_FILE, 'utf8').trim().split('\n').filter(Boolean)
+    if (lines.length > maxPoints * 3) {
+      // 文件超长 → 压缩只保留最近 maxPoints 行（30s/点 ≈ 2 天/1200 行后触发）
+      const keep = lines.slice(-maxPoints)
+      mkdirSync(DEFAULTS_DIR, { recursive: true })
+      writeFileSync(HISTORY_FILE, keep.join('\n') + '\n')
+      return keep.map(parseHistoryLine).filter(Boolean)
+    }
+    const from = Math.max(0, lines.length - maxPoints)
+    return lines.slice(from).map(parseHistoryLine).filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+function parseHistoryLine(line) {
+  try {
+    const p = JSON.parse(line)
+    if (p && typeof p.ts === 'string') return p
+  } catch { /* 坏行跳过 */ }
+  return null
+}
+
+function appendHistoryToDisk(point) {
+  try {
+    appendFileSync(HISTORY_FILE, JSON.stringify(point) + '\n')
+  } catch { /* 忽略 */ }
 }
 
 /** ── widget 配置存取 ──────────────────────────────────────────────── */
@@ -726,20 +775,23 @@ export function apply(ctx, config) {
   // Surge AI 节点信誉（读本机 state 文件 + 事件流，成本低）
   const surgeRep = makePoller(() => collectSurgeRep(cfg), cfg.surgeRep.pollMs)
 
-  // macOS 滚动短趋势（内存缓冲；按 ts 去重，30s 采样节奏 → 120 点 = 1h 窗口）
-  const history = []
+  // ── macOS 滚动短趋势（持久化 jsonl + 内存窗口；按 ts 去重，30s 采样节奏 → 120 点 = 1h 窗口）
+  // 2026-08-19 P2：重启从磁盘加载（不因插件重启清零）；断档由 fillGapPoints 标注。
+  const history = loadHistoryFromDisk(cfg.macos.historyPoints)
   const pushHistory = (snap) => {
     const d = snap?.data
     if (!d) return
     if (history.length && history[history.length - 1].ts === snap.ts) return
-    history.push({
+    const point = {
       ts: snap.ts,
       load1: d.loadavg?.load1 ?? null,
       cpuUsedPct: d.cpu?.usedPct ?? null,
       memUsedPct: d.memory?.usedPct ?? null,
       netInBps: d.net?.inBps ?? null,
       netOutBps: d.net?.outBps ?? null,
-    })
+    }
+    history.push(point)
+    appendHistoryToDisk(point)
     if (history.length > cfg.macos.historyPoints) history.shift()
   }
   const macosTimer = setInterval(() => {
@@ -747,11 +799,21 @@ export function apply(ctx, config) {
     pushHistory(macos.snapshot())
   }, 3000)
   macosTimer.unref?.()
-  // history 端点（非 makePoller；聚合端点同构快照）
+  // history 端点（非 makePoller；聚合端点同构快照；gap 填充 + 窗口元信息）
   const historyPoller = {
     get: async () => {
       pushHistory(macos.snapshot())
-      return { ts: new Date().toISOString(), data: { points: history.slice(-60) }, error: null }
+      const raw = history.slice(-60)
+      return {
+        ts: new Date().toISOString(),
+        data: {
+          points: fillGapPoints(raw, cfg.macos.pollMs),
+          sampleMs: cfg.macos.pollMs,
+          windowStart: raw[0]?.ts ?? null,
+          windowEnd: raw[raw.length - 1]?.ts ?? null,
+        },
+        error: null,
+      }
     },
   }
   // endpoint → poller 映射（/dashboards/snapshot 聚合用）
