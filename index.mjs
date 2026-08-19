@@ -28,6 +28,7 @@ import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync
 import { join } from 'node:path'
 import { homedir, hostname } from 'node:os'
 import { createConnection } from 'node:net'
+import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics } from './lib/parsers.mjs'
 
 export const name = 'dsh-dashboards'
 export const inject = ['webServer']
@@ -127,8 +128,8 @@ const DEFAULT_WIDGETS = [
   { id: 'los-usage', type: 'stat', endpoint: '/dashboards/los/usage', title: 'LLM 用量 24h', refreshMs: 60000 },
   { id: 'los-nodes', type: 'matrix', endpoint: '/dashboards/los/nodes', title: '执行节点', refreshMs: 30000 },
   { id: 'los-latency', type: 'chart', endpoint: '/dashboards/los/trends', title: 'provider 延迟', refreshMs: 300000 },
-  { id: 'mbp-load', type: 'chart', endpoint: '/dashboards/macos/history', title: '本机负载', refreshMs: 15000 },
-  { id: 'mbp-mem', type: 'stat', endpoint: '/dashboards/macos', title: '本机内存', refreshMs: 15000 },
+  { id: 'mbp-load', type: 'chart', endpoint: '/dashboards/macos/history', title: '本机负载', refreshMs: 30000 },
+  { id: 'mbp-mem', type: 'stat', endpoint: '/dashboards/macos', title: '本机内存', refreshMs: 30000 },
   { id: 'svc-probe', type: 'list', endpoint: '/dashboards/probe', title: '关键服务', refreshMs: 30000 },
   { id: 'kuma-status', type: 'list', endpoint: '/dashboards/kuma', title: '服务状态', refreshMs: 30000 },
   { id: 'feed-digests', type: 'feed', endpoint: '/dashboards/feed/digests', title: 'feed 采集摘要', refreshMs: 60000 },
@@ -283,14 +284,21 @@ async function losFetch(cfg, tokens, path, { operator = false } = {}) {
 }
 
 async function collectLosUsage(cfg, tokens) {
-  const res = await losFetch(cfg, tokens, '/usage/summary')
+  // 显式 24h 窗口（与 widget 标题「LLM 用量 24h」一致）；los /usage/summary 缺省是 7 天，
+  // 不传会把 7 天汇总当成 24h 展示（成本数字差 ~26 倍，2026-08-19 实测对拍）。
+  const from = new Date(Date.now() - 24 * 3600_000).toISOString()
+  const res = await losFetch(cfg, tokens, `/usage/summary?from=${encodeURIComponent(from)}`)
   const d = await res.json()
   return {
     totals: d.totals ?? null,
     byProviderModel: (d.byProviderModel ?? []).map((r) => ({
       provider: r.provider, model: r.model, calls: r.modelResponseCount,
-      tokens: r.totalTokens ?? 0, costUsd: r.estimatedCostUsd ?? 0,
-      cacheHitRate: r.cacheHitRate ?? null,
+      // los 行无 totalTokens/cacheHitRate 字段（只有 prompt/completion/hit/miss），2026-08-19 修正映射
+      tokens: (r.promptTokens ?? 0) + (r.completionTokens ?? 0),
+      costUsd: r.estimatedCostUsd ?? 0,
+      cacheHitRate: (r.cacheHitTokens ?? 0) + (r.cacheMissTokens ?? 0) > 0
+        ? (r.cacheHitTokens ?? 0) / ((r.cacheHitTokens ?? 0) + (r.cacheMissTokens ?? 0))
+        : null,
     })),
     callTelemetry: (d.callTelemetry ?? []).map((r) => ({
       provider: r.provider, model: r.model, callCount: r.callCount,
@@ -314,36 +322,6 @@ async function collectLosTrends(cfg, tokens) {
   }
 }
 
-/** Prometheus 文本 → 分组统计（los /metrics）。 */
-function parsePrometheus(text) {
-  const out = { taskRuns: {}, runEvals: {}, toolErrors: null, modelCost: null, providerCalls: {}, providerErrors: {}, providerDurationMs: {}, cacheHit: null, cacheMiss: null, raw: 0 }
-  for (const line of text.split('\n')) {
-    if (!line || line.startsWith('#')) continue
-    const m = line.match(/^(\w+)(?:\{([^}]*)\})?\s+(\S+)$/)
-    if (!m) continue
-    const name = m[1]
-    const labels = {}
-    if (m[2]) {
-      for (const kv of m[2].split(',')) {
-        const [k, v] = kv.split('=')
-        if (k) labels[k] = (v ?? '').replace(/^"|"$/g, '')
-      }
-    }
-    const value = Number(m[3])
-    out.raw += 1
-    if (name === 'los_task_runs_total') out.taskRuns[labels.status ?? '?'] = value
-    else if (name === 'los_run_evals_total') out.runEvals[labels.success ?? '?'] = value
-    else if (name === 'los_tool_errors_total') out.toolErrors = value
-    else if (name === 'los_model_cost_total') out.modelCost = value
-    else if (name === 'los_provider_calls_total') out.providerCalls[labels.provider ?? '?'] = value
-    else if (name === 'los_provider_errors_total') out.providerErrors[labels.provider ?? '?'] = value
-    else if (name === 'los_provider_duration_milliseconds') out.providerDurationMs[labels.provider ?? '?'] = value
-    else if (name === 'los_cache_hit_tokens_total') out.cacheHit = value
-    else if (name === 'los_cache_miss_tokens_total') out.cacheMiss = value
-  }
-  return out
-}
-
 async function collectLosMetrics(cfg, tokens) {
   const res = await losFetch(cfg, tokens, '/metrics')
   return parsePrometheus(await res.text())
@@ -362,41 +340,6 @@ async function collectLosNodes(cfg, tokens) {
     heartbeatAgeSec: n.lastHeartbeatAt
       ? Math.max(0, Math.round((Date.now() - new Date(n.lastHeartbeatAt).getTime()) / 1000))
       : null,
-  }))
-}
-
-/** ── Kuma 2.x：Prometheus /metrics → monitors（无旧版 /api/v1 REST，Basic auth 取 metrics） ── */
-function parseKumaMetrics(text) {
-  const rows = {}
-  for (const line of text.split('\n')) {
-    const m = line.match(/^(\w+)(?:\{([^}]*)\})?\s+(\S+)$/)
-    if (!m) continue
-    const name = m[1]
-    const labels = {}
-    if (m[2]) {
-      for (const kv of m[2].split(',')) {
-        const eq = kv.indexOf('=')
-        if (eq === -1) continue
-        labels[kv.slice(0, eq)] = kv.slice(eq + 1).replace(/^"|"$/g, '')
-      }
-    }
-    const value = Number(m[3])
-    // 只关心 monitor_* 指标；其它指标（process_*/nodejs_*/http_* 等）无 monitor 标签，跳过避免幻影行
-    if (!name.startsWith('monitor_')) continue
-    const id = labels.monitor_id ?? labels.monitor_name ?? '?'
-    if (!rows[id]) {
-      rows[id] = { id, name: labels.monitor_name ?? id, type: labels.monitor_type ?? null, status: null, latencyMs: null, uptime: null, certDays: null }
-    }
-    if (name === 'monitor_status') rows[id].status = value
-    else if (name === 'monitor_response_time') rows[id].latencyMs = value
-    else if (name === 'monitor_uptime_ratio' && labels.window === '30d') rows[id].uptime = value * 100
-    else if (name === 'monitor_cert_days_remaining') rows[id].certDays = value
-  }
-  const STATUS = { 0: 'down', 1: 'up', 2: 'pending', 3: 'maintenance' }
-  return Object.values(rows).map((r) => ({
-    id: r.id, name: r.name, type: r.type,
-    status: STATUS[r.status] ?? 'unknown',
-    latency: r.latencyMs, uptime: r.uptime, certDays: r.certDays,
   }))
 }
 
@@ -437,55 +380,6 @@ function withTimeout(promise, ms, label) {
   })
   timer?.unref?.()
   return Promise.race([promise, timeout])
-}
-
-function parseLoadavg(text) {
-  // macOS `sysctl -n vm.loadavg` 输出带花括号："{ 1.23 0.98 0.76 }"
-  const m = text.trim().match(/\{\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)/)
-  return m ? { load1: Number(m[1]), load5: Number(m[2]), load15: Number(m[3]) } : null
-}
-
-function parseVmStat(text) {
-  const pages = {}
-  for (const line of text.split('\n')) {
-    const m = line.match(/^Pages\s+(\w+):\s+(\d+)\.?/)
-    if (m) pages[m[1].toLowerCase()] = Number(m[2])
-  }
-  return pages
-}
-
-function parseIostatCpu(text) {
-  const lines = text.trim().split('\n').filter(Boolean)
-  const last = lines[lines.length - 1] ?? ''
-  const nums = last.trim().split(/\s+/).map(Number).filter((n) => Number.isFinite(n))
-  if (nums.length < 3) return null
-  const [us, sy, id] = nums.slice(-3)
-  return { us, sy, id, usedPct: Math.round((us + sy) * 10) / 10 }
-}
-
-function parseDf(text) {
-  const rows = []
-  for (const line of text.trim().split('\n').slice(1)) {
-    const f = line.trim().split(/\s+/)
-    if (f.length < 9) continue
-    rows.push({
-      fs: f[0], size: f[1], used: f[2], avail: f[3], capacity: f[4], mount: f.slice(8).join(' '),
-    })
-  }
-  return rows
-}
-
-function parseNetstatIb(text) {
-  const byIface = {}
-  for (const line of text.split('\n')) {
-    const f = line.trim().split(/\s+/)
-    if (f.length < 10 || !f[2]?.startsWith('<Link#')) continue
-    const name = f[0]
-    const ibytes = Number(f[6] ?? 0)
-    const obytes = Number(f[9] ?? 0)
-    byIface[name] = { ibytes, obytes }
-  }
-  return byIface
 }
 
 let prevNet = null

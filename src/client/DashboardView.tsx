@@ -163,10 +163,11 @@ function NodeMatrix({ data, t }: { data: unknown; t: (k: string) => string }) {
   )
 }
 
-function Sparkline({ series }: { series: { name: string; color: string; values: (number | null)[] }[] }) {
+function Sparkline({ series }: { series: { name: string; color: string; unit?: 'ms' | 'raw'; values: (number | null)[] }[] }) {
   const W = 300
   const H = 56
   const P = 3
+  const fmt = (v: number, unit?: 'ms' | 'raw') => (unit === 'ms' ? fmtDur(v) : v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(1))
   const paths = series.map((s) => {
     const nums = s.values.filter((v): v is number => v != null)
     if (!nums.length) return null
@@ -181,6 +182,7 @@ function Sparkline({ series }: { series: { name: string; color: string; values: 
     return {
       name: s.name,
       color: s.color,
+      unit: s.unit,
       last: nums[nums.length - 1],
       d: `M${pts.join(' L')}`,
     }
@@ -196,7 +198,7 @@ function Sparkline({ series }: { series: { name: string; color: string; values: 
         {paths.filter((p): p is NonNullable<typeof p> => p !== null).map((p, i) => (
           <span key={i} className={css.legendItem}>
             <span className={css.legendDot} style={{ background: p.color }} />
-            {p.name} {p.last != null ? (p.last >= 1000 ? `${(p.last / 1000).toFixed(1)}k` : p.last.toFixed(1)) : '—'}
+            {p.name} {p.last != null ? fmt(p.last, p.unit) : '—'}
           </span>
         ))}
       </div>
@@ -360,6 +362,7 @@ function TrendChart({ data }: { data: unknown }) {
       .map((s, i) => ({
         name: `${s.model ?? s.provider ?? '?'}`,
         color: COLORS[i % COLORS.length],
+        unit: 'ms' as const, // los trends avgDurationMs 单位 ms
         values: (s.points ?? []).map((p) => p.avgDurationMs ?? null),
       }))
     if (!series.length) return <p className={css.muted}>无趋势数据</p>
@@ -369,8 +372,8 @@ function TrendChart({ data }: { data: unknown }) {
     const pts = d.points
     if (pts.length < 2) return <p className={css.muted}>等待采样…</p>
     const series = [
-      { name: 'load1', color: COLORS[0], values: pts.map((p) => p.load1 ?? null) },
-      { name: 'mem%', color: COLORS[1], values: pts.map((p) => p.memUsedPct ?? null) },
+      { name: 'load1', unit: 'raw' as const, color: COLORS[0], values: pts.map((p) => p.load1 ?? null) },
+      { name: 'mem%', unit: 'raw' as const, color: COLORS[1], values: pts.map((p) => p.memUsedPct ?? null) },
     ]
     return <Sparkline series={series} />
   }
