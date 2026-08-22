@@ -118,6 +118,171 @@ function StatCard({ data, t }: { data: unknown; t: (k: string) => string }) {
   return <p className={css.muted}>{t('noData')}</p>
 }
 
+/** AI 额度（ZenMux + Packy）：/dashboards/ai-quota 聚合。 */
+function QuotaCard({ data }: { data: unknown }) {
+  if (data == null || typeof data !== 'object') {
+    return <p className={css.muted}>—</p>
+  }
+  const d = data as {
+    zenmux?: {
+      paygBalanceUsd?: number
+      plan?: string | null
+      accountStatus?: string | null
+      quotas?: {
+        h5?: { used?: number; max?: number; usedPercent?: number; resetsAt?: number | null }
+        d7?: { used?: number; max?: number; usedPercent?: number; resetsAt?: number | null }
+        month?: { used?: number; max?: number; usedPercent?: number; resetsAt?: number | null }
+      }
+    } | null
+    packy?: { remainingUsd?: number; usedUsd?: number; totalUsd?: number; requestCount?: number | null; group?: string | null } | null
+    errors?: string[]
+  }
+  const z = d.zenmux
+  const p = d.packy
+  const errs = (d.errors ?? []).filter(Boolean)
+  const lowZen = z?.paygBalanceUsd != null && z.paygBalanceUsd < 1
+  const lowPacky = p?.remainingUsd != null && p.remainingUsd < 1
+  const barClass = (pct: number | undefined) =>
+    pct == null ? css.barOk : pct >= 80 ? css.barDanger : pct >= 50 ? css.barWarn : css.barOk
+  const windowChip = (label: string, q?: { used?: number; max?: number; usedPercent?: number; resetsAt?: number | null }) => {
+    if (!q) return null
+    const pct = q.usedPercent ?? (q.max ? Math.round(((q.used ?? 0) / q.max) * 100) : 0)
+    const reset = q.resetsAt ? ` · ${new Date(q.resetsAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}重置` : ''
+    return (
+      <div className={css.quotaWindow}>
+        <div className={css.pillRow}>
+          <span className={`${css.pill} ${css.pillDim}`}>{label} {q.used ?? 0}/{q.max ?? 0}</span>
+          <span className={`${css.pill} ${css.pillDim}`}>{pct}%{reset}</span>
+        </div>
+        <div className={css.barTrack}><div className={`${css.barFill} ${barClass(pct)}`} style={{ width: `${Math.min(100, pct)}%` }} /></div>
+      </div>
+    )
+  }
+  return (
+    <div className={css.quotaGrid}>
+      <div className={css.quotaBlock}>
+        <p className={css.cardTitle}>ZenMux</p>
+        {z ? (
+          <>
+            <div className={css.pillRow}>
+              <span className={`${css.pill} ${lowZen ? css.pillWarn : ''}`}>PAYG {fmtUsd(z.paygBalanceUsd)}</span>
+              <span className={`${css.pill} ${css.pillDim}`}>订阅 {z.plan ?? '—'}{z.accountStatus === 'healthy' ? '' : ` (${z.accountStatus ?? '?'})`}</span>
+            </div>
+            {windowChip('5h', z.quotas?.h5)}
+            {windowChip('7d', z.quotas?.d7)}
+            {windowChip('月', z.quotas?.month)}
+          </>
+        ) : (
+          <p className={css.muted}>未配置</p>
+        )}
+      </div>
+      <div className={css.quotaBlock}>
+        <p className={css.cardTitle}>Packy</p>
+        {p ? (
+          <>
+            <div className={css.pillRow}>
+              <span className={`${css.pill} ${lowPacky ? css.pillWarn : ''}`}>剩余 {fmtUsd(p.remainingUsd)}</span>
+              <span className={`${css.pill} ${css.pillDim}`}>已用 {fmtUsd(p.usedUsd)}</span>
+              <span className={`${css.pill} ${css.pillDim}`}>分组 {p.group ?? '—'}</span>
+            </div>
+            {p.requestCount != null && (
+              <div className={css.pillRow}>
+                <span className={`${css.pill} ${css.pillDim}`}>累计请求 {p.requestCount.toLocaleString()}</span>
+              </div>
+            )}
+          </>
+        ) : (
+          <p className={css.muted}>未配置</p>
+        )}
+      </div>
+      {errs.length > 0 && <p className={css.muted}>{errs.join('；')}</p>}
+    </div>
+  )
+}
+
+/** DSH 本地会话消耗（P5）：/dashboards/dsh/usage 聚合（evidenceClass=dsh_sessions）。 */
+function UsageCard({ data }: { data: unknown }) {
+  if (data == null || typeof data !== 'object') {
+    return <p className={css.muted}>—</p>
+  }
+  const d = data as {
+    totals?: {
+      modelResponseCount?: number
+      promptTokens?: number
+      completionTokens?: number
+      cacheReadTokens?: number
+      totalTokens?: number
+      estimatedCostUsd?: number
+      cacheSavingsUsd?: number
+      costUnknownCount?: number
+    }
+    byProviderModel?: Array<{
+      provider: string
+      model: string
+      modelResponseCount: number
+      promptTokens: number
+      completionTokens: number
+      cacheReadTokens: number
+      totalTokens: number
+      estimatedCostUsd: number
+      cacheSavingsUsd: number
+    }>
+    byDay?: Array<{
+      day: number
+      modelResponseCount: number
+      promptTokens: number
+      completionTokens: number
+      cacheReadTokens: number
+      estimatedCostUsd: number
+    }>
+  }
+  const t = d.totals
+  if (!t) return <p className={css.muted}>—</p>
+  const fmtTokens = (n?: number) =>
+    n == null ? '—' : n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n.toLocaleString()
+  const usd = (n?: number) => (n == null ? '—' : `$${n.toFixed(2)}`)
+  return (
+    <div>
+      <div className={css.pillRow}>
+        <span className={`${css.pill} ${css.pillDim}`}>响应 {t.modelResponseCount ?? 0}</span>
+        <span className={`${css.pill} ${css.pillDim}`}>tokens {fmtTokens(t.totalTokens)}</span>
+        <span className={`${css.pill} ${t.costUnknownCount ? css.pillWarn : ''}`}>成本 {usd(t.estimatedCostUsd)}</span>
+        <span className={`${css.pill} ${css.pillDim}`}>缓存省 {usd(t.cacheSavingsUsd)}</span>
+        {t.costUnknownCount ? <span className={`${css.pill} ${css.pillWarn}`}>未计价 {t.costUnknownCount}</span> : null}
+      </div>
+      <table className={css.usageTable}>
+        <thead>
+          <tr><th>模型</th><th>响应</th><th>输入</th><th>输出</th><th>缓存读</th><th>成本</th><th>缓存省</th></tr>
+        </thead>
+        <tbody>
+          {(d.byProviderModel ?? []).map((r) => (
+            <tr key={`${r.provider}/${r.model}`}>
+              <td><code>{r.provider}/{r.model}</code></td>
+              <td>{r.modelResponseCount}</td>
+              <td>{fmtTokens(r.promptTokens)}</td>
+              <td>{fmtTokens(r.completionTokens)}</td>
+              <td>{fmtTokens(r.cacheReadTokens)}</td>
+              <td>{usd(r.estimatedCostUsd)}</td>
+              <td>{usd(r.cacheSavingsUsd)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {(d.byDay ?? []).length > 0 && (
+        <div className={css.dayStrip}>
+          {(d.byDay ?? []).slice(-7).map((r) => (
+            <span key={r.day} className={css.dayCell}>
+              <span>{new Date(r.day * 86400000).toLocaleDateString([], { month: 'numeric', day: 'numeric' })}</span>
+              <span>{fmtTokens(r.promptTokens + r.completionTokens)}</span>
+              <span>{usd(r.estimatedCostUsd)}</span>
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 interface NodeRow {
   nodeId?: string; hostLabel?: string | null; status?: string
   rolloutState?: string | null
@@ -578,6 +743,10 @@ function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
           <SurgeNodeTable data={d} t={t} />
         ) : widget.type === 'feed' ? (
           <FeedCard data={d} t={t} />
+        ) : widget.type === 'quota' ? (
+          <QuotaCard data={d} />
+        ) : widget.type === 'usage' ? (
+          <UsageCard data={d} />
         ) : (
           <p className={css.muted}>{t('noData')}</p>
         )}

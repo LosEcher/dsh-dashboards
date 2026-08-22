@@ -27,6 +27,7 @@ import { execFile } from 'node:child_process'
 import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir, hostname } from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { createConnection } from 'node:net'
 import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints } from './lib/parsers.mjs'
 
@@ -100,7 +101,8 @@ const FEED_DIR = join(HOME, 'scheduler-reports')
 const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/los/usage', '/dashboards/los/trends', '/dashboards/los/metrics', '/dashboards/los/nodes',
   '/dashboards/macos', '/dashboards/macos/history', '/dashboards/probe', '/dashboards/glances', '/dashboards/kuma',
-  '/dashboards/feed/digests', '/dashboards/surge/ai-reputation',
+  '/dashboards/feed/digests', '/dashboards/surge/ai-reputation', '/dashboards/ai-quota',
+  '/dashboards/dsh/usage',
 ])
 
 /** Surge 节点信誉数据源（surge-auto ai-node-reputation 输出）。 */
@@ -136,6 +138,8 @@ const DEFAULT_WIDGETS = [
   { id: 'kuma-status', type: 'list', endpoint: '/dashboards/kuma', title: '服务状态', refreshMs: 30000 },
   { id: 'feed-digests', type: 'feed', endpoint: '/dashboards/feed/digests', title: 'feed 采集摘要', refreshMs: 60000 },
   { id: 'surge-ai-rep', type: 'surge', endpoint: '/dashboards/surge/ai-reputation', title: 'Surge 节点信誉', refreshMs: 30000 },
+  { id: 'ai-quota', type: 'quota', endpoint: '/dashboards/ai-quota', title: 'AI 额度', refreshMs: 60000 },
+  { id: 'dsh-usage', type: 'usage', endpoint: '/dashboards/dsh/usage', title: 'DSH 消耗 7d', refreshMs: 120000 },
 ]
 
 /** ── 配置解析：defaulting happens here, never inline ─────────────────── */
@@ -659,6 +663,132 @@ function appendHistoryToDisk(point) {
   } catch { /* 忽略 */ }
 }
 
+/** ── AI 额度（ZenMux PAYG/订阅 + Packy 余额）────────────────────────
+ * 数据源：
+ *   ZenMux management API（ZENMUX_MANAGEMENT_API_KEY，~/.dsh/.credentials.yaml）
+ *     GET https://zenmux.ai/api/v1/management/payg/balance
+ *     GET https://zenmux.ai/api/v1/management/subscription/detail
+ *   Packy NewAPI（PACKY_SYSTEM_TOKEN + PACKY_USER_ID，同上文件）
+ *     GET https://www.packyapi.com/api/user/self  (New-Api-User 头)
+ */
+function readCredential(name) {
+  try {
+    const text = readFileSync(join(HOME, '.credentials.yaml'), 'utf8')
+    const m = text.match(new RegExp(`^${name}:\\s*(\\S+)\\s*$`, 'm'))
+    if (m) return m[1]
+  } catch { /* ignore */ }
+  return process.env[name] ?? null
+}
+
+/** Packy 查询被 Cloudflare bot 防护/网络错误后的重试节流（ms 时间戳；借鉴 Orca retryAtMs）。 */
+let packyRetryAtMs = 0
+
+async function collectAiQuota() {
+  const out = { zenmux: null, packy: null, errors: [] }
+  const mgmtKey = readCredential('ZENMUX_MANAGEMENT_API_KEY')
+  if (mgmtKey) {
+    try {
+      const [balance, sub] = await Promise.all([
+        fetch('https://zenmux.ai/api/v1/management/payg/balance', { headers: { Authorization: `Bearer ${mgmtKey}` } }).then((r) => r.json()),
+        fetch('https://zenmux.ai/api/v1/management/subscription/detail', { headers: { Authorization: `Bearer ${mgmtKey}` } }).then((r) => r.json()),
+      ])
+      const b = balance?.data ?? {}
+      const s = sub?.data ?? {}
+      const q5 = s.quota_5_hour ?? {}
+      const q7 = s.quota_7_day ?? {}
+      const qm = s.quota_monthly ?? {}
+      const windowOf = (q) => ({
+        used: q.used_flows ?? 0,
+        max: q.max_flows ?? 0,
+        usedUsd: Number(q.used_value_usd ?? 0),
+        maxUsd: Number(q.max_value_usd ?? 0),
+        usedPercent: q.max_flows ? Math.round(((q.used_flows ?? 0) / q.max_flows) * 100) : 0,
+        resetsAt: typeof q.resets_at === 'number' ? q.resets_at : null,
+      })
+      out.zenmux = {
+        paygBalanceUsd: Number(b.total_credits ?? 0),
+        plan: s.plan?.tier ?? null,
+        planAmountUsd: Number(s.plan?.amount_usd ?? 0),
+        accountStatus: s.account_status ?? null,
+        quotas: { h5: windowOf(q5), d7: windowOf(q7), month: windowOf(qm) },
+      }
+    } catch (e) {
+      out.errors.push(`zenmux: ${e?.message ?? e}`)
+    }
+  } else {
+    out.errors.push('zenmux: ZENMUX_MANAGEMENT_API_KEY 未配置')
+  }
+
+  const now = Date.now()
+  if (packyRetryAtMs && now < packyRetryAtMs) {
+    out.errors.push(`packy: 上次查询被限流，${Math.ceil((packyRetryAtMs - now) / 60000)} 分钟后自动重试`)
+  } else {
+    const packyToken = readCredential('PACKY_SYSTEM_TOKEN')
+    const packyUserId = readCredential('PACKY_USER_ID')
+    if (packyToken && packyUserId) {
+      try {
+        const res = await fetch('https://www.packyapi.com/api/user/self', {
+          headers: {
+            Authorization: `Bearer ${packyToken}`,
+            'New-Api-User': packyUserId,
+            'User-Agent': 'cc-switch/1.0',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+        })
+        const text = await res.text()
+        let body
+        try {
+          body = JSON.parse(text)
+        } catch {
+          // Cloudflare bot 挑战页或非 JSON 响应
+          packyRetryAtMs = Date.now() + 10 * 60_000
+          out.errors.push('packy: 查询被服务端拦截（Cloudflare bot 防护），10 分钟后自动重试')
+          return out
+        }
+        if (!body?.success) {
+          out.errors.push(`packy: ${body?.message ?? res.status}`)
+        } else {
+          const d = body.data ?? {}
+          out.packy = {
+            remainingUsd: Number(d.quota ?? 0) / 500000,
+            usedUsd: Number(d.used_quota ?? 0) / 500000,
+            totalUsd: (Number(d.quota ?? 0) + Number(d.used_quota ?? 0)) / 500000,
+            requestCount: d.request_count ?? null,
+            group: d.group ?? null,
+          }
+        }
+      } catch (e) {
+        packyRetryAtMs = Date.now() + 5 * 60_000
+        out.errors.push(`packy: ${e?.message ?? e}（5 分钟后重试）`)
+      }
+    } else {
+      out.errors.push('packy: PACKY_SYSTEM_TOKEN / PACKY_USER_ID 未配置')
+    }
+  }
+  return out
+}
+
+/** ── DSH 本地会话 usage 聚合（P5：只读 ~/.dsh/sessions 派生投影，无副作用） ──
+ * 调 scripts/dsh-usage-aggregate.py（python3 + zstandard），窗口=最近 7 天，
+ * 输出形状对齐 los.usage-summary（evidenceClass=dsh_sessions），供统一对账。
+ */
+const DSH_USAGE_SCRIPT = fileURLToPath(new URL('./scripts/dsh-usage-aggregate.py', import.meta.url))
+const DSH_USAGE_TIMEOUT_MS = 20000
+
+async function collectDshUsage() {
+  const fromMs = Date.now() - 7 * 86400_000
+  const { out, error } = await runExec('python3', [DSH_USAGE_SCRIPT, '--from-ms', String(fromMs)], DSH_USAGE_TIMEOUT_MS)
+  if (error) return { data: null, error: `dsh-usage: ${error}` }
+  try {
+    const parsed = JSON.parse(out)
+    if (parsed.error) return { data: null, error: `dsh-usage: ${parsed.error}` }
+    return { data: parsed, error: null }
+  } catch (e) {
+    return { data: null, error: `dsh-usage parse: ${e?.message ?? e}` }
+  }
+}
+
 /** ── widget 配置存取 ──────────────────────────────────────────────── */
 function loadWidgets() {
   try {
@@ -774,6 +904,10 @@ export function apply(ctx, config) {
   const feedDigests = makePoller(collectFeedDigests, 60000)
   // Surge AI 节点信誉（读本机 state 文件 + 事件流，成本低）
   const surgeRep = makePoller(() => collectSurgeRep(cfg), cfg.surgeRep.pollMs)
+  // AI 额度（ZenMux + Packy；60s 刷新，独立于 los 节奏）
+  const aiQuota = makePoller(collectAiQuota, 60000)
+  // DSH 本地会话 usage 聚合（P5：只读 ~/.dsh/sessions 派生投影，无副作用）
+  const dshUsage = makePoller(collectDshUsage, 120000)
 
   // ── macOS 滚动短趋势（持久化 jsonl + 内存窗口；按 ts 去重，30s 采样节奏 → 120 点 = 1h 窗口）
   // 2026-08-19 P2：重启从磁盘加载（不因插件重启清零）；断档由 fillGapPoints 标注。
@@ -829,6 +963,8 @@ export function apply(ctx, config) {
     '/dashboards/kuma': kuma,
     '/dashboards/feed/digests': feedDigests,
     '/dashboards/surge/ai-reputation': surgeRep,
+    '/dashboards/ai-quota': aiQuota,
+    '/dashboards/dsh/usage': dshUsage,
   }
 
   const timers = [
@@ -842,6 +978,8 @@ export function apply(ctx, config) {
     startPoller(kuma, cfg.kuma.pollMs),
     startPoller(feedDigests, 60000),
     startPoller(surgeRep, cfg.surgeRep.pollMs),
+    startPoller(aiQuota, 60000),
+    startPoller(dshUsage, 120000),
   ]
 
   // ── 磁盘水位告警（独立于看板 idle 门控：看板未打开也持续检查，主动推飞书） ──
@@ -918,6 +1056,7 @@ export function apply(ctx, config) {
               kuma: { enabled: cfg.kuma.enabled, ...s(kuma) },
               feed: s(feedDigests),
               surgeRep: s(surgeRep),
+              dsh: { usage: s(dshUsage) },
             },
             widgets: loadWidgets().length,
           })
@@ -953,6 +1092,8 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/kuma') { sendJson(res, 200, await kuma.get()); return }
         if (method === 'GET' && path === '/dashboards/feed/digests') { sendJson(res, 200, await feedDigests.get()); return }
         if (method === 'GET' && path === '/dashboards/surge/ai-reputation') { sendJson(res, 200, await surgeRep.get()); return }
+        if (method === 'GET' && path === '/dashboards/ai-quota') { sendJson(res, 200, await aiQuota.get()); return }
+        if (method === 'GET' && path === '/dashboards/dsh/usage') { sendJson(res, 200, await dshUsage.get()); return }
         if (method === 'GET' && path === '/dashboards/widgets') {
           sendJson(res, 200, { ts: new Date().toISOString(), widgets: loadWidgets() })
           return
