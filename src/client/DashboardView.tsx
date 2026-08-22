@@ -283,6 +283,71 @@ function UsageCard({ data }: { data: unknown }) {
   )
 }
 
+/** 统一消耗对账（P6）：/dashboards/usage/reconcile 三源合并（DSH + los + 配额）。 */
+function ReconcileCard({ data }: { data: unknown }) {
+  if (data == null || typeof data !== 'object') {
+    return <p className={css.muted}>—</p>
+  }
+  const d = data as {
+    combined?: { modelResponseCount?: number; totalTokens?: number; estimatedCostUsd?: number; cacheSavingsUsd?: number }
+    sources?: {
+      dshSessions?: { totals?: UsageTotals } | null
+      losRuntime?: { totals?: UsageTotals } | null
+      quotas?: { zenmux?: { paygBalanceUsd?: number } | null; packy?: { remainingUsd?: number } | null; errors?: string[] } | null
+    }
+    errors?: string[]
+  }
+  interface UsageTotals {
+    modelResponseCount?: number; promptTokens?: number; completionTokens?: number
+    cacheReadTokens?: number; totalTokens?: number; estimatedCostUsd?: number; cacheSavingsUsd?: number
+  }
+  const c = d.combined
+  const s = d.sources
+  const fmtTokens = (n?: number) =>
+    n == null ? '—' : n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n.toLocaleString()
+  const usd = (n?: number) => (n == null ? '—' : `$${n.toFixed(2)}`)
+  const block = (label: string, t?: UsageTotals | null) => (
+    <div className={css.quotaBlock}>
+      <p className={css.cardTitle}>{label}</p>
+      {t ? (
+        <div className={css.pillRow}>
+          <span className={`${css.pill} ${css.pillDim}`}>响应 {t.modelResponseCount ?? 0}</span>
+          <span className={`${css.pill} ${css.pillDim}`}>tokens {fmtTokens(t.totalTokens)}</span>
+          <span className={`${css.pill} ${css.pillDim}`}>成本 {usd(t.estimatedCostUsd)}</span>
+        </div>
+      ) : (
+        <p className={css.muted}>无数据</p>
+      )}
+    </div>
+  )
+  const quota = s?.quotas
+  const errs = [...(d.errors ?? []), ...(quota?.errors ?? [])]
+  return (
+    <div>
+      {c && (
+        <div className={css.pillRow}>
+          <span className={`${css.pill} ${css.pillWarn}`}>综合成本 {usd(c.estimatedCostUsd)}</span>
+          <span className={`${css.pill} ${css.pillDim}`}>响应 {c.modelResponseCount ?? 0}</span>
+          <span className={`${css.pill} ${css.pillDim}`}>tokens {fmtTokens(c.totalTokens)}</span>
+          <span className={`${css.pill} ${css.pillDim}`}>缓存省 {usd(c.cacheSavingsUsd)}</span>
+        </div>
+      )}
+      <div className={css.quotaGrid}>
+        {block('DSH sessions', s?.dshSessions?.totals)}
+        {block('los runtime', s?.losRuntime?.totals)}
+        <div className={css.quotaBlock}>
+          <p className={css.cardTitle}>配额余额</p>
+          <div className={css.pillRow}>
+            <span className={`${css.pill} ${css.pillDim}`}>ZenMux {usd(quota?.zenmux?.paygBalanceUsd)}</span>
+            <span className={`${css.pill} ${css.pillDim}`}>Packy {usd(quota?.packy?.remainingUsd)}</span>
+          </div>
+        </div>
+      </div>
+      {errs.length > 0 && <p className={css.muted}>{errs.join('；')}</p>}
+    </div>
+  )
+}
+
 interface NodeRow {
   nodeId?: string; hostLabel?: string | null; status?: string
   rolloutState?: string | null
@@ -747,6 +812,8 @@ function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
           <QuotaCard data={d} />
         ) : widget.type === 'usage' ? (
           <UsageCard data={d} />
+        ) : widget.type === 'reconcile' ? (
+          <ReconcileCard data={d} />
         ) : (
           <p className={css.muted}>{t('noData')}</p>
         )}

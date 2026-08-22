@@ -103,6 +103,7 @@ const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/macos', '/dashboards/macos/history', '/dashboards/probe', '/dashboards/glances', '/dashboards/kuma',
   '/dashboards/feed/digests', '/dashboards/surge/ai-reputation', '/dashboards/ai-quota',
   '/dashboards/dsh/usage',
+  '/dashboards/usage/reconcile',
 ])
 
 /** Surge 节点信誉数据源（surge-auto ai-node-reputation 输出）。 */
@@ -140,6 +141,7 @@ const DEFAULT_WIDGETS = [
   { id: 'surge-ai-rep', type: 'surge', endpoint: '/dashboards/surge/ai-reputation', title: 'Surge 节点信誉', refreshMs: 30000 },
   { id: 'ai-quota', type: 'quota', endpoint: '/dashboards/ai-quota', title: 'AI 额度', refreshMs: 60000 },
   { id: 'dsh-usage', type: 'usage', endpoint: '/dashboards/dsh/usage', title: 'DSH 消耗 7d', refreshMs: 120000 },
+  { id: 'usage-reconcile', type: 'reconcile', endpoint: '/dashboards/usage/reconcile', title: '消耗对账', refreshMs: 120000 },
 ]
 
 /** ── 配置解析：defaulting happens here, never inline ─────────────────── */
@@ -789,6 +791,41 @@ async function collectDshUsage() {
   }
 }
 
+/** ── 统一消耗对账（P6）：DSH sessions + los runtime + 配额 三源合并 ──
+ * 纯函数；poller 实例由 apply 闭包传入（collectDshUsage 等可模块级定义，
+ * 因为它们不依赖 apply 内的 poller）。
+ */
+async function collectUsageReconcile(dshUsageRef, losUsageRef, aiQuotaRef) {
+  const [dshSnap, losSnap, quotaSnap] = await Promise.all([
+    dshUsageRef.get(), losUsageRef.get(), aiQuotaRef.get(),
+  ])
+  const dsh = dshSnap.data
+  const los = losSnap.data
+  const quota = quotaSnap.data
+  const errors = []
+  if (dshSnap.error) errors.push(`dsh: ${dshSnap.error}`)
+  if (losSnap.error) errors.push(`los: ${losSnap.error}`)
+  if (quotaSnap.error) errors.push(`quota: ${quotaSnap.error}`)
+  const combined = {
+    modelResponseCount: (dsh?.totals?.modelResponseCount ?? 0) + (los?.totals?.modelResponseCount ?? 0),
+    totalTokens: (dsh?.totals?.totalTokens ?? 0) + (los?.totals?.totalTokens ?? 0),
+    estimatedCostUsd: round2((dsh?.totals?.estimatedCostUsd ?? 0) + (los?.totals?.estimatedCostUsd ?? 0)),
+    cacheSavingsUsd: round2((dsh?.totals?.cacheSavingsUsd ?? 0) + (los?.totals?.cacheSavingsUsd ?? 0)),
+  }
+  return {
+    evidenceClass: 'usage_reconcile',
+    generatedAt: Date.now(),
+    sources: {
+      dshSessions: dsh,
+      losRuntime: los,
+      quotas: quota,
+    },
+    combined,
+    errors,
+  }
+}
+function round2(n) { return Math.round(n * 100) / 100 }
+
 /** ── widget 配置存取 ──────────────────────────────────────────────── */
 function loadWidgets() {
   try {
@@ -908,6 +945,8 @@ export function apply(ctx, config) {
   const aiQuota = makePoller(collectAiQuota, 60000)
   // DSH 本地会话 usage 聚合（P5：只读 ~/.dsh/sessions 派生投影，无副作用）
   const dshUsage = makePoller(collectDshUsage, 120000)
+  // 统一消耗对账（P6：DSH + los + 配额 三源合并）
+  const usageReconcile = makePoller(() => collectUsageReconcile(dshUsage, losUsage, aiQuota), 120000)
 
   // ── macOS 滚动短趋势（持久化 jsonl + 内存窗口；按 ts 去重，30s 采样节奏 → 120 点 = 1h 窗口）
   // 2026-08-19 P2：重启从磁盘加载（不因插件重启清零）；断档由 fillGapPoints 标注。
@@ -965,6 +1004,7 @@ export function apply(ctx, config) {
     '/dashboards/surge/ai-reputation': surgeRep,
     '/dashboards/ai-quota': aiQuota,
     '/dashboards/dsh/usage': dshUsage,
+    '/dashboards/usage/reconcile': usageReconcile,
   }
 
   const timers = [
@@ -980,6 +1020,7 @@ export function apply(ctx, config) {
     startPoller(surgeRep, cfg.surgeRep.pollMs),
     startPoller(aiQuota, 60000),
     startPoller(dshUsage, 120000),
+    startPoller(usageReconcile, 120000),
   ]
 
   // ── 磁盘水位告警（独立于看板 idle 门控：看板未打开也持续检查，主动推飞书） ──
@@ -1056,7 +1097,7 @@ export function apply(ctx, config) {
               kuma: { enabled: cfg.kuma.enabled, ...s(kuma) },
               feed: s(feedDigests),
               surgeRep: s(surgeRep),
-              dsh: { usage: s(dshUsage) },
+              dsh: { usage: s(dshUsage), reconcile: s(usageReconcile) },
             },
             widgets: loadWidgets().length,
           })
@@ -1094,6 +1135,7 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/surge/ai-reputation') { sendJson(res, 200, await surgeRep.get()); return }
         if (method === 'GET' && path === '/dashboards/ai-quota') { sendJson(res, 200, await aiQuota.get()); return }
         if (method === 'GET' && path === '/dashboards/dsh/usage') { sendJson(res, 200, await dshUsage.get()); return }
+        if (method === 'GET' && path === '/dashboards/usage/reconcile') { sendJson(res, 200, await usageReconcile.get()); return }
         if (method === 'GET' && path === '/dashboards/widgets') {
           sendJson(res, 200, { ts: new Date().toISOString(), widgets: loadWidgets() })
           return
