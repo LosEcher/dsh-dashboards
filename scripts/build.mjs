@@ -71,8 +71,16 @@ const footer = 'return module.exports; } });'
  * DSH shell does not load for plugin client bundles. This onLoad plugin
  * inlines the module instead, in the exact wire format the DSH plugin
  * ecosystem uses (see dsh-llm-fallbacks dist): hashed class names
- * (`_<8-hex>_<name>`, md5 of the class name), a `<style data-plugin-css>`
- * tag injected on first load, and a `{ name: hashedName }` default export.
+ * (`_<8-hex>_<name>`), a `<style data-plugin-css>` tag injected on first
+ * load, and a `{ name: hashedName }` default export.
+ *
+ * Hash seed: `<plugin-id>:<module-basename>:<name>` (NOT bare name). Every
+ * plugin's CSS is injected into the same global document.head, so hashing
+ * only the bare class name collides across plugins that use the same local
+ * name (e.g. `wrap` in dsh-dashboards vs dsh-quick-actions — the latter's
+ * `position:fixed` seat rule leaked onto the dashboard's table cell).
+ * Scoping the seed per plugin+module keeps hashes globally unique while the
+ * suffix still carries the readable original name.
  */
 const cssModulePlugin = {
   name: 'css-module',
@@ -86,7 +94,10 @@ const cssModulePlugin = {
       let out = css
       // Longest first so `.cardOpen` is not clobbered by the `.card` rule.
       for (const name of [...names].sort((a, b) => b.length - a.length)) {
-        const hashed = `_${createHash('md5').update(name).digest('hex').slice(0, 8)}_${name}`
+        // Seed the hash with plugin id + module path: class names are global
+        // (all plugin styles share document.head) and bare-name hashing
+        // collides across plugins (see header comment).
+        const hashed = `_${createHash('md5').update(`${PLUGIN_ID}:${basename(args.path)}:${name}`).digest('hex').slice(0, 8)}_${name}`
         map[name] = hashed
         out = out.replaceAll(new RegExp(`\\.${name}(?![\\w-])`, 'g'), `.${hashed}`)
       }
