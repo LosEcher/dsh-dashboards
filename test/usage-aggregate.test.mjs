@@ -61,6 +61,8 @@ test('aggregate prices DeepSeek usage with peak/off-peak, weekend and CNY conver
     assert.equal(t.cacheReadTokens, 3_200_000)
     assert.equal(t.completionTokens, 200_000)
     assert.equal(t.totalTokens, 3_800_000)
+    // cacheHitRate = cacheRead/(cacheRead + net-miss prompt) = 3.2M/3.6M（与 los usage-summary 同口径）
+    assert.ok(Math.abs(t.cacheHitRate - 3_200_000 / 3_600_000) < 0.000001, `hitRate=${t.cacheHitRate}`)
     // One event off-peak (x1), two peak (x2), one weekend-flat (x1):
     // per event base CNY = 0.1M*1.5 + 0.8M*0.05 + 0.05M*4.5 = 0.15+0.04+0.225 = 0.415
     // total CNY = 0.415 * (1 + 2 + 2 + 1) = 2.49
@@ -86,6 +88,7 @@ test('aggregate skips unpriced routes but still counts tokens', () => {
     assert.equal(t.totalTokens, 1500)
     assert.equal(t.costUnknownCount, 1)
     assert.equal(t.estimatedCostUsd, 0)
+    assert.equal(t.cacheHitRate, 0)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

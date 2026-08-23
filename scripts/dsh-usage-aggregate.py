@@ -157,6 +157,8 @@ def main():
                 merge_into(day_bucket, row, cost, savings, cost_cny)
 
     def finish(bucket):
+        # cacheHitRate 口径与 los usage-summary 对齐：cacheRead/(cacheRead+净 miss 输入)
+        cache_denom = bucket["promptTokens"] + bucket["cacheReadTokens"]
         return {
             "modelResponseCount": bucket["modelResponseCount"],
             "promptTokens": bucket["promptTokens"],
@@ -166,6 +168,7 @@ def main():
             "estimatedCostUsd": round(bucket["estimatedCostUsd"], 6),
             "estimatedCostCny": round(bucket["estimatedCostCny"], 6),
             "cacheSavingsUsd": round(bucket["cacheSavingsUsd"], 6),
+            "cacheHitRate": round(bucket["cacheReadTokens"] / cache_denom, 6) if cache_denom > 0 else None,
             "costUnknownCount": bucket["costUnknownCount"],
         }
 

@@ -214,6 +214,7 @@ function UsageCard({ data }: { data: unknown }) {
       totalTokens?: number
       estimatedCostUsd?: number
       cacheSavingsUsd?: number
+      cacheHitRate?: number | null
       costUnknownCount?: number
     }
     byProviderModel?: Array<{
@@ -246,6 +247,7 @@ function UsageCard({ data }: { data: unknown }) {
       <div className={css.pillRow}>
         <span className={`${css.pill} ${css.pillDim}`}>响应 {t.modelResponseCount ?? 0}</span>
         <span className={`${css.pill} ${css.pillDim}`}>tokens {fmtTokens(t.totalTokens)}</span>
+        <span className={`${css.pill} ${css.pillDim}`}>缓存命中 {t.cacheHitRate != null ? `${(t.cacheHitRate * 100).toFixed(1)}%` : '—'}</span>
         <span className={`${css.pill} ${t.costUnknownCount ? css.pillWarn : ''}`}>成本 {usd(t.estimatedCostUsd)}</span>
         <span className={`${css.pill} ${css.pillDim}`}>缓存省 {usd(t.cacheSavingsUsd)}</span>
         {t.costUnknownCount ? <span className={`${css.pill} ${css.pillWarn}`}>未计价 {t.costUnknownCount}</span> : null}
@@ -290,6 +292,10 @@ function ReconcileCard({ data }: { data: unknown }) {
   }
   const d = data as {
     combined?: { modelResponseCount?: number; totalTokens?: number; estimatedCostUsd?: number; cacheSavingsUsd?: number }
+    windows?: {
+      dsh?: { from?: number | string | null; to?: number | string | null }
+      los?: { from?: number | string | null; to?: number | string | null }
+    }
     sources?: {
       dshSessions?: { totals?: UsageTotals } | null
       losRuntime?: { totals?: UsageTotals } | null
@@ -306,9 +312,20 @@ function ReconcileCard({ data }: { data: unknown }) {
   const fmtTokens = (n?: number) =>
     n == null ? '—' : n >= 1e9 ? `${(n / 1e9).toFixed(2)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n.toLocaleString()
   const usd = (n?: number) => (n == null ? '—' : `$${n.toFixed(2)}`)
-  const block = (label: string, t?: UsageTotals | null) => (
+  /** 由 from/to 估算窗口时长（DSH=epoch ms，los=ISO 字符串），用于标注口径。 */
+  const windowLabel = (w?: { from?: number | string | null; to?: number | string | null }) => {
+    const f = w?.from
+    const t0 = w?.to
+    if (f == null || t0 == null) return ''
+    const a = new Date(typeof f === 'number' ? f : String(f)).getTime()
+    const b = new Date(typeof t0 === 'number' ? t0 : String(t0)).getTime()
+    if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) return ''
+    const hours = Math.round((b - a) / 3600_000)
+    return hours >= 48 ? `近${Math.round(hours / 24)}d` : `近${hours}h`
+  }
+  const block = (label: string, t?: UsageTotals | null, win?: string) => (
     <div className={css.quotaBlock}>
-      <p className={css.cardTitle}>{label}</p>
+      <p className={css.cardTitle}>{label}{win ? <span className={css.muted}> · {win}</span> : null}</p>
       {t ? (
         <div className={css.pillRow}>
           <span className={`${css.pill} ${css.pillDim}`}>响应 {t.modelResponseCount ?? 0}</span>
@@ -322,6 +339,8 @@ function ReconcileCard({ data }: { data: unknown }) {
   )
   const quota = s?.quotas
   const errs = [...(d.errors ?? []), ...(quota?.errors ?? [])]
+  const winDsh = windowLabel(d.windows?.dsh)
+  const winLos = windowLabel(d.windows?.los)
   return (
     <div>
       {c && (
@@ -332,9 +351,12 @@ function ReconcileCard({ data }: { data: unknown }) {
           <span className={`${css.pill} ${css.pillDim}`}>缓存省 {usd(c.cacheSavingsUsd)}</span>
         </div>
       )}
+      {winDsh && winLos && (
+        <p className={css.muted}>综合值为 {winDsh} DSH + {winLos} los 跨窗口相加，近似参考</p>
+      )}
       <div className={css.quotaGrid}>
-        {block('DSH sessions', s?.dshSessions?.totals)}
-        {block('los runtime', s?.losRuntime?.totals)}
+        {block('DSH sessions', s?.dshSessions?.totals, winDsh)}
+        {block('los runtime', s?.losRuntime?.totals, winLos)}
         <div className={css.quotaBlock}>
           <p className={css.cardTitle}>配额余额</p>
           <div className={css.pillRow}>

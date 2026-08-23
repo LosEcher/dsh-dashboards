@@ -298,6 +298,9 @@ async function collectLosUsage(cfg, tokens) {
   const res = await losFetch(cfg, tokens, `/usage/summary?from=${encodeURIComponent(from)}`)
   const d = await res.json()
   return {
+    // 透传 los 实际窗口（ISO 字符串），供对账视图标注口径（los 缺省 7d，本插件显式传 24h）
+    from: d.from ?? null,
+    to: d.to ?? null,
     totals: d.totals ?? null,
     byProviderModel: (d.byProviderModel ?? []).map((r) => ({
       provider: r.provider, model: r.model, calls: r.modelResponseCount,
@@ -781,13 +784,17 @@ const DSH_USAGE_TIMEOUT_MS = 20000
 async function collectDshUsage() {
   const fromMs = Date.now() - 7 * 86400_000
   const { out, error } = await runExec('python3', [DSH_USAGE_SCRIPT, '--from-ms', String(fromMs)], DSH_USAGE_TIMEOUT_MS)
-  if (error) return { data: null, error: `dsh-usage: ${error}` }
+  // 成功直接返回聚合对象（平铺），失败 throw 交给 poller 记 snapshot.error——
+  // 与 collectLosUsage 等其它 collector 一致。旧实现返回 {data, error} 会被
+  // poller 再包一层（snapshot.data.data），导致客户端与对账读 .totals 全部
+  // undefined →「DSH 消耗 7d」与「DSH sessions」永远显示无数据（2026-08-23 定位）。
+  if (error) throw new Error(`dsh-usage: ${error}`)
   try {
     const parsed = JSON.parse(out)
-    if (parsed.error) return { data: null, error: `dsh-usage: ${parsed.error}` }
-    return { data: parsed, error: null }
+    if (parsed.error) throw new Error(`dsh-usage: ${parsed.error}`)
+    return parsed
   } catch (e) {
-    return { data: null, error: `dsh-usage parse: ${e?.message ?? e}` }
+    throw new Error(`dsh-usage parse: ${e?.message ?? e}`)
   }
 }
 
@@ -815,6 +822,12 @@ async function collectUsageReconcile(dshUsageRef, losUsageRef, aiQuotaRef) {
   return {
     evidenceClass: 'usage_reconcile',
     generatedAt: Date.now(),
+    // 窗口元信息：DSH 聚合窗口（epoch ms，脚本输出）与 los 网关窗口（ISO 字符串）。
+    // 两者窗口不同（DSH 7d、los 24h），combined 是跨窗口近似相加，UI 必须标注。
+    windows: {
+      dsh: { from: dsh?.from ?? null, to: dsh?.to ?? null },
+      los: { from: los?.from ?? null, to: los?.to ?? null },
+    },
     sources: {
       dshSessions: dsh,
       losRuntime: los,
