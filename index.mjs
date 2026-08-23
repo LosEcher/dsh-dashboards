@@ -917,6 +917,15 @@ function sendJson(res, status, json) {
   res.end(JSON.stringify(json))
 }
 
+/** 插件版本（/plugins/<id>/status 约定用；读 package.json，失败返回 null）。 */
+function readPluginVersion() {
+  try {
+    return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? null
+  } catch {
+    return null
+  }
+}
+
 /** ── 插件主体 ─────────────────────────────────────────────────────── */
 export function apply(ctx, config) {
   const cfg = resolveConfig(config)
@@ -1071,6 +1080,48 @@ export function apply(ctx, config) {
   diskAlertTimer.unref?.()
   timers.push(diskAlertTimer)
 
+  // /plugins/<id>/status 统一约定（2026-08-23）：内部状态只读折叠（exact 独立路由）
+  const dashStatus = () => {
+    const s = (p) => {
+      const snap = p.snapshot()
+      return { ts: snap.ts, error: snap.error ?? null, hasData: snap.data !== null }
+    }
+    return {
+      ts: new Date().toISOString(),
+      backends: {
+        los: { usage: s(losUsage), trends: s(losTrends), metrics: s(losMetrics), nodes: s(losNodes) },
+        macos: { ...s(macos), enabled: cfg.macos.enabled },
+        probe: s(probe),
+        glances: { enabled: cfg.glances.enabled, ...s(glances) },
+        kuma: { enabled: cfg.kuma.enabled, ...s(kuma) },
+        feed: s(feedDigests),
+        surgeRep: s(surgeRep),
+        dsh: { usage: s(dshUsage), reconcile: s(usageReconcile) },
+      },
+      widgets: loadWidgets().length,
+    }
+  }
+  ctx.webServer.register({
+    kind: 'exact',
+    path: '/plugins/dsh-dashboards/status',
+    handler: (_req, res) => {
+      const status = dashStatus()
+      const backends = status.backends ?? {}
+      const healthy = (b) => (b && b.error === null && b.hasData) ? 1 : 0
+      sendJson(res, 200, {
+        ok: true,
+        plugin: 'dsh-dashboards',
+        version: readPluginVersion(),
+        counts: {
+          widgets: status.widgets ?? 0,
+          backendsOk: healthy(backends.probe) + healthy(backends.macos) + healthy(backends.los?.usage),
+        },
+        lastError: null,
+        detail: { backends, widgets: status.widgets ?? 0 },
+      })
+    },
+  })
+
   ctx.webServer.register({
     kind: 'prefix',
     path: '/dashboards',
@@ -1096,24 +1147,7 @@ export function apply(ctx, config) {
           return
         }
         if (method === 'GET' && path === '/dashboards/status') {
-          const s = (p) => {
-            const snap = p.snapshot()
-            return { ts: snap.ts, error: snap.error ?? null, hasData: snap.data !== null }
-          }
-          sendJson(res, 200, {
-            ts: new Date().toISOString(),
-            backends: {
-              los: { usage: s(losUsage), trends: s(losTrends), metrics: s(losMetrics), nodes: s(losNodes) },
-              macos: { ...s(macos), enabled: cfg.macos.enabled },
-              probe: s(probe),
-              glances: { enabled: cfg.glances.enabled, ...s(glances) },
-              kuma: { enabled: cfg.kuma.enabled, ...s(kuma) },
-              feed: s(feedDigests),
-              surgeRep: s(surgeRep),
-              dsh: { usage: s(dshUsage), reconcile: s(usageReconcile) },
-            },
-            widgets: loadWidgets().length,
-          })
+          sendJson(res, 200, dashStatus())
           return
         }
         if (method === 'GET' && path === '/dashboards/los/usage') { sendJson(res, 200, await losUsage.get()); return }
