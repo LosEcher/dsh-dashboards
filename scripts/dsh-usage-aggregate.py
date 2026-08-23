@@ -25,25 +25,49 @@ except ImportError:
 
 # (provider, model) -> (promptPer1M, completionPer1M, cacheHitPer1M)
 # 数值复用 los packages/agent/src/model-profiles.ts（2026-08-22 核对）
+# (provider, model) -> 定价（CNY 每百万 tokens，低谷价）
+# 数值对齐 los packages/agent/src/model-profiles.ts（2026-08-23 同步）：
+# DeepSeek 8/17 起峰谷定价（高峰=低谷×2，北京 9-12/14-18 工作日），
+# 8/23 起周末全天低谷；cost 字段 USD = CNY ÷ cnyPerUsd（PBOC 中间价≈6.8）。
 PRICING = {
-    ("deepseek-official", "deepseek-v4-flash"): (0.14, 0.28, 0.0028),
-    ("deepseek", "deepseek-v4-flash"): (0.14, 0.28, 0.0028),
-    ("deepseek-official", "deepseek-v4-pro"): (0.435, 0.87, 0.003625),
-    ("deepseek", "deepseek-v4-pro"): (0.435, 0.87, 0.003625),
+    ("deepseek-official", "deepseek-v4-flash"): (1.5, 4.5, 0.05),
+    ("deepseek", "deepseek-v4-flash"): (1.5, 4.5, 0.05),
+    ("deepseek-official", "deepseek-v4-pro"): (4.5, 13.5, 0.15),
+    ("deepseek", "deepseek-v4-pro"): (4.5, 13.5, 0.15),
     # 未知/未定价模型：cost 不计算（costUnknown 计数），tokens 仍计入
 }
 
+PEAK_MULTIPLIER = 2
+CNY_PER_USD = 6.8
+# 周末全天低谷规则自 2026-08-23 00:00（北京时间）起生效
+WEEKEND_FLAT_SINCE_MS = int(__import__("datetime").datetime(2026, 8, 23, 0, 0,
+    tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=8))).timestamp() * 1000)
 
-def cost_for(provider, model, prompt, completion, cache_read):
+
+def peak_multiplier_at(ts_ms):
+    """DeepSeek 计费时段：工作日北京 09-12/14-18 高峰（×2）；8/23 起周末全天低谷。"""
+    import datetime as _dt
+    bj = _dt.datetime.fromtimestamp((ts_ms + 8 * 3600 * 1000) / 1000, _dt.timezone.utc)
+    dow = bj.weekday()
+    if dow >= 5:  # 周六(5)/周日(6)
+        return 1 if ts_ms >= WEEKEND_FLAT_SINCE_MS else PEAK_MULTIPLIER if (9 <= bj.hour < 12 or 14 <= bj.hour < 18) else 1
+    if 9 <= bj.hour < 12 or 14 <= bj.hour < 18:
+        return PEAK_MULTIPLIER
+    return 1
+
+
+def cost_for(provider, model, prompt, completion, cache_read, ts_ms):
     rates = PRICING.get((provider, model))
     if not rates:
-        return None, None
+        return None, None, None
     prompt_rate, completion_rate, cache_rate = rates
-    prompt_cost = prompt / 1e6 * prompt_rate
-    completion_cost = completion / 1e6 * completion_rate
-    cache_cost = cache_read / 1e6 * cache_rate
-    savings = cache_read / 1e6 * (prompt_rate - cache_rate)
-    return prompt_cost + completion_cost + cache_cost, savings
+    peak = peak_multiplier_at(ts_ms)
+    prompt_cost_cny = prompt / 1e6 * prompt_rate * peak
+    completion_cost_cny = completion / 1e6 * completion_rate * peak
+    cache_cost_cny = cache_read / 1e6 * cache_rate * peak
+    total_cny = prompt_cost_cny + completion_cost_cny + cache_cost_cny
+    savings_cny = cache_read / 1e6 * (prompt_rate - cache_rate) * peak
+    return total_cny / CNY_PER_USD, savings_cny / CNY_PER_USD, total_cny
 
 
 def decompress_frames(path):
@@ -61,12 +85,13 @@ def new_bucket():
         "completionTokens": 0,
         "cacheReadTokens": 0,
         "estimatedCostUsd": 0.0,
+        "estimatedCostCny": 0.0,
         "cacheSavingsUsd": 0.0,
         "costUnknownCount": 0,
     }
 
 
-def merge_into(target, source, cost, savings):
+def merge_into(target, source, cost, savings, cost_cny):
     target["modelResponseCount"] += 1
     target["promptTokens"] += source["promptTokens"]
     target["completionTokens"] += source["completionTokens"]
@@ -75,6 +100,7 @@ def merge_into(target, source, cost, savings):
         target["costUnknownCount"] += 1
     else:
         target["estimatedCostUsd"] += cost
+        target["estimatedCostCny"] += cost_cny
         target["cacheSavingsUsd"] += savings
 
 
@@ -117,15 +143,18 @@ def main():
                 input_tokens = int(usage.get("inputTokens") or 0)
                 cache_read = int(usage.get("cacheReadTokens") or 0)
                 completion = int(usage.get("outputTokens") or 0)
-                prompt = max(0, input_tokens - cache_read)  # promptTokensIncludeCacheHits
-                cost, savings = cost_for(provider, model, prompt, completion, cache_read)
+                # DSH 的 inputTokens 已是净缓存未命中（llm-deepseek 适配器扣除
+                # cacheRead 后上报），勿再减 cache_read——旧实现二次扣除会把
+                # prompt 截断为 0，系统性低估成本（2026-08-23 修正）。
+                prompt = input_tokens
+                cost, savings, cost_cny = cost_for(provider, model, prompt, completion, cache_read, event_time)
                 row = {"promptTokens": prompt, "completionTokens": completion, "cacheReadTokens": cache_read}
-                merge_into(totals, row, cost, savings)
+                merge_into(totals, row, cost, savings, cost_cny)
                 model_bucket = by_model.setdefault((provider, model), new_bucket())
-                merge_into(model_bucket, row, cost, savings)
+                merge_into(model_bucket, row, cost, savings, cost_cny)
                 day = event_time // 86400000
                 day_bucket = by_day.setdefault(day, new_bucket())
-                merge_into(day_bucket, row, cost, savings)
+                merge_into(day_bucket, row, cost, savings, cost_cny)
 
     def finish(bucket):
         return {
@@ -135,6 +164,7 @@ def main():
             "cacheReadTokens": bucket["cacheReadTokens"],
             "totalTokens": bucket["promptTokens"] + bucket["completionTokens"] + bucket["cacheReadTokens"],
             "estimatedCostUsd": round(bucket["estimatedCostUsd"], 6),
+            "estimatedCostCny": round(bucket["estimatedCostCny"], 6),
             "cacheSavingsUsd": round(bucket["cacheSavingsUsd"], 6),
             "costUnknownCount": bucket["costUnknownCount"],
         }
@@ -153,7 +183,8 @@ def main():
             {"day": day, "modelResponseCount": bucket["modelResponseCount"],
              "promptTokens": bucket["promptTokens"], "completionTokens": bucket["completionTokens"],
              "cacheReadTokens": bucket["cacheReadTokens"],
-             "estimatedCostUsd": round(bucket["estimatedCostUsd"], 6)}
+             "estimatedCostUsd": round(bucket["estimatedCostUsd"], 6),
+             "estimatedCostCny": round(bucket["estimatedCostCny"], 6)}
             for day, bucket in sorted(by_day.items())
         ],
     }
