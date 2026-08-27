@@ -29,7 +29,7 @@ import { join } from 'node:path'
 import { homedir, hostname } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { createConnection } from 'node:net'
-import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints, historyPointChanged, shouldRefreshSlow } from './lib/parsers.mjs'
+import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints, historyPointChanged, shouldRefreshSlow, bucketKey, accumulateBucket, finalizeBucket, bucketFromRow, downsampleAnchored, HISTORY_METRICS } from './lib/parsers.mjs'
 
 export const name = 'dsh-dashboards'
 export const inject = ['webServer']
@@ -98,6 +98,17 @@ const PROBE_FILE = join(HOME, 'storages/dsh-dashboards/probe-targets.json')
 const DEFAULTS_DIR = join(HOME, 'storages/dsh-dashboards')
 /** macOS 滚动趋势持久化（事件溯源风格 jsonl，追加写；重启不清零，2026-08-19）。 */
 const HISTORY_FILE = join(HOME, 'storages/dsh-dashboards/history.jsonl')
+/** B3 多分辨率聚合落盘：minute 桶（60s，7 天）与 hour 桶（3600s，90 天）。
+ * raw 档保留 2h（historyPoints×pollMs≈1h，内存窗口）；长窗口读聚合档。 */
+const HISTORY_MIN_FILE = join(HOME, 'storages/dsh-dashboards/history-min.jsonl')
+const HISTORY_HOUR_FILE = join(HOME, 'storages/dsh-dashboards/history-hour.jsonl')
+const AGG_MIN_MS = 60_000
+const AGG_HOUR_MS = 3_600_000
+const AGG_MIN_RETENTION_MS = 7 * 86_400_000
+const AGG_HOUR_RETENTION_MS = 90 * 86_400_000
+/** 聚合落盘节奏：minute 档每 5min 落盘一次、hour 档每 30min 一次（文件小，全量重写）。 */
+const AGG_MIN_FLUSH_MS = 300_000
+const AGG_HOUR_FLUSH_MS = 1_800_000
 /** feed 采集摘要报告目录（scheduler job「多平台 feed 采集摘要」落盘：feed-digest-*.md 在 scheduler-reports 根目录；feed/ 子目录是原始 JSON，feed-profile/ 是画像）。 */
 const FEED_DIR = join(HOME, 'scheduler-reports')
 
@@ -691,6 +702,58 @@ function appendHistoryToDisk(point) {
   } catch { /* 忽略 */ }
 }
 
+/** ── B3 多分辨率聚合读写（history-min/hour.jsonl） ────────────────────
+ * 内存 Map 直接存累加状态（accumulateBucket 输出），落盘/查询时才 finalize。
+ * 每行 = finalizeBucket 输出（{bucket, samples, <metric>:{min,avg,max,count}}）。
+ * 全量重写 + 按保留窗口裁剪（文件小：7d×1440 桶 + 90d×24 桶 ≈ 万级行）。
+ * 启动加载最近桶继续聚合（bucketFromRow 无损恢复 sum/count）。 */
+function loadAggregates(file) {
+  try {
+    const lines = readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)
+    const buckets = new Map()
+    for (const line of lines) {
+      const row = JSON.parse(line)
+      if (row && typeof row.bucket === 'number') buckets.set(row.bucket, bucketFromRow(row))
+    }
+    return buckets
+  } catch {
+    return new Map()
+  }
+}
+
+function saveAggregates(file, buckets, retentionMs) {
+  try {
+    const now = Date.now()
+    const rows = []
+    for (const [bucket, acc] of buckets) {
+      if (now - bucket > retentionMs) continue
+      rows.push(finalizeBucket(acc, bucket))
+    }
+    rows.sort((a, b) => a.bucket - b.bucket)
+    mkdirSync(DEFAULTS_DIR, { recursive: true })
+    writeFileSync(file, rows.map((r) => JSON.stringify(r)).join('\n') + '\n')
+  } catch { /* 忽略 */ }
+}
+
+/** 折叠聚合桶 Map 为查询点序列（截断窗口后升序返回）。 */
+function aggregatesToPoints(buckets, windowMs) {
+  const now = Date.now()
+  const from = now - windowMs
+  const keys = [...buckets.keys()].filter((k) => k >= from).sort((a, b) => a - b)
+  return keys.map((k) => {
+    const r = finalizeBucket(buckets.get(k), k)
+    return {
+      ts: new Date(k).toISOString(),
+      load1: r.load1?.avg ?? null,
+      memUsedPct: r.memUsedPct?.max ?? null,
+      cpuUsedPct: r.cpuUsedPct?.avg ?? null,
+      netInBps: r.netInBps?.avg ?? null,
+      netOutBps: r.netOutBps?.avg ?? null,
+      bucketSamples: r.samples ?? 0,
+    }
+  })
+}
+
 /** ── AI 额度（ZenMux PAYG/订阅 + Packy 余额）────────────────────────
  * 数据源：
  *   ZenMux management API（ZENMUX_MANAGEMENT_API_KEY，~/.dsh/.credentials.yaml）
@@ -998,7 +1061,12 @@ export function apply(ctx, config) {
   // 2026-08-27 B1：变化门控写入——指标无实质变化（HISTORY_WRITE_TOLERANCE 容差内）时
   //   跳过磁盘 append（内存窗口仍保留全部点，曲线连续）；镜像 mac-performance-monitor
   //   SampleStore.lastWritten 的 change-gated inserts（~94% 空闲拍不再写行）。
+  // 2026-08-27 B3：push 时同步累加 minute/hour 聚合桶（内存 Map + 周期落盘），
+  //   history 端点按 ?window= 选档（1h raw / 6h-24h minute / 7d hour）。
   const history = loadHistoryFromDisk(cfg.macos.historyPoints)
+  const minBuckets = loadAggregates(HISTORY_MIN_FILE)
+  const hourBuckets = loadAggregates(HISTORY_HOUR_FILE)
+  let lastAggFlushAt = Date.now()
   let lastWrittenPoint = null
   const pushHistory = (snap) => {
     const d = snap?.data
@@ -1013,6 +1081,14 @@ export function apply(ctx, config) {
       netOutBps: d.net?.outBps ?? null,
     }
     history.push(point)
+    // B3：同步累加聚合桶（raw 点 → minute/hour；bucket 幂等由时间锚定保证）
+    const tsMs = new Date(point.ts).getTime()
+    if (Number.isFinite(tsMs)) {
+      const minKey = bucketKey(tsMs, AGG_MIN_MS)
+      minBuckets.set(minKey, accumulateBucket(minBuckets.get(minKey), point))
+      const hourKey = bucketKey(tsMs, AGG_HOUR_MS)
+      hourBuckets.set(hourKey, accumulateBucket(hourBuckets.get(hourKey), point))
+    }
     if (cfg.macos.writeGate) {
       // 门控：与上次实际写入磁盘的点无实质变化 → 只留内存窗口，跳过磁盘写
       if (lastWrittenPoint === null || historyPointChanged(lastWrittenPoint, point)) {
@@ -1025,23 +1101,57 @@ export function apply(ctx, config) {
     }
     if (history.length > cfg.macos.historyPoints) history.shift()
   }
+  // 聚合桶周期落盘（minute 5min / hour 30min；全量重写 + 保留窗口裁剪）
+  const flushAggregates = () => {
+    const now = Date.now()
+    if (now - lastAggFlushAt >= AGG_MIN_FLUSH_MS) {
+      saveAggregates(HISTORY_MIN_FILE, minBuckets, AGG_MIN_RETENTION_MS)
+      saveAggregates(HISTORY_HOUR_FILE, hourBuckets, AGG_HOUR_RETENTION_MS)
+      lastAggFlushAt = now
+    }
+  }
   const macosTimer = setInterval(() => {
     if (isIdle()) return
     pushHistory(macos.snapshot())
+    flushAggregates()
   }, 3000)
   macosTimer.unref?.()
   // history 端点（非 makePoller；聚合端点同构快照；gap 填充 + 窗口元信息）
+  // ?window=1h（默认，raw）| 6h | 24h | 7d（minute/hour 聚合 + 绝对时间锚定降采样 B5）
   const historyPoller = {
-    get: async () => {
+    get: async (searchParams) => {
       pushHistory(macos.snapshot())
+      const windowArg = searchParams?.get?.('window') ?? '1h'
       const raw = history.slice(-60)
+      if (windowArg === '1h') {
+        return {
+          ts: new Date().toISOString(),
+          data: {
+            points: fillGapPoints(raw, cfg.macos.pollMs),
+            sampleMs: cfg.macos.pollMs,
+            windowStart: raw[0]?.ts ?? null,
+            windowEnd: raw[raw.length - 1]?.ts ?? null,
+          },
+          error: null,
+        }
+      }
+      // 长窗口：选档聚合 → 绝对时间锚定降采样到 ≤120 点（B5：mem 取峰值保尖峰）
+      const WINDOWS = {
+        '6h': { ms: 6 * 3600_000, buckets: minBuckets, sampleMs: AGG_MIN_MS },
+        '24h': { ms: 24 * 3600_000, buckets: minBuckets, sampleMs: AGG_MIN_MS },
+        '7d': { ms: 7 * 86_400_000, buckets: hourBuckets, sampleMs: AGG_HOUR_MS },
+      }
+      const win = WINDOWS[windowArg] ?? WINDOWS['24h']
+      const pts = aggregatesToPoints(win.buckets, win.ms)
+      const downsampled = downsampleAnchored(pts, win.ms, 120)
       return {
         ts: new Date().toISOString(),
         data: {
-          points: fillGapPoints(raw, cfg.macos.pollMs),
-          sampleMs: cfg.macos.pollMs,
-          windowStart: raw[0]?.ts ?? null,
-          windowEnd: raw[raw.length - 1]?.ts ?? null,
+          points: fillGapPoints(downsampled, win.sampleMs * 2),
+          sampleMs: win.sampleMs,
+          granularity: win.sampleMs === AGG_MIN_MS ? 'minute' : 'hour',
+          windowStart: pts[0]?.ts ?? null,
+          windowEnd: pts[pts.length - 1]?.ts ?? null,
         },
         error: null,
       }
@@ -1193,7 +1303,7 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/macos') { const s = await macos.get(); if (cfg.macos.enabled && !s.data) await macos.refresh(); sendJson(res, 200, s); return }
         if (method === 'GET' && path === '/dashboards/macos/history') {
           // 统一走 historyPoller（含 gap 填充 + sampleMs/window 元信息，与 snapshot 聚合同构）
-          sendJson(res, 200, await historyPoller.get())
+          sendJson(res, 200, await historyPoller.get(url.searchParams))
           return
         }
         if (method === 'GET' && path === '/dashboards/probe') { sendJson(res, 200, await probe.get()); return }
