@@ -9,7 +9,8 @@
  *   GET /dashboards/los/metrics        los /metrics（Prometheus → 任务统计）
  *   GET /dashboards/los/nodes          los /nodes（执行节点矩阵 + capacity 快照）
  *   GET /dashboards/macos              macOS 原生探针快照（loadavg/mem/disk/net/cpu）
- *   GET /dashboards/macos/history      macOS 滚动短趋势（内存缓冲）
+ *   GET /dashboards/macos/history      macOS 滚动短趋势（?window=1h|6h|24h|7d 选档聚合）
+ *   GET /dashboards/macos/insights     macOS 趋势分析（growth/step/drift 检测，B8）
  *   GET /dashboards/probe              端口/HTTP 服务探活
  *   GET /dashboards/probe-targets      探针目标（store 优先 → Config.probe.targets → DEFAULT_TARGETS）
  *   PUT /dashboards/probe-targets      保存探针目标（空数组 = 重置回默认；持久化 ~/.dsh/storages/dsh-dashboards/probe-targets.json）
@@ -29,7 +30,7 @@ import { join } from 'node:path'
 import { homedir, hostname } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { createConnection } from 'node:net'
-import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints, historyPointChanged, shouldRefreshSlow, bucketKey, accumulateBucket, finalizeBucket, bucketFromRow, downsampleAnchored, HISTORY_METRICS } from './lib/parsers.mjs'
+import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints, historyPointChanged, shouldRefreshSlow, bucketKey, accumulateBucket, finalizeBucket, bucketFromRow, downsampleAnchored, HISTORY_METRICS, detectSustainedGrowth, detectStepChange, detectTrendDrift } from './lib/parsers.mjs'
 
 export const name = 'dsh-dashboards'
 export const inject = ['webServer']
@@ -115,7 +116,7 @@ const FEED_DIR = join(HOME, 'scheduler-reports')
 /** widget endpoint 白名单（防 PUT 注入任意路径）。 */
 const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/los/usage', '/dashboards/los/trends', '/dashboards/los/metrics', '/dashboards/los/nodes',
-  '/dashboards/macos', '/dashboards/macos/history', '/dashboards/probe', '/dashboards/glances', '/dashboards/kuma',
+  '/dashboards/macos', '/dashboards/macos/history', '/dashboards/macos/insights', '/dashboards/probe', '/dashboards/glances', '/dashboards/kuma',
   '/dashboards/feed/digests', '/dashboards/surge/ai-reputation', '/dashboards/ai-quota',
   '/dashboards/dsh/usage',
   '/dashboards/usage/reconcile',
@@ -1157,6 +1158,32 @@ export function apply(ctx, config) {
       }
     },
   }
+  // B8: 趋势分析端点（基于聚合历史运行检测器；纯函数，读时计算）
+  // 借鉴 mac-performance-monitor Analysis/：LeakDetector / ChangeDetector /
+  // ThermalDrift 的阈值保守语义（宁缺毋滥）。窗口越大越可信：growth/drift
+  // 用 7d hour 聚合，step 用 24h minute 聚合。
+  const insightsPoller = {
+    get: async () => {
+      pushHistory(macos.snapshot())
+      const hourPts = aggregatesToPoints(hourBuckets, 7 * 86_400_000)
+      const minPts = aggregatesToPoints(minBuckets, 24 * 3600_000)
+      const findings = []
+      const growth = detectSustainedGrowth(hourPts)
+      if (growth) findings.push(growth)
+      const drift = detectTrendDrift(hourPts)
+      if (drift) findings.push(drift)
+      const step = detectStepChange(minPts)
+      if (step) findings.push({ kind: 'step', ...step })
+      return {
+        ts: new Date().toISOString(),
+        data: {
+          findings,
+          sampleBasis: { hourPoints: hourPts.length, minutePoints: minPts.length },
+        },
+        error: null,
+      }
+    },
+  }
   // endpoint → poller 映射（/dashboards/snapshot 聚合用）
   const pollerByEndpoint = {
     '/dashboards/los/usage': losUsage,
@@ -1165,6 +1192,7 @@ export function apply(ctx, config) {
     '/dashboards/los/nodes': losNodes,
     '/dashboards/macos': macos,
     '/dashboards/macos/history': historyPoller,
+    '/dashboards/macos/insights': insightsPoller,
     '/dashboards/probe': probe,
     '/dashboards/glances': glances,
     '/dashboards/kuma': kuma,
@@ -1304,6 +1332,10 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/macos/history') {
           // 统一走 historyPoller（含 gap 填充 + sampleMs/window 元信息，与 snapshot 聚合同构）
           sendJson(res, 200, await historyPoller.get(url.searchParams))
+          return
+        }
+        if (method === 'GET' && path === '/dashboards/macos/insights') {
+          sendJson(res, 200, await insightsPoller.get())
           return
         }
         if (method === 'GET' && path === '/dashboards/probe') { sendJson(res, 200, await probe.get()); return }
