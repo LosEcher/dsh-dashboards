@@ -29,7 +29,7 @@ import { join } from 'node:path'
 import { homedir, hostname } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { createConnection } from 'node:net'
-import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints } from './lib/parsers.mjs'
+import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints, historyPointChanged, shouldRefreshSlow } from './lib/parsers.mjs'
 
 export const name = 'dsh-dashboards'
 export const inject = ['webServer']
@@ -56,6 +56,10 @@ export const Config = Schema.object({
     diskAlertCooldownMs: Schema.number(),
     /** 磁盘水位独立检查间隔 ms（不受看板 idle 门控，看板未打开也告警）。 */
     diskAlertCheckMs: Schema.number(),
+    /** 慢变量降频间隔 ms（B2）：df 容量/进程数分钟级，按此间隔复用缓存，其余快变量每拍。 */
+    slowCmdMs: Schema.number(),
+    /** 变化门控写入（B1）：指标无实质变化时跳过磁盘 append（内存窗口仍保留全部点）。 */
+    writeGate: Schema.boolean(),
   }),
   glances: Schema.object({
     enabled: Schema.boolean(),
@@ -162,6 +166,10 @@ function resolveConfig(config) {
       diskAlertPct: c.macos?.diskAlertPct ?? 85,
       diskAlertCooldownMs: c.macos?.diskAlertCooldownMs ?? 6 * 3600_000,
       diskAlertCheckMs: c.macos?.diskAlertCheckMs ?? 300_000,
+      // 慢变量降频（B2）：df/ps 分钟级，默认 5×pollMs（150s）复用缓存
+      slowCmdMs: c.macos?.slowCmdMs ?? 150_000,
+      // 变化门控写入（B1）：默认开
+      writeGate: c.macos?.writeGate ?? true,
     },
     glances: {
       enabled: c.glances?.enabled ?? false,
@@ -396,9 +404,19 @@ function withTimeout(promise, ms, label) {
 let prevNet = null
 let prevNetAt = 0
 
+/** 慢变量降频缓存（B2）：df 容量/ps 进程数分钟级变化，按 slowCmdMs 复用缓存，
+ * 避免每拍重复 exec（df 可能卡挂载，ps 遍历 500+ 进程）。镜像
+ * mac-performance-monitor 的 batteryReadInterval/SMC slowInterval 语义。 */
+const slowCmdCache = { df: { at: 0, out: null }, ps: { at: 0, out: null } }
+
 async function collectMacos(cfg) {
+  // 慢变量降频判定的基准时间（网络差分用函数内后面的 now；这里是降频用）
+  const slowNow = Date.now()
   // 各命令并行执行：总耗时 = max(单命令) 而非累加；df 卡住不影响 load/mem/cpu。
-  const [load, memsize, ncpu, model, pagesize, vmstat, iostat, df, netstat, ps] = await Promise.all([
+  const slowMs = cfg.macos.slowCmdMs
+  const dfDue = shouldRefreshSlow(slowCmdCache.df.at, slowNow, slowMs)
+  const psDue = shouldRefreshSlow(slowCmdCache.ps.at, slowNow, slowMs)
+  const [load, memsize, ncpu, model, pagesize, vmstat, iostat, dfRes, netstat, psRes] = await Promise.all([
     runExec('sysctl', ['-n', 'vm.loadavg']),
     runExec('sysctl', ['-n', 'hw.memsize']),
     runExec('sysctl', ['-n', 'hw.ncpu']),
@@ -406,10 +424,15 @@ async function collectMacos(cfg) {
     runExec('sysctl', ['-n', 'hw.pagesize']),
     runExec('vm_stat'),
     runExec('iostat', ['-c', '2', '-w', '1']),
-    runExec('df', ['-h', '/', '/System/Volumes/Data']),
+    dfDue ? runExec('df', ['-h', '/', '/System/Volumes/Data']) : Promise.resolve(slowCmdCache.df.out ?? { out: null }),
     runExec('netstat', ['-ib']),
-    runExec('ps', ['-ax', '-o', 'pid=']),
+    psDue ? runExec('ps', ['-ax', '-o', 'pid=']) : Promise.resolve(slowCmdCache.ps.out ?? { out: null }),
   ])
+  // 慢变量只在真正重跑时更新缓存（失败保留旧值，避免缓存被 error 污染）
+  if (dfDue && dfRes?.out) { slowCmdCache.df = { at: slowNow, out: dfRes } }
+  if (psDue && psRes?.out) { slowCmdCache.ps = { at: slowNow, out: psRes } }
+  const df = dfRes
+  const ps = psRes
 
   const loadavg = load.out ? parseLoadavg(load.out) : null
   const pages = vmstat.out ? parseVmStat(vmstat.out) : {}
@@ -972,7 +995,11 @@ export function apply(ctx, config) {
 
   // ── macOS 滚动短趋势（持久化 jsonl + 内存窗口；按 ts 去重，30s 采样节奏 → 120 点 = 1h 窗口）
   // 2026-08-19 P2：重启从磁盘加载（不因插件重启清零）；断档由 fillGapPoints 标注。
+  // 2026-08-27 B1：变化门控写入——指标无实质变化（HISTORY_WRITE_TOLERANCE 容差内）时
+  //   跳过磁盘 append（内存窗口仍保留全部点，曲线连续）；镜像 mac-performance-monitor
+  //   SampleStore.lastWritten 的 change-gated inserts（~94% 空闲拍不再写行）。
   const history = loadHistoryFromDisk(cfg.macos.historyPoints)
+  let lastWrittenPoint = null
   const pushHistory = (snap) => {
     const d = snap?.data
     if (!d) return
@@ -986,7 +1013,16 @@ export function apply(ctx, config) {
       netOutBps: d.net?.outBps ?? null,
     }
     history.push(point)
-    appendHistoryToDisk(point)
+    if (cfg.macos.writeGate) {
+      // 门控：与上次实际写入磁盘的点无实质变化 → 只留内存窗口，跳过磁盘写
+      if (lastWrittenPoint === null || historyPointChanged(lastWrittenPoint, point)) {
+        appendHistoryToDisk(point)
+        lastWrittenPoint = point
+      }
+    } else {
+      appendHistoryToDisk(point)
+      lastWrittenPoint = point
+    }
     if (history.length > cfg.macos.historyPoints) history.shift()
   }
   const macosTimer = setInterval(() => {
