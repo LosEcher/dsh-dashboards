@@ -855,6 +855,8 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
   const [widgets, setWidgets] = useState<SnapshotWidget[] | null>(null)
   const [configError, setConfigError] = useState<string | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
+  // 最近一次成功的数据（fetch 瞬时失败时保留旧数据渲染，不整页红字）
+  const widgetsRef = useRef<SnapshotWidget[] | null>(null)
 
   // ── 编辑模式：widget 移除 + 探针目标增删（PUT /dashboards/widgets + /probe-targets） ──
   const [editing, setEditing] = useState(false)
@@ -981,17 +983,24 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
   // 单 ticker：15s 拉一次 /dashboards/snapshot（host 侧按各后端 interval 决定真正采集，
   // client 不再逐卡 fetch——往返 7→1）。可见性门控：浏览器标签页隐藏时停 ticker，
   // 避免后台 tab 里挂着的看板让 host 8 个 poller 永活（配合 host 侧 180s 活动门控）。
+  // 2026-09-01：fetch 瞬时失败（如冷启动时 host 侧重型后端仍在首次采集）保留旧数据，
+  // 只有从未拿到数据才整页报错；host 侧 get() 已改 stale-while-revalidate（≤2.5s 响应），
+  // 此超时仅为兜底。
   useEffect(() => {
     let alive = true
     let timer: ReturnType<typeof setInterval> | null = null
     const load = async () => {
       try {
-        const res = await fetch('/dashboards/snapshot', { signal: AbortSignal.timeout(10000) })
+        const res = await fetch('/dashboards/snapshot', { signal: AbortSignal.timeout(15000) })
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const d = await res.json() as { widgets?: SnapshotWidget[] }
-        if (alive) { setWidgets(d.widgets ?? []); setConfigError(null) }
+        if (alive) {
+          widgetsRef.current = d.widgets ?? []
+          setWidgets(widgetsRef.current)
+          setConfigError(null)
+        }
       } catch (e) {
-        if (alive) setConfigError(String(e))
+        if (alive && !widgetsRef.current?.length) setConfigError(String(e))
       }
     }
     const sync = () => {

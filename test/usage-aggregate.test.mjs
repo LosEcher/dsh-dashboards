@@ -37,6 +37,26 @@ function run(root) {
   return JSON.parse(out.toString())
 }
 
+function runWithCache(root, cache) {
+  const out = execFileSync('python3', [SCRIPT, '--sessions-root', root, '--cache', cache], { maxBuffer: 1 << 20 })
+  return JSON.parse(out.toString())
+}
+
+function runForceFull(root, cache) {
+  const out = execFileSync('python3', [SCRIPT, '--sessions-root', root, '--cache', cache, '--force-full'], { maxBuffer: 1 << 20 })
+  return JSON.parse(out.toString())
+}
+
+/** 重写某 session 文件（追加事件；zstd 整文件重压，mtime 必变）。 */
+function rewriteSession(root, name, events) {
+  const payload = events.map(line).join('\n') + '\n'
+  const zstd = execFileSync('python3', ['-c', `
+import sys, zstandard
+sys.stdout.buffer.write(zstandard.ZstdCompressor().compress(sys.stdin.buffer.read()))
+`], { input: payload, maxBuffer: 1 << 20 })
+  writeFileSync(join(root, 'ws', name, 'session.jsonl.zstd'), zstd)
+}
+
 test('aggregate prices DeepSeek usage with peak/off-peak, weekend and CNY conversion', () => {
   const s = (ts, input, cacheRead, output) => [
     { type: 'request/header', time: ts, data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } } } },
@@ -89,6 +109,55 @@ test('aggregate skips unpriced routes but still counts tokens', () => {
     assert.equal(t.costUnknownCount, 1)
     assert.equal(t.estimatedCostUsd, 0)
     assert.equal(t.cacheHitRate, 0)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('incremental cache: 未变文件复用、变更文件重扫，聚合结果一致', () => {
+  const ts = 1787036400000
+  const header = { type: 'request/header', time: ts, data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } } } }
+  const msg = { type: 'assistant/message', time: ts, data: { usage: { inputTokens: 100_000, cacheReadTokens: 800_000, outputTokens: 50_000 } } }
+  const root = makeFixture({ a: [header, msg] })
+  const cache = join(root, 'cache.json')
+  try {
+    const r1 = runWithCache(root, cache)
+    assert.equal(r1.cacheReusedSessions, 0)
+    assert.equal(r1.totals.modelResponseCount, 1)
+    // 第二次：文件未变 → 全复用，输出一致
+    const r2 = runWithCache(root, cache)
+    assert.equal(r2.cacheReusedSessions, 1)
+    assert.equal(r2.totals.modelResponseCount, 1)
+    assert.deepEqual(r2.totals, r1.totals)
+    assert.deepEqual(r2.byProviderModel, r1.byProviderModel)
+    // 追加一条事件 → mtime 变化 → 重扫该文件，计数增长
+    rewriteSession(root, 'a', [header, msg, msg])
+    const r3 = runWithCache(root, cache)
+    assert.equal(r3.cacheReusedSessions, 0)
+    assert.equal(r3.totals.modelResponseCount, 2)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('增量缓存 24h 校准：--force-full 全量重扫且结果一致', () => {
+  const ts = 1787036400000
+  const header = { type: 'request/header', time: ts, data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } } } }
+  const msg = { type: 'assistant/message', time: ts, data: { usage: { inputTokens: 100_000, cacheReadTokens: 800_000, outputTokens: 50_000 } } }
+  const root = makeFixture({ a: [header, msg], b: [header, msg] })
+  const cache = join(root, 'cache.json')
+  try {
+    const r1 = runWithCache(root, cache)
+    assert.equal(r1.totals.modelResponseCount, 2)
+    const r2 = runWithCache(root, cache)
+    assert.equal(r2.cacheReusedSessions, 2)
+    // force-full：忽略缓存命中，全部重扫；结果应与增量一致
+    const rf = runForceFull(root, cache)
+    assert.equal(rf.cacheReusedSessions, 0)
+    assert.deepEqual(rf.totals, r1.totals)
+    // 校准后缓存恢复增量
+    const r3 = runWithCache(root, cache)
+    assert.equal(r3.cacheReusedSessions, 2)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

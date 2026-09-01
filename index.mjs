@@ -31,6 +31,7 @@ import { homedir, hostname } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { createConnection } from 'node:net'
 import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints, historyPointChanged, shouldRefreshSlow, bucketKey, accumulateBucket, finalizeBucket, bucketFromRow, downsampleAnchored, HISTORY_METRICS, detectSustainedGrowth, detectStepChange, detectTrendDrift } from './lib/parsers.mjs'
+import { makePoller, startPoller, touchActivity, isIdle } from './lib/poller.mjs'
 
 export const name = 'dsh-dashboards'
 export const inject = ['webServer']
@@ -130,12 +131,6 @@ const SURGE_STATUS_LABEL = {
   healthy: 'healthy', grok_403: 'grok_403', xai_blocked: 'xai_blocked',
   xai_banned: 'xai_banned', dead: 'dead', xai_partial: 'xai_partial',
 }
-
-/** 活动门控：超过此时长无 /dashboards 请求，后台轮询暂停（看板未打开时不空转采集）。 */
-const IDLE_PAUSE_MS = 180_000
-let lastActivityAt = Date.now()
-function touchActivity() { lastActivityAt = Date.now() }
-function isIdle() { return Date.now() - lastActivityAt > IDLE_PAUSE_MS }
 
 const DEFAULT_TARGETS = [
   { name: 'dsh-web', url: 'http://127.0.0.1:3080' },
@@ -249,66 +244,41 @@ function resolveTokens(cfg) {
   return { authToken, operatorToken }
 }
 
-/** ── 轮询缓存（single-flight，每后端独立节奏） ─────────────────────── */
-function makePoller(fn, intervalMs) {
-  let snapshot = { ts: null, data: null, error: null }
-  let inFlight = null
-  async function refresh() {
-    if (inFlight) return inFlight
-    inFlight = (async () => {
-      try {
-        const data = await fn()
-        snapshot = { ts: new Date().toISOString(), data, error: null }
-      } catch (e) {
-        snapshot = { ...snapshot, ts: new Date().toISOString(), error: String(e) }
-      } finally {
-        inFlight = null
-      }
-    })()
-    return inFlight
-  }
-  async function get(force = false) {
-    const stale = !snapshot.ts || (snapshot.data === null && snapshot.error === null)
-    if (force || stale || Date.now() - new Date(snapshot.ts).getTime() > intervalMs) {
-      await refresh()
-    }
-    return snapshot
-  }
-  return { get, refresh, snapshot: () => snapshot }
-}
-
-function startPoller(poller, intervalMs) {
-  void poller.refresh()
-  const timer = setInterval(() => {
-    // 活动门控：看板未打开（无 /dashboards 请求）时跳过本轮，零采集开销
-    if (isIdle()) return
-    void poller.refresh()
-  }, intervalMs)
-  timer.unref?.()
-  return timer
-}
-
-/** ── los 采集（双 token 回退） ─────────────────────────────────────── */
+/** ── los 采集（双 token 回退） ───────────────────────────────────────
+ * 2026-09-01 修复错误归因：原实现在 attempt 失败后直接 fallthrough 并
+ * 抛「需 token」——token 已配置但请求超时（AbortSignal.timeout 8s）时
+ * 报错信息误导（把 TimeoutError 吞成「未配置 token」）。现保留真实错误。
+ */
 async function losFetch(cfg, tokens, path, { operator = false } = {}) {
   const url = `${cfg.losUrl}${path}`
-  const attempt = async (headers) => {
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) })
-    if (!res.ok) throw new Error(`los ${path} HTTP ${res.status}`)
-    return res
+  let lastErr = null
+  const tried = []
+  const attempt = async (label, headers) => {
+    tried.push(label)
+    try {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) })
+      if (!res.ok) throw new Error(`los ${path} HTTP ${res.status}`)
+      return res
+    } catch (e) {
+      lastErr = e
+      throw e
+    }
   }
+  const missing = (what) => new Error(`los ${path} 需 ${what}（Config / credentials / env 未配置）`)
+  const failed = () => new Error(`los ${path} 请求失败: ${lastErr?.message ?? lastErr}（已尝试 ${tried.join('/')}）`)
   if (operator) {
     if (tokens.operatorToken) {
-      try { return await attempt({ 'x-los-operator-token': tokens.operatorToken }) } catch (e) { /* fallthrough */ }
+      try { return await attempt('operator', { 'x-los-operator-token': tokens.operatorToken }) } catch { /* fallthrough */ }
     }
-    throw new Error(`los ${path} 需 operator token（Config.losOperatorToken / losEnvFile / LOS_OPERATOR_TOKEN）`)
+    throw tried.length ? failed() : missing('operator token')
   }
   if (tokens.authToken) {
-    try { return await attempt({ Authorization: `Bearer ${tokens.authToken}` }) } catch (e) { /* fallthrough */ }
+    try { return await attempt('bearer', { Authorization: `Bearer ${tokens.authToken}` }) } catch { /* fallthrough */ }
   }
   if (tokens.operatorToken) {
-    try { return await attempt({ 'x-los-operator-token': tokens.operatorToken }) } catch (e) { /* fallthrough */ }
+    try { return await attempt('operator', { 'x-los-operator-token': tokens.operatorToken }) } catch { /* fallthrough */ }
   }
-  throw new Error(`los ${path} 需 token（Config.losToken / credentials / losEnvFile）`)
+  throw tried.length ? failed() : missing('token（Config.losToken / credentials / losEnvFile）')
 }
 
 async function collectLosUsage(cfg, tokens) {
@@ -377,8 +347,8 @@ async function collectLosNodes(cfg, tokens) {
 /** ── macOS 原生探针（零安装，异步 execFile，绝不阻塞事件循环） ──────
  * 2026-08-16 修复：原 spawnSync 链在 SMB/NFS 挂载 stall 时会以 D 态子进程
  * 同步卡死事件循环（曾冻住协调重启的 force-exit 定时器 3.5 分钟）。
- * 现改异步 execFile + SIGKILL 硬上限 + 看门狗（withTimeout），单命令失败
- * 只降级该字段，不拖垮整次采集。
+ * 现改异步 execFile + SIGKILL 硬上限；整体看门狗由轮询基座 timeoutMs 兜底
+ * （单命令失败只降级该字段，不拖垮整次采集）。
  */
 const PROBE_CMD_TIMEOUT_MS = 3000
 /** 单次采集整体硬上限（看门狗；超时记 error，下一拍重试）。 */
@@ -401,16 +371,6 @@ function runExec(cmd, args, timeoutMs = PROBE_CMD_TIMEOUT_MS) {
       resolve({ out: stdout })
     })
   })
-}
-
-/** 看门狗：整体超时兜底（无论底层卡多久，这里按时 reject，由 poller 记 error）。 */
-function withTimeout(promise, ms, label) {
-  let timer
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} 超时 ${ms}ms`)), ms)
-  })
-  timer?.unref?.()
-  return Promise.race([promise, timeout])
 }
 
 let prevNet = null
@@ -781,8 +741,8 @@ async function collectAiQuota() {
   if (mgmtKey) {
     try {
       const [balance, sub] = await Promise.all([
-        fetch('https://zenmux.ai/api/v1/management/payg/balance', { headers: { Authorization: `Bearer ${mgmtKey}` } }).then((r) => r.json()),
-        fetch('https://zenmux.ai/api/v1/management/subscription/detail', { headers: { Authorization: `Bearer ${mgmtKey}` } }).then((r) => r.json()),
+        fetch('https://zenmux.ai/api/v1/management/payg/balance', { headers: { Authorization: `Bearer ${mgmtKey}` }, signal: AbortSignal.timeout(8000) }).then((r) => r.json()),
+        fetch('https://zenmux.ai/api/v1/management/subscription/detail', { headers: { Authorization: `Bearer ${mgmtKey}` }, signal: AbortSignal.timeout(8000) }).then((r) => r.json()),
       ])
       const b = balance?.data ?? {}
       const s = sub?.data ?? {}
@@ -827,6 +787,7 @@ async function collectAiQuota() {
             'Content-Type': 'application/json',
             'Accept': 'application/json',
           },
+          signal: AbortSignal.timeout(8000),
         })
         const text = await res.text()
         let body
@@ -867,10 +828,12 @@ async function collectAiQuota() {
  */
 const DSH_USAGE_SCRIPT = fileURLToPath(new URL('./scripts/dsh-usage-aggregate.py', import.meta.url))
 const DSH_USAGE_TIMEOUT_MS = 20000
+/** 聚合增量缓存（脚本按 mtime+size 跳过未变 session 文件，2026-09-01）。 */
+const DSH_USAGE_CACHE = join(HOME, 'storages/dsh-dashboards/usage-aggregate-cache.json')
 
 async function collectDshUsage() {
   const fromMs = Date.now() - 7 * 86400_000
-  const { out, error } = await runExec('python3', [DSH_USAGE_SCRIPT, '--from-ms', String(fromMs)], DSH_USAGE_TIMEOUT_MS)
+  const { out, error } = await runExec('python3', [DSH_USAGE_SCRIPT, '--from-ms', String(fromMs), '--cache', DSH_USAGE_CACHE], DSH_USAGE_TIMEOUT_MS)
   // 成功直接返回聚合对象（平铺），失败 throw 交给 poller 记 snapshot.error——
   // 与 collectLosUsage 等其它 collector 一致。旧实现返回 {data, error} 会被
   // poller 再包一层（snapshot.data.data），导致客户端与对账读 .totals 全部
@@ -1019,43 +982,56 @@ export function apply(ctx, config) {
   const tokens = resolveTokens(cfg)
 
   // 各后端轮询器（los 按子路径各自缓存；macos/probe/glances/kuma 各一）
-  const losUsage = makePoller(() => collectLosUsage(cfg, tokens), cfg.losPollMs)
-  const losTrends = makePoller(() => collectLosTrends(cfg, tokens), Math.max(cfg.losPollMs, 120000))
-  const losMetrics = makePoller(() => collectLosMetrics(cfg, tokens), Math.max(cfg.losPollMs, 120000))
-  const losNodes = makePoller(() => collectLosNodes(cfg, tokens), Math.max(cfg.losPollMs, 90000))
-  // 看门狗：单次采集整体 12s 硬上限，df/iostat 卡挂载也只降级该拍，不拖住 get()。
-  const macos = makePoller(() => withTimeout(collectMacos(cfg), PROBE_TOTAL_TIMEOUT_MS, 'macos 探针'), cfg.macos.pollMs)
-  const probe = makePoller(() => collectProbe(cfg), cfg.probe.pollMs)
-  const glances = makePoller(async () => {
-    if (!cfg.glances.enabled) return { enabled: false, reason: 'glances 未启用（Config.glances.enabled）' }
-    const res = await fetch(`${cfg.glances.url}/api/4/all`, { signal: AbortSignal.timeout(6000) })
-    if (!res.ok) return { enabled: true, error: `glances HTTP ${res.status}` }
-    const d = await res.json()
-    return { enabled: true, cpu: d.cpu ?? null, mem: d.mem ?? null, load: d.load ?? null, fs: d.fs ?? [], net: d.net ?? null }
-  }, cfg.glances.pollMs)
-  const kuma = makePoller(async () => {
-    if (!cfg.kuma.enabled) return { enabled: false, reason: 'kuma 未启用（Config.kuma.enabled；配置 url+token 后启用）' }
-    if (!cfg.kuma.url || !cfg.kuma.token) return { enabled: true, error: 'kuma 缺 url/token' }
-    // Kuma 2.x 无 /api/v1 REST；唯一鉴权数据端点 = /metrics（Prometheus 文本）。
-    // API key 以 Basic auth 密码传入（username 任意，kuma apiAuthorizer 取 password）。
-    const auth = `Basic ${Buffer.from(`apikey:${cfg.kuma.token}`).toString('base64')}`
-    const res = await fetch(`${cfg.kuma.url.replace(/\/+$/, '')}/metrics`, {
-      headers: { Authorization: auth },
-      signal: AbortSignal.timeout(8000),
-    })
-    if (!res.ok) return { enabled: true, error: `kuma /metrics HTTP ${res.status}` }
-    return { enabled: true, monitors: parseKumaMetrics(await res.text()) }
-  }, cfg.kuma.pollMs)
+  // 声明式 DataSource（lib/poller.mjs 基座）：统一 stale-while-revalidate /
+  // 超时兜底 / stats 观测；collect 闭包捕获 cfg/tokens。
+  const losUsage = makePoller({ id: 'los-usage', collect: () => collectLosUsage(cfg, tokens), intervalMs: cfg.losPollMs })
+  const losTrends = makePoller({ id: 'los-trends', collect: () => collectLosTrends(cfg, tokens), intervalMs: Math.max(cfg.losPollMs, 120000) })
+  const losMetrics = makePoller({ id: 'los-metrics', collect: () => collectLosMetrics(cfg, tokens), intervalMs: Math.max(cfg.losPollMs, 120000) })
+  const losNodes = makePoller({ id: 'los-nodes', collect: () => collectLosNodes(cfg, tokens), intervalMs: Math.max(cfg.losPollMs, 90000) })
+  // 看门狗：单次采集整体 12s 硬上限（基座 timeoutMs 兜底），df/iostat 卡挂载也只降级该拍
+  const macos = makePoller({ id: 'macos', collect: () => collectMacos(cfg), intervalMs: cfg.macos.pollMs, timeoutMs: PROBE_TOTAL_TIMEOUT_MS })
+  const probe = makePoller({ id: 'probe', collect: () => collectProbe(cfg), intervalMs: cfg.probe.pollMs })
+  const glances = makePoller({
+    id: 'glances',
+    intervalMs: cfg.glances.pollMs,
+    collect: async () => {
+      if (!cfg.glances.enabled) return { enabled: false, reason: 'glances 未启用（Config.glances.enabled）' }
+      const res = await fetch(`${cfg.glances.url}/api/4/all`, { signal: AbortSignal.timeout(6000) })
+      if (!res.ok) return { enabled: true, error: `glances HTTP ${res.status}` }
+      const d = await res.json()
+      return { enabled: true, cpu: d.cpu ?? null, mem: d.mem ?? null, load: d.load ?? null, fs: d.fs ?? [], net: d.net ?? null }
+    },
+  })
+  const kuma = makePoller({
+    id: 'kuma',
+    intervalMs: cfg.kuma.pollMs,
+    collect: async () => {
+      if (!cfg.kuma.enabled) return { enabled: false, reason: 'kuma 未启用（Config.kuma.enabled；配置 url+token 后启用）' }
+      if (!cfg.kuma.url || !cfg.kuma.token) return { enabled: true, error: 'kuma 缺 url/token' }
+      // Kuma 2.x 无 /api/v1 REST；唯一鉴权数据端点 = /metrics（Prometheus 文本）。
+      // API key 以 Basic auth 密码传入（username 任意，kuma apiAuthorizer 取 password）。
+      const auth = `Basic ${Buffer.from(`apikey:${cfg.kuma.token}`).toString('base64')}`
+      const res = await fetch(`${cfg.kuma.url.replace(/\/+$/, '')}/metrics`, {
+        headers: { Authorization: auth },
+        signal: AbortSignal.timeout(8000),
+      })
+      if (!res.ok) return { enabled: true, error: `kuma /metrics HTTP ${res.status}` }
+      return { enabled: true, monitors: parseKumaMetrics(await res.text()) }
+    },
+  })
   // feed 摘要（读本机报告文件，成本低；60s 节奏 + 快照缓存即可）
-  const feedDigests = makePoller(collectFeedDigests, 60000)
+  const feedDigests = makePoller({ id: 'feed', collect: collectFeedDigests, intervalMs: 60000 })
   // Surge AI 节点信誉（读本机 state 文件 + 事件流，成本低）
-  const surgeRep = makePoller(() => collectSurgeRep(cfg), cfg.surgeRep.pollMs)
+  const surgeRep = makePoller({ id: 'surge-rep', collect: () => collectSurgeRep(cfg), intervalMs: cfg.surgeRep.pollMs })
   // AI 额度（ZenMux + Packy；60s 刷新，独立于 los 节奏）
-  const aiQuota = makePoller(collectAiQuota, 60000)
+  const aiQuota = makePoller({ id: 'ai-quota', collect: collectAiQuota, intervalMs: 60000 })
   // DSH 本地会话 usage 聚合（P5：只读 ~/.dsh/sessions 派生投影，无副作用）
-  const dshUsage = makePoller(collectDshUsage, 120000)
-  // 统一消耗对账（P6：DSH + los + 配额 三源合并）
-  const usageReconcile = makePoller(() => collectUsageReconcile(dshUsage, losUsage, aiQuota), 120000)
+  // 2026-09-01：15min 节奏（原 120s——7 天窗口聚合全量扫 ~18s CPU，120s 轮询 ≈15% 核
+  // 常驻占用且是冷开 /dashboards/snapshot 的主阻塞源；增量缓存后单次 <1s，
+  // 15min 节奏对「7d 消耗」展示无感知差异）。timeoutMs 覆盖脚本内部 20s 上限。
+  const dshUsage = makePoller({ id: 'dsh-usage', collect: collectDshUsage, intervalMs: 15 * 60_000, timeoutMs: 25_000 })
+  // 统一消耗对账（P6：DSH + los + 配额 三源合并；5min——los/ai 各自 60s 已足够新）
+  const usageReconcile = makePoller({ id: 'usage-reconcile', collect: () => collectUsageReconcile(dshUsage, losUsage, aiQuota), intervalMs: 5 * 60_000 })
 
   // ── macOS 滚动短趋势（持久化 jsonl + 内存窗口；按 ts 去重，30s 采样节奏 → 120 点 = 1h 窗口）
   // 2026-08-19 P2：重启从磁盘加载（不因插件重启清零）；断档由 fillGapPoints 标注。
@@ -1215,8 +1191,8 @@ export function apply(ctx, config) {
     startPoller(feedDigests, 60000),
     startPoller(surgeRep, cfg.surgeRep.pollMs),
     startPoller(aiQuota, 60000),
-    startPoller(dshUsage, 120000),
-    startPoller(usageReconcile, 120000),
+    startPoller(dshUsage, 15 * 60_000),
+    startPoller(usageReconcile, 5 * 60_000),
   ]
 
   // ── 磁盘水位告警（独立于看板 idle 门控：看板未打开也持续检查，主动推飞书） ──
@@ -1258,7 +1234,9 @@ export function apply(ctx, config) {
   const dashStatus = () => {
     const s = (p) => {
       const snap = p.snapshot()
-      return { ts: snap.ts, error: snap.error ?? null, hasData: snap.data !== null }
+      // stats（2026-09-01 轮询基座观测）：刷新次数/成败/最近耗时/最近错误/连续失败
+      const stats = p.stats?.() ?? null
+      return { ts: snap.ts, error: snap.error ?? null, hasData: snap.data !== null, stats }
     }
     return {
       ts: new Date().toISOString(),
