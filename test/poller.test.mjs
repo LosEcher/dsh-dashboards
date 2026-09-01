@@ -14,7 +14,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { makePoller, startPoller, touchActivity, isIdleSince } from '../lib/poller.mjs'
+import { makePoller, startPoller, touchActivity, isIdleSince, _resetActivityForTest } from '../lib/poller.mjs'
 
 /** 可控 promise：手动 resolve/reject，用于模拟慢/挂起/失败的 collect。 */
 function deferred() {
@@ -127,21 +127,39 @@ test('timeoutMs 兜底: collect 永不返回 → 记「采集超时」error', as
   assert.ok(Date.now() - started >= 40)
 })
 
-test('活动门控: idle 跳过周期刷新，touchActivity 后恢复', async () => {
-  touchActivity() // 重置共享活动时间戳
+test('活动门控: 惰性首刷 + idle 跳过周期刷新，touchActivity 后恢复', async () => {
+  _resetActivityForTest()
+  touchActivity() // 模拟看板已打开过（活动态）
   let calls = 0
   const p = makePoller({ id: 't', intervalMs: 20, collect: async () => { calls += 1; return {} } })
   const timer = startPoller(p, 20, { idleMs: 120 })
   try {
-    await sleep(350) // 启动首刷 + idle 窗口内的 tick（20s×6=120ms 内），之后全跳过
+    assert.equal(calls, 0, '惰性：启动不首刷')
+    await sleep(350) // 首个非 idle tick（20ms）触发首刷，idle（>120ms）后跳过
     const before = calls
-    assert.ok(before >= 1, '启动应首刷')
+    assert.ok(before >= 1 && before <= 7, `非 idle 窗口应刷若干次（calls=${before}）`)
     await sleep(200) // 仍在 idle → 不再增长
     const after = calls
     assert.ok(after <= before + 1, `idle 期间不应持续刷新（before=${before} after=${after}）`)
     touchActivity()
     await sleep(80) // 恢复活动 → 下一个 tick 刷新
     assert.ok(calls > after, `touch 后应恢复刷新（after=${after} calls=${calls}）`)
+  } finally {
+    clearInterval(timer)
+  }
+})
+
+test('活动门控: 启动即 idle，无 touch 时首个 tick 也跳过（真·零开销）', async () => {
+  _resetActivityForTest() // 模拟全新进程启动（无任何活动）
+  let calls = 0
+  const p = makePoller({ id: 't', intervalMs: 20, collect: async () => { calls += 1; return {} } })
+  const timer = startPoller(p, 20, { idleMs: 60 })
+  try {
+    await sleep(150) // 多个 tick 窗口，但无活动 → 全部跳过
+    assert.equal(calls, 0, '无活动时不应有任何采集（含首个 tick）')
+    touchActivity() // 首个 /dashboards 请求
+    await sleep(80)
+    assert.ok(calls > 0, 'touch 后开始采集')
   } finally {
     clearInterval(timer)
   }

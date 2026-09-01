@@ -31,7 +31,7 @@ import { homedir, hostname } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { createConnection } from 'node:net'
 import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints, historyPointChanged, shouldRefreshSlow, bucketKey, accumulateBucket, finalizeBucket, bucketFromRow, downsampleAnchored, HISTORY_METRICS, detectSustainedGrowth, detectStepChange, detectTrendDrift } from './lib/parsers.mjs'
-import { makePoller, startPoller, touchActivity, isIdle } from './lib/poller.mjs'
+import { makePoller, startPoller, touchActivity, isIdle, sleep } from './lib/poller.mjs'
 
 export const name = 'dsh-dashboards'
 export const inject = ['webServer']
@@ -154,6 +154,10 @@ const DEFAULT_WIDGETS = [
   { id: 'dsh-usage', type: 'usage', endpoint: '/dashboards/dsh/usage', title: 'DSH 消耗 7d', refreshMs: 120000 },
   { id: 'usage-reconcile', type: 'reconcile', endpoint: '/dashboards/usage/reconcile', title: '消耗对账', refreshMs: 120000 },
 ]
+
+/** /dashboards/snapshot 单 widget 最坏等待（2026-09-01 per-widget deadline；
+ * 超时回当前快照+deadlineExceeded 标记，双保险于 poller 的 freshWaitCapMs）。 */
+const SNAPSHOT_WIDGET_DEADLINE_MS = 3000
 
 /** ── 配置解析：defaulting happens here, never inline ─────────────────── */
 function resolveConfig(config) {
@@ -1285,14 +1289,23 @@ export function apply(ctx, config) {
       touchActivity()
       try {
         // 聚合快照：一次请求返回全部 widget 的配置+数据（client 单 ticker 15s 拉一次，往返 7→1）
+        // 2026-09-01 per-widget deadline：单个后端再慢（get 的 freshWaitCapMs 兜底之外）
+        // 也不拖全量——超时回该 poller 当前快照并标记 deadlineExceeded（数据可能旧）。
         if (method === 'GET' && path === '/dashboards/snapshot') {
           const widgets = loadWidgets()
+          const boundedGet = async (p) => {
+            const snap = await Promise.race([
+              p.get(),
+              sleep(SNAPSHOT_WIDGET_DEADLINE_MS).then(() => ({ ...p.snapshot(), deadlineExceeded: true })),
+            ])
+            return snap
+          }
           const items = await Promise.all(widgets.map(async (w) => {
             const p = pollerByEndpoint[w.endpoint]
             if (!p) {
               return { id: w.id, type: w.type, endpoint: w.endpoint, title: w.title, refreshMs: w.refreshMs, snap: { ts: null, data: null, error: `未知 endpoint ${w.endpoint}` } }
             }
-            const snap = await p.get()
+            const snap = await boundedGet(p)
             return { id: w.id, type: w.type, endpoint: w.endpoint, title: w.title, refreshMs: w.refreshMs, snap }
           }))
           sendJson(res, 200, { ts: new Date().toISOString(), widgets: items })
