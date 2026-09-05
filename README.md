@@ -26,6 +26,23 @@ GET/PUT /dashboards/widgets   widget 配置（PUT 需带 {widgets:[{id,type,endp
 GET/PUT /dashboards/probe-targets  服务探活目标（PUT 带 {targets:[{name,url?|port?}]}；空数组=重置回默认）
 ```
 
+### AI 额度渠道（`/dashboards/ai-quota`，widget type=quota）
+
+统一输出 `channels[]`（保留 legacy `zenmux`/`packy` 字段供对账卡消费）。数据源分三类：
+
+1. **余额 API（官方直连，需 `~/.dsh/.credentials.yaml` 对应 key）**
+   - ZenMux（`ZENMUX_MANAGEMENT_API_KEY`）：PAYG 余额 + 订阅 5h/7d/月 窗口
+   - Packy（`PACKY_SYSTEM_TOKEN` + `PACKY_USER_ID`）：`quota÷500000=USD`；Cloudflare 防护，被拦自动节流
+   - DeepSeek（`DEEPSEEK_API_KEY`）：GET api.deepseek.com/user/balance
+   - OpenRouter（`OPENROUTER_API_KEY`）：GET /api/v1/auth/key（免费档无预存余额只显示用量）
+2. **订阅窗口（quota-axi 本地采集内核，schema v5）**：codex/cursor/claude/kimi/grok/copilot
+   - 安装：`cd dsh-dashboards && npm install --no-save quota-axi@0.1.29`（运行时 spawn 本插件 node_modules 内二进制）
+   - 依赖官方 CLI/App 本机登录态（`~/.codex/auth.json`、`~/.grok/auth.json`、`~/.kimi-code/credentials/kimi-code.json`、Keychain 等）；未登录渠道显示 `auth` + 恢复命令
+   - 子集：`Config.aiQuota.quotaAxiProviders`（cordis.patch.yml）或默认全六家
+3. **站内/控制台型（kimi 会员、NVIDIA build 等）无公开 API**，不做自动采集
+
+刷新节奏：`Config.aiQuota.pollMs`（默认 5min；活动门控 + single-flight，看板未开零采集）。终端汇总：`~/.dsh/scripts/quota-all.mjs`（`--json` 机器可读）。
+
 探针目标解析链：UI 编辑 store（`~/.dsh/storages/dsh-dashboards/probe-targets.json`，PUT 落盘）→ `Config.probe.targets`（cordis.patch.yml）→ `DEFAULT_TARGETS`（index.mjs）。看板 tab 右上角「编辑」可增删探针目标与移除 widget，保存即时生效（client bundle 需刷新页面加载）。
 
 ## 安装

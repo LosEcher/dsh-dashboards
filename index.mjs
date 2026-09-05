@@ -90,10 +90,33 @@ export const Config = Schema.object({
     /** 事件流（与 surge-health-watch 共用）。 */
     eventsFile: Schema.string(),
   }),
+  aiQuota: Schema.object({
+    /** AI 额度整体刷新间隔 ms（余额 API 缓存 + quota-axi 本地采集，默认 5min）。 */
+    pollMs: Schema.number(),
+    /** 是否启用 quota-axi 订阅窗口采集（claude/codex/cursor/kimi/grok/copilot）。 */
+    quotaAxiEnabled: Schema.boolean(),
+    /** quota-axi provider 子集（默认全六家；只读本地登录态，未登录的返回 auth/unavailable）。 */
+    quotaAxiProviders: Schema.array(Schema.string()),
+    /** quota-axi 单次 spawn 硬超时 ms。 */
+    quotaAxiTimeoutMs: Schema.number(),
+  }),
 })
 
 const HOME = process.env.DSH_HOME ?? `${homedir()}/.dsh`
 const CRED_FILE = join(HOME, '.credentials.yaml')
+/** quota-axi 本地采集内核（npm 包，随插件 node_modules 安装；herdr-quota 同款 schema v5）。 */
+const QUOTA_AXI_JS = join(fileURLToPath(new URL('.', import.meta.url)), 'node_modules/quota-axi/dist/bin/quota-axi.js')
+/** 订阅窗口渠道全集（顺序即看板展示顺序）。 */
+const QUOTA_AXI_PROVIDERS = ['codex', 'cursor', 'claude', 'kimi', 'grok', 'copilot']
+/** 订阅渠道需登录时的恢复命令提示（供看板 note 展示，不执行）。 */
+const QUOTA_AXI_SIGNIN_HINT = {
+  claude: 'claude /login',
+  codex: 'codex login',
+  cursor: 'cursor-agent login',
+  kimi: 'kimi login',
+  grok: 'grok login --oauth',
+  copilot: 'github-copilot-cli auth login',
+}
 const WIDGETS_FILE = join(HOME, 'storages/dsh-dashboards/widgets.json')
 /** 探针目标 store：UI 编辑（PUT /dashboards/probe-targets）落盘于此，优先于 Config.probe.targets 与 DEFAULT_TARGETS。 */
 const PROBE_FILE = join(HOME, 'storages/dsh-dashboards/probe-targets.json')
@@ -201,6 +224,14 @@ function resolveConfig(config) {
       pollMs: c.surgeRep?.pollMs ?? 30000,
       stateFile: c.surgeRep?.stateFile ?? SURGE_STATE_FILE,
       eventsFile: c.surgeRep?.eventsFile ?? SURGE_EVENTS_FILE,
+    },
+    aiQuota: {
+      pollMs: c.aiQuota?.pollMs ?? 300_000,
+      quotaAxiEnabled: c.aiQuota?.quotaAxiEnabled ?? true,
+      quotaAxiProviders: Array.isArray(c.aiQuota?.quotaAxiProviders) && c.aiQuota.quotaAxiProviders.length
+        ? c.aiQuota.quotaAxiProviders
+        : [...QUOTA_AXI_PROVIDERS],
+      quotaAxiTimeoutMs: c.aiQuota?.quotaAxiTimeoutMs ?? 15000,
     },
   }
 }
@@ -719,13 +750,14 @@ function aggregatesToPoints(buckets, windowMs) {
   })
 }
 
-/** ── AI 额度（ZenMux PAYG/订阅 + Packy 余额）────────────────────────
- * 数据源：
- *   ZenMux management API（ZENMUX_MANAGEMENT_API_KEY，~/.dsh/.credentials.yaml）
- *     GET https://zenmux.ai/api/v1/management/payg/balance
- *     GET https://zenmux.ai/api/v1/management/subscription/detail
- *   Packy NewAPI（PACKY_SYSTEM_TOKEN + PACKY_USER_ID，同上文件）
- *     GET https://www.packyapi.com/api/user/self  (New-Api-User 头)
+/** ── AI 额度（多渠道统一视图）────────────────────────────────────────
+ * 三类数据源：
+ *  - 余额 API（官方直连）：ZenMux PAYG、Packy（NewAPI）、DeepSeek、OpenRouter
+ *  - 订阅窗口（quota-axi 本地采集内核：只读官方 CLI/App 登录态 + first-party 端点，
+ *    herdr-quota 同款 schema v5）：codex/cursor/claude/kimi/grok/copilot
+ *  - 站内/控制台型（kimi 会员、NVIDIA build 等）无公开 API，不做自动采集。
+ * 输出 { zenmux, packy } 为 legacy 字段（对账卡消费），channels[] 为统一列表。
+ * 凭据 ~/.dsh/.credentials.yaml；quota-axi 装在插件本地 node_modules。
  */
 function readCredential(name) {
   try {
@@ -739,42 +771,231 @@ function readCredential(name) {
 /** Packy 查询被 Cloudflare bot 防护/网络错误后的重试节流（ms 时间戳；借鉴 Orca retryAtMs）。 */
 let packyRetryAtMs = 0
 
-async function collectAiQuota() {
-  const out = { zenmux: null, packy: null, errors: [] }
+function isoNow() { return new Date().toISOString() }
+
+function roundPct(used, max) {
+  if (!Number(max) || !Number.isFinite(Number(used))) return 0
+  return Math.max(0, Math.min(100, Math.round((Number(used) / Number(max)) * 100)))
+}
+
+/** 统一渠道条目（client QuotaCard 按此渲染）。 */
+function makeChannel(id, label, extra = {}) {
+  return {
+    id, label,
+    kind: 'balance',            // balance | window | hybrid
+    plan: null, currency: null, amount: null, amountLabel: null,
+    meta: null, windows: [],    // [{ scope,label,used,max,usedPercent,resetsAt,unit }]
+    health: 'live',             // live | stale | auth | unavailable
+    note: null, updatedAt: isoNow(),
+    ...extra,
+  }
+}
+
+function windowRow(scope, label, w, unit = null) {
+  return {
+    scope, label,
+    used: Number(w?.used ?? 0),
+    max: Number(w?.max ?? 0),
+    usedPercent: w?.usedPercent ?? roundPct(w?.used, w?.max),
+    resetsAt: w?.resetsAt ?? null,
+    unit,
+  }
+}
+
+/** ZenMux：PAYG 余额 + 订阅窗口（5h/7d/月）。失败抛错由调用方记录。 */
+async function collectZenmux(mgmtKey) {
+  const [balance, sub] = await Promise.all([
+    fetch('https://zenmux.ai/api/v1/management/payg/balance', { headers: { Authorization: `Bearer ${mgmtKey}` }, signal: AbortSignal.timeout(8000) }).then((r) => r.json()),
+    fetch('https://zenmux.ai/api/v1/management/subscription/detail', { headers: { Authorization: `Bearer ${mgmtKey}` }, signal: AbortSignal.timeout(8000) }).then((r) => r.json()),
+  ])
+  const b = balance?.data ?? {}
+  const s = sub?.data ?? {}
+  const q5 = s.quota_5_hour ?? {}
+  const q7 = s.quota_7_day ?? {}
+  const qm = s.quota_monthly ?? {}
+  const windowOf = (q) => ({
+    used: q.used_flows ?? 0,
+    max: q.max_flows ?? 0,
+    usedUsd: Number(q.used_value_usd ?? 0),
+    maxUsd: Number(q.max_value_usd ?? 0),
+    usedPercent: q.max_flows ? Math.round(((q.used_flows ?? 0) / q.max_flows) * 100) : 0,
+    resetsAt: typeof q.resets_at === 'number' ? q.resets_at : null,
+  })
+  const data = {
+    paygBalanceUsd: Number(b.total_credits ?? 0),
+    plan: s.plan?.tier ?? null,
+    planAmountUsd: Number(s.plan?.amount_usd ?? 0),
+    accountStatus: s.account_status ?? null,
+    quotas: { h5: windowOf(q5), d7: windowOf(q7), month: windowOf(qm) },
+  }
+  const channel = makeChannel('zenmux', 'ZenMux', {
+    kind: 'hybrid',
+    plan: data.plan,
+    currency: 'USD', amount: data.paygBalanceUsd, amountLabel: 'PAYG',
+    meta: data.accountStatus && data.accountStatus !== 'healthy' ? `账户 ${data.accountStatus}` : null,
+    windows: [
+      windowRow('5h', '5h', data.quotas.h5, 'flows'),
+      windowRow('7d', '7d', data.quotas.d7, 'flows'),
+      windowRow('month', '月', data.quotas.month, 'flows'),
+    ].filter((w) => w.max > 0),
+  })
+  return { data, channel }
+}
+
+/** Packy（NewAPI）：/api/user/self，quota÷500000=USD。双主机互为后备（官方文档写 www.packyapi.ai）。 */
+async function tryPackyHost(host, token, userId) {
+  const res = await fetch(`https://${host}/api/user/self`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'New-Api-User': userId,
+      'User-Agent': 'cc-switch/1.0',
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    signal: AbortSignal.timeout(8000),
+  })
+  const text = await res.text()
+  let body
+  try { body = JSON.parse(text) } catch { throw new Error('Cloudflare bot 防护拦截（非 JSON 响应）') }
+  if (!body?.success) throw new Error(String(body?.message ?? `HTTP ${res.status}`))
+  return body.data ?? {}
+}
+
+async function collectPacky(token, userId) {
+  const hosts = ['www.packyapi.com', 'www.packyapi.ai']
+  let lastErr = null
+  for (const host of hosts) {
+    try {
+      const d = await tryPackyHost(host, token, userId)
+      const remainingUsd = Number(d.quota ?? 0) / 500000
+      const usedUsd = Number(d.used_quota ?? 0) / 500000
+      const totalUsd = remainingUsd + usedUsd
+      const data = { remainingUsd, usedUsd, totalUsd, requestCount: d.request_count ?? null, group: d.group ?? null }
+      const channel = makeChannel('packy', 'PackyCode', {
+        kind: 'balance',
+        plan: d.group ?? null,
+        currency: 'USD', amount: remainingUsd, amountLabel: '剩余',
+        meta: data.requestCount != null ? `累计请求 ${data.requestCount}` : null,
+        windows: [windowRow('total', '总额', { used: usedUsd, max: totalUsd, usedPercent: roundPct(usedUsd, totalUsd) }, 'USD')].filter((w) => w.max > 0),
+      })
+      return { data, channel }
+    } catch (e) {
+      lastErr = e
+    }
+  }
+  throw new Error(lastErr?.message ?? '双主机均查询失败')
+}
+
+/** DeepSeek 开放平台余额（官方 GET /user/balance）。 */
+async function collectDeepseek(apiKey) {
+  const res = await fetch('https://api.deepseek.com/user/balance', {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(8000),
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const body = await res.json()
+  const bi = Array.isArray(body?.balance_infos) ? body.balance_infos[0] : null
+  if (!bi) throw new Error('响应缺少 balance_infos')
+  const currency = bi.currency ?? 'CNY'
+  const total = Number(bi.total_balance ?? 0)
+  const topped = Number(bi.topped_up_balance ?? 0)
+  const granted = Number(bi.granted_balance ?? 0)
+  return makeChannel('deepseek', 'DeepSeek', {
+    kind: 'balance',
+    plan: null, currency, amount: total, amountLabel: '余额',
+    meta: `充值 ${topped.toFixed(2)} · 赠送 ${granted.toFixed(2)}`,
+  })
+}
+
+/** OpenRouter：GET /api/v1/auth/key（credits 字段仅非免费档存在）。 */
+async function collectOpenrouter(apiKey) {
+  const res = await fetch('https://openrouter.ai/api/v1/auth/key', {
+    headers: { Authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(8000),
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const body = await res.json()
+  const d = body?.data ?? {}
+  const credits = d.credits != null ? Number(d.credits) : null
+  const usage = Number(d.usage ?? 0)
+  const freeTier = !!d.is_free_tier
+  const limit = d.limit != null ? Number(d.limit) : null
+  return makeChannel('openrouter', 'OpenRouter', {
+    kind: 'balance',
+    plan: freeTier ? 'free tier' : (limit != null ? `限额 $${limit.toFixed(2)}` : null),
+    currency: 'USD',
+    amount: credits,
+    amountLabel: credits != null ? '余额' : null,
+    meta: `已用 $${usage.toFixed(3)}`,
+    note: credits == null && freeTier ? '免费档：无预存余额，按用量限额计' : null,
+  })
+}
+
+function axHealth(stateStatus) {
+  if (stateStatus === 'fresh') return 'live'
+  if (stateStatus === 'stale') return 'stale'
+  if (stateStatus === 'auth_required' || stateStatus === 'auth') return 'auth'
+  return 'unavailable'
+}
+
+/** quota-axi provider 记录 → 统一渠道条目（schema v5；只读归一化，绝不读凭据）。 */
+function quotaAxiChannel(p) {
+  const st = p?.state ?? {}
+  const wins = (Array.isArray(p?.windows) ? p.windows : [])
+    .map((w) => ({
+      scope: w.id ?? w.label ?? 'window',
+      label: w.label ?? w.id ?? 'window',
+      used: null, max: null,
+      usedPercent: w.percentUsed != null ? Math.round(w.percentUsed) : null,
+      percentRemaining: w.percentRemaining != null ? Math.round(w.percentRemaining) : null,
+      resetsAt: w.resetsAt ? new Date(w.resetsAt).getTime() : null,
+      unit: p?.credits?.unit ?? null,
+    }))
+  const health = axHealth(st.status)
+  const hint = QUOTA_AXI_SIGNIN_HINT[p.provider]
+  return makeChannel(p.provider, p.label ?? p.provider, {
+    kind: wins.length ? 'window' : 'balance',
+    plan: p.plan ?? null,
+    currency: null, amount: null, amountLabel: null,
+    meta: p.credits?.unlimited ? '无限用量' : null,
+    windows: wins,
+    health,
+    note: health === 'auth' && hint ? `需登录：${hint}` : (st.status === 'unavailable' ? '额度暂不可读' : null),
+    updatedAt: st.refreshedAt ?? null,
+  })
+}
+
+/** 订阅窗口渠道：spawn quota-axi（本机官方 CLI/App 登录态直连，1-3s）。 */
+async function collectQuotaAxi(cfg) {
+  if (!cfg.aiQuota.quotaAxiEnabled) return { channels: [], errors: [] }
+  if (!existsSync(QUOTA_AXI_JS)) {
+    return { channels: [], errors: ['quota-axi: 未安装（到插件目录执行 npm install quota-axi@0.1.29）'] }
+  }
+  const providers = (cfg.aiQuota.quotaAxiProviders ?? QUOTA_AXI_PROVIDERS).filter((p) => QUOTA_AXI_PROVIDERS.includes(p))
+  if (!providers.length) return { channels: [], errors: [] }
+  const args = ['--json', '--full']
+  if (providers.length < QUOTA_AXI_PROVIDERS.length) args.push('--provider', providers.join(','))
+  const res = await runExec(process.execPath, [QUOTA_AXI_JS, ...args], cfg.aiQuota.quotaAxiTimeoutMs)
+  if (res.error) return { channels: [], errors: [`quota-axi: ${res.error}`] }
+  let parsed
+  try {
+    parsed = JSON.parse(res.out)
+  } catch {
+    return { channels: [], errors: ['quota-axi: 输出非 JSON（schema 版本不兼容？）'] }
+  }
+  const list = Array.isArray(parsed?.providers) ? parsed.providers : []
+  return { channels: list.map(quotaAxiChannel), errors: [] }
+}
+
+/** AI 额度总采集（legacy zenmux/packy 字段保留给对账卡；channels 为统一视图）。 */
+async function collectAiQuota(cfg) {
+  const out = { generatedAt: isoNow(), zenmux: null, packy: null, channels: [], errors: [] }
   const mgmtKey = readCredential('ZENMUX_MANAGEMENT_API_KEY')
   if (mgmtKey) {
-    try {
-      const [balance, sub] = await Promise.all([
-        fetch('https://zenmux.ai/api/v1/management/payg/balance', { headers: { Authorization: `Bearer ${mgmtKey}` }, signal: AbortSignal.timeout(8000) }).then((r) => r.json()),
-        fetch('https://zenmux.ai/api/v1/management/subscription/detail', { headers: { Authorization: `Bearer ${mgmtKey}` }, signal: AbortSignal.timeout(8000) }).then((r) => r.json()),
-      ])
-      const b = balance?.data ?? {}
-      const s = sub?.data ?? {}
-      const q5 = s.quota_5_hour ?? {}
-      const q7 = s.quota_7_day ?? {}
-      const qm = s.quota_monthly ?? {}
-      const windowOf = (q) => ({
-        used: q.used_flows ?? 0,
-        max: q.max_flows ?? 0,
-        usedUsd: Number(q.used_value_usd ?? 0),
-        maxUsd: Number(q.max_value_usd ?? 0),
-        usedPercent: q.max_flows ? Math.round(((q.used_flows ?? 0) / q.max_flows) * 100) : 0,
-        resetsAt: typeof q.resets_at === 'number' ? q.resets_at : null,
-      })
-      out.zenmux = {
-        paygBalanceUsd: Number(b.total_credits ?? 0),
-        plan: s.plan?.tier ?? null,
-        planAmountUsd: Number(s.plan?.amount_usd ?? 0),
-        accountStatus: s.account_status ?? null,
-        quotas: { h5: windowOf(q5), d7: windowOf(q7), month: windowOf(qm) },
-      }
-    } catch (e) {
-      out.errors.push(`zenmux: ${e?.message ?? e}`)
-    }
-  } else {
-    out.errors.push('zenmux: ZENMUX_MANAGEMENT_API_KEY 未配置')
+    const r = await collectZenmux(mgmtKey).catch((e) => ({ error: e?.message ?? e }))
+    if (r.error) out.errors.push(`zenmux: ${r.error}`)
+    else { out.zenmux = r.data; out.channels.push(r.channel) }
   }
-
   const now = Date.now()
   if (packyRetryAtMs && now < packyRetryAtMs) {
     out.errors.push(`packy: 上次查询被限流，${Math.ceil((packyRetryAtMs - now) / 60000)} 分钟后自动重试`)
@@ -782,47 +1003,31 @@ async function collectAiQuota() {
     const packyToken = readCredential('PACKY_SYSTEM_TOKEN')
     const packyUserId = readCredential('PACKY_USER_ID')
     if (packyToken && packyUserId) {
-      try {
-        const res = await fetch('https://www.packyapi.com/api/user/self', {
-          headers: {
-            Authorization: `Bearer ${packyToken}`,
-            'New-Api-User': packyUserId,
-            'User-Agent': 'cc-switch/1.0',
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-          },
-          signal: AbortSignal.timeout(8000),
-        })
-        const text = await res.text()
-        let body
-        try {
-          body = JSON.parse(text)
-        } catch {
-          // Cloudflare bot 挑战页或非 JSON 响应
-          packyRetryAtMs = Date.now() + 10 * 60_000
-          out.errors.push('packy: 查询被服务端拦截（Cloudflare bot 防护），10 分钟后自动重试')
-          return out
-        }
-        if (!body?.success) {
-          out.errors.push(`packy: ${body?.message ?? res.status}`)
-        } else {
-          const d = body.data ?? {}
-          out.packy = {
-            remainingUsd: Number(d.quota ?? 0) / 500000,
-            usedUsd: Number(d.used_quota ?? 0) / 500000,
-            totalUsd: (Number(d.quota ?? 0) + Number(d.used_quota ?? 0)) / 500000,
-            requestCount: d.request_count ?? null,
-            group: d.group ?? null,
-          }
-        }
-      } catch (e) {
+      const r = await collectPacky(packyToken, packyUserId).catch((e) => {
         packyRetryAtMs = Date.now() + 5 * 60_000
-        out.errors.push(`packy: ${e?.message ?? e}（5 分钟后重试）`)
-      }
-    } else {
-      out.errors.push('packy: PACKY_SYSTEM_TOKEN / PACKY_USER_ID 未配置')
+        return { error: `${e?.message ?? e}（5 分钟后重试）` }
+      })
+      if (r.error) out.errors.push(`packy: ${r.error}`)
+      else { out.packy = r.data; out.channels.push(r.channel) }
     }
   }
+  // 官方余额 API（有 key 才查；缺 key 不出错不打扰）
+  const dsKey = readCredential('DEEPSEEK_API_KEY')
+  if (dsKey) {
+    const r = await collectDeepseek(dsKey).catch((e) => ({ error: e?.message ?? e }))
+    if (r.error) out.errors.push(`deepseek: ${r.error}`)
+    else out.channels.push(r)
+  }
+  const orKey = readCredential('OPENROUTER_API_KEY')
+  if (orKey) {
+    const r = await collectOpenrouter(orKey).catch((e) => ({ error: e?.message ?? e }))
+    if (r.error) out.errors.push(`openrouter: ${r.error}`)
+    else out.channels.push(r)
+  }
+  // 订阅窗口渠道（provider 级 auth/unavailable 走 channel health，不进 errors）
+  const ax = await collectQuotaAxi(cfg)
+  out.channels.push(...ax.channels)
+  out.errors.push(...ax.errors)
   return out
 }
 
@@ -1027,8 +1232,8 @@ export function apply(ctx, config) {
   const feedDigests = makePoller({ id: 'feed', collect: collectFeedDigests, intervalMs: 60000 })
   // Surge AI 节点信誉（读本机 state 文件 + 事件流，成本低）
   const surgeRep = makePoller({ id: 'surge-rep', collect: () => collectSurgeRep(cfg), intervalMs: cfg.surgeRep.pollMs })
-  // AI 额度（ZenMux + Packy；60s 刷新，独立于 los 节奏）
-  const aiQuota = makePoller({ id: 'ai-quota', collect: collectAiQuota, intervalMs: 60000 })
+  // AI 额度（多渠道：余额 API + quota-axi 订阅窗口；5min 节奏，独立于 los）
+  const aiQuota = makePoller({ id: 'ai-quota', collect: () => collectAiQuota(cfg), intervalMs: cfg.aiQuota.pollMs })
   // DSH 本地会话 usage 聚合（P5：只读 ~/.dsh/sessions 派生投影，无副作用）
   // 2026-09-01：15min 节奏（原 120s——7 天窗口聚合全量扫 ~18s CPU，120s 轮询 ≈15% 核
   // 常驻占用且是冷开 /dashboards/snapshot 的主阻塞源；增量缓存后单次 <1s，
@@ -1194,7 +1399,7 @@ export function apply(ctx, config) {
     startPoller(kuma, cfg.kuma.pollMs),
     startPoller(feedDigests, 60000),
     startPoller(surgeRep, cfg.surgeRep.pollMs),
-    startPoller(aiQuota, 60000),
+    startPoller(aiQuota, cfg.aiQuota.pollMs),
     startPoller(dshUsage, 15 * 60_000),
     startPoller(usageReconcile, 5 * 60_000),
   ]

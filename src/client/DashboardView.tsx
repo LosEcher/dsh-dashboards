@@ -118,83 +118,114 @@ function StatCard({ data, t }: { data: unknown; t: (k: string) => string }) {
   return <p className={css.muted}>{t('noData')}</p>
 }
 
-/** AI 额度（ZenMux + Packy）：/dashboards/ai-quota 聚合。 */
+interface QuotaWindow {
+  scope?: string
+  label?: string
+  used?: number | null
+  max?: number | null
+  usedPercent?: number | null
+  percentRemaining?: number | null
+  resetsAt?: number | string | null
+  unit?: string | null
+}
+interface QuotaChannel {
+  id?: string
+  label?: string
+  kind?: string
+  plan?: string | null
+  currency?: string | null
+  amount?: number | null
+  amountLabel?: string | null
+  meta?: string | null
+  windows?: QuotaWindow[]
+  health?: string
+  note?: string | null
+  updatedAt?: string | null
+}
+
+const fmtMoney = (v: number | null | undefined, currency?: string | null): string => {
+  if (v == null || !Number.isFinite(v)) return '—'
+  const sign = currency === 'CNY' ? '¥' : '$'
+  const a = Math.abs(v)
+  const s = currency === 'CNY' || a < 1 ? v.toFixed(2) : a >= 100 ? v.toFixed(0) : v.toFixed(2)
+  return `${sign}${s}`
+}
+
+/** 窗口重置时间：相对倒计时 + 本地钟点（本地算，不加 API 调用）。 */
+const fmtReset = (ts?: number | string | null): string => {
+  if (ts == null) return ''
+  const t = new Date(ts).getTime()
+  if (!Number.isFinite(t)) return ''
+  const diff = t - Date.now()
+  const clock = new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  if (diff <= 0) return `${clock} 重置`
+  const min = Math.ceil(diff / 60000)
+  const rel = min >= 60 ? `${Math.floor(min / 60)}h${min % 60 >= 10 ? `${min % 60}m` : ''}` : `${min}m`
+  return `${rel}后 · ${clock}`
+}
+
+/** AI 额度（多渠道统一视图）：/dashboards/ai-quota 的 channels[]。 */
 function QuotaCard({ data }: { data: unknown }) {
   if (data == null || typeof data !== 'object') {
     return <p className={css.muted}>—</p>
   }
-  const d = data as {
-    zenmux?: {
-      paygBalanceUsd?: number
-      plan?: string | null
-      accountStatus?: string | null
-      quotas?: {
-        h5?: { used?: number; max?: number; usedPercent?: number; resetsAt?: number | null }
-        d7?: { used?: number; max?: number; usedPercent?: number; resetsAt?: number | null }
-        month?: { used?: number; max?: number; usedPercent?: number; resetsAt?: number | null }
-      }
-    } | null
-    packy?: { remainingUsd?: number; usedUsd?: number; totalUsd?: number; requestCount?: number | null; group?: string | null } | null
-    errors?: string[]
-  }
-  const z = d.zenmux
-  const p = d.packy
+  const d = data as { channels?: QuotaChannel[] | null; errors?: string[] }
+  const channels = d.channels ?? []
   const errs = (d.errors ?? []).filter(Boolean)
-  const lowZen = z?.paygBalanceUsd != null && z.paygBalanceUsd < 1
-  const lowPacky = p?.remainingUsd != null && p.remainingUsd < 1
-  const barClass = (pct: number | undefined) =>
+  const barClass = (pct: number | null | undefined) =>
     pct == null ? css.barOk : pct >= 80 ? css.barDanger : pct >= 50 ? css.barWarn : css.barOk
-  const windowChip = (label: string, q?: { used?: number; max?: number; usedPercent?: number; resetsAt?: number | null }) => {
-    if (!q) return null
-    const pct = q.usedPercent ?? (q.max ? Math.round(((q.used ?? 0) / q.max) * 100) : 0)
-    const reset = q.resetsAt ? ` · ${new Date(q.resetsAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}重置` : ''
-    return (
-      <div className={css.quotaWindow}>
-        <div className={css.pillRow}>
-          <span className={`${css.pill} ${css.pillDim}`}>{label} {q.used ?? 0}/{q.max ?? 0}</span>
-          <span className={`${css.pill} ${css.pillDim}`}>{pct}%{reset}</span>
-        </div>
-        <div className={css.barTrack}><div className={`${css.barFill} ${barClass(pct)}`} style={{ width: `${Math.min(100, pct)}%` }} /></div>
-      </div>
-    )
+  const healthText = (h?: string): string | null =>
+    h === 'auth' ? '需登录' : h === 'stale' ? '数据过期' : h === 'unavailable' ? '不可用' : null
+  if (!channels.length && !errs.length) {
+    return <p className={css.muted}>未配置额度渠道</p>
   }
   return (
     <div className={css.quotaGrid}>
-      <div className={css.quotaBlock}>
-        <p className={css.cardTitle}>ZenMux</p>
-        {z ? (
-          <>
-            <div className={css.pillRow}>
-              <span className={`${css.pill} ${lowZen ? css.pillWarn : ''}`}>PAYG {fmtUsd(z.paygBalanceUsd)}</span>
-              <span className={`${css.pill} ${css.pillDim}`}>订阅 {z.plan ?? '—'}{z.accountStatus === 'healthy' ? '' : ` (${z.accountStatus ?? '?'})`}</span>
+      {channels.map((ch) => {
+        const health = ch.health ?? 'live'
+        const htxt = healthText(health)
+        const lowAmount = ch.amount != null && ch.amount < (ch.currency === 'CNY' ? 20 : 1)
+        const wins = ch.windows ?? []
+        return (
+          <div className={css.quotaBlock} key={ch.id ?? ch.label ?? '?'}>
+            <div className={css.cardHeader}>
+              <p className={css.cardTitle}>
+                {ch.label ?? ch.id}
+                {ch.plan ? <span className={css.muted}> · {ch.plan}</span> : null}
+              </p>
+              {htxt ? <span className={`${css.pill} ${css.pillWarn}`}>{htxt}</span> : null}
             </div>
-            {windowChip('5h', z.quotas?.h5)}
-            {windowChip('7d', z.quotas?.d7)}
-            {windowChip('月', z.quotas?.month)}
-          </>
-        ) : (
-          <p className={css.muted}>未配置</p>
-        )}
-      </div>
-      <div className={css.quotaBlock}>
-        <p className={css.cardTitle}>Packy</p>
-        {p ? (
-          <>
-            <div className={css.pillRow}>
-              <span className={`${css.pill} ${lowPacky ? css.pillWarn : ''}`}>剩余 {fmtUsd(p.remainingUsd)}</span>
-              <span className={`${css.pill} ${css.pillDim}`}>已用 {fmtUsd(p.usedUsd)}</span>
-              <span className={`${css.pill} ${css.pillDim}`}>分组 {p.group ?? '—'}</span>
-            </div>
-            {p.requestCount != null && (
+            {ch.amount != null && (
               <div className={css.pillRow}>
-                <span className={`${css.pill} ${css.pillDim}`}>累计请求 {p.requestCount.toLocaleString()}</span>
+                <span className={`${css.pill} ${lowAmount ? css.pillWarn : ''}`}>
+                  {ch.amountLabel ? `${ch.amountLabel} ` : ''}
+                  {fmtMoney(ch.amount, ch.currency)}
+                </span>
+                {ch.meta ? <span className={`${css.pill} ${css.pillDim}`}>{ch.meta}</span> : null}
               </div>
             )}
-          </>
-        ) : (
-          <p className={css.muted}>未配置</p>
-        )}
-      </div>
+            {wins.map((w) => {
+              const pct = w.usedPercent ?? (w.max ? Math.round(((w.used ?? 0) / w.max) * 100) : null)
+              const frac = w.used != null && w.max != null ? `${w.used}/${w.max}${w.unit ? ` ${w.unit}` : ''}` : null
+              const reset = fmtReset(w.resetsAt)
+              return (
+                <div className={css.quotaWindow} key={w.scope ?? w.label ?? 'w'}>
+                  <div className={css.pillRow}>
+                    <span className={`${css.pill} ${css.pillDim}`}>{w.label}{frac ? ` ${frac}` : ''}</span>
+                    <span className={`${css.pill} ${css.pillDim}`}>{pct != null ? `${pct}%` : '—'}{reset ? ` · ${reset}` : ''}</span>
+                  </div>
+                  {pct != null && (
+                    <div className={css.barTrack}>
+                      <div className={`${css.barFill} ${barClass(pct)}`} style={{ width: `${Math.min(100, pct)}%` }} />
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+            {ch.note ? <p className={css.muted}>{ch.note}</p> : null}
+          </div>
+        )
+      })}
       {errs.length > 0 && <p className={css.muted}>{errs.join('；')}</p>}
     </div>
   )
