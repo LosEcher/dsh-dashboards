@@ -25,7 +25,7 @@
 
 import Schema from '@deepseek-ai/schemastery'
 import { execFile } from 'node:child_process'
-import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync, appendFileSync } from 'node:fs'
+import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync, appendFileSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir, hostname } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -99,6 +99,8 @@ export const Config = Schema.object({
     quotaAxiProviders: Schema.array(Schema.string()),
     /** quota-axi 单次 spawn 硬超时 ms。 */
     quotaAxiTimeoutMs: Schema.number(),
+    /** Grok 登录态自动续期（~/.grok/auth.json refresh_token → auth.x.ai，原子写回；默认开）。 */
+    autoRefreshGrok: Schema.boolean(),
   }),
 })
 
@@ -232,6 +234,7 @@ function resolveConfig(config) {
         ? c.aiQuota.quotaAxiProviders
         : [...QUOTA_AXI_PROVIDERS],
       quotaAxiTimeoutMs: c.aiQuota?.quotaAxiTimeoutMs ?? 15000,
+      autoRefreshGrok: c.aiQuota?.autoRefreshGrok ?? true,
     },
   }
 }
@@ -965,6 +968,45 @@ function quotaAxiChannel(p) {
   })
 }
 
+/** Grok 官方 CLI 登录态文件（~/…/home/.grok/auth.json；放行 homedir() 非 .dsh）。 */
+const GROK_AUTH_FILE = join(homedir(), '.grok', 'auth.json')
+
+/** Grok 登录态自动续期：key 距过期 <1h 时用 refresh_token 换新并原子写回
+ * （OIDC refresh，Grok CLI/OpenTokenUsage 同款；失败静默，token 不落日志）。
+ * Kimi 由其官方 CLI 自行续期（实测 usage 端点自愈），无需本插件处理。 */
+async function refreshGrokIfNeeded(cfg) {
+  if (!cfg.aiQuota?.autoRefreshGrok) return
+  try {
+    const auth = JSON.parse(readFileSync(GROK_AUTH_FILE, 'utf8'))
+    const entry = Object.entries(auth).find(([, v]) => v && typeof v === 'object' && v.refresh_token && v.oidc_client_id)
+    if (!entry) return
+    const [, rec] = entry
+    const expMs = rec.expires_at ? new Date(rec.expires_at).getTime() : NaN
+    if (Number.isFinite(expMs) && Date.now() < expMs - 3600_000) return // 仍有效
+    const res = await fetch('https://auth.x.ai/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: rec.refresh_token,
+        client_id: rec.oidc_client_id,
+      }).toString(),
+      signal: AbortSignal.timeout(12000),
+    })
+    const body = await res.json().catch(() => ({}))
+    if (!res.ok || !body.access_token) return
+    const updated = {
+      ...rec,
+      key: body.access_token,
+      expires_at: new Date(Date.now() + (body.expires_in ?? 3600) * 1000).toISOString(),
+    }
+    if (body.refresh_token) updated.refresh_token = body.refresh_token
+    const tmp = GROK_AUTH_FILE + '.refresh-tmp'
+    writeFileSync(tmp, JSON.stringify({ ...auth, [entry[0]]: updated }, null, 2) + '\n', { mode: 0o600 })
+    renameSync(tmp, GROK_AUTH_FILE)
+  } catch { /* 续期失败/文件不可读：静默，保留上次状态，下次采样再试 */ }
+}
+
 /** 订阅窗口渠道：spawn quota-axi（本机官方 CLI/App 登录态直连，1-3s）。 */
 async function collectQuotaAxi(cfg) {
   if (!cfg.aiQuota.quotaAxiEnabled) return { channels: [], errors: [] }
@@ -973,6 +1015,7 @@ async function collectQuotaAxi(cfg) {
   }
   const providers = (cfg.aiQuota.quotaAxiProviders ?? QUOTA_AXI_PROVIDERS).filter((p) => QUOTA_AXI_PROVIDERS.includes(p))
   if (!providers.length) return { channels: [], errors: [] }
+  if (providers.includes('grok')) await refreshGrokIfNeeded(cfg)
   const args = ['--json', '--full']
   if (providers.length < QUOTA_AXI_PROVIDERS.length) args.push('--provider', providers.join(','))
   const res = await runExec(process.execPath, [QUOTA_AXI_JS, ...args], cfg.aiQuota.quotaAxiTimeoutMs)
@@ -1233,7 +1276,8 @@ export function apply(ctx, config) {
   // Surge AI 节点信誉（读本机 state 文件 + 事件流，成本低）
   const surgeRep = makePoller({ id: 'surge-rep', collect: () => collectSurgeRep(cfg), intervalMs: cfg.surgeRep.pollMs })
   // AI 额度（多渠道：余额 API + quota-axi 订阅窗口；5min 节奏，独立于 los）
-  const aiQuota = makePoller({ id: 'ai-quota', collect: () => collectAiQuota(cfg), intervalMs: cfg.aiQuota.pollMs })
+  // timeoutMs 放宽到 30s：quota-axi spawn（15s 上限）+ Grok 自动续期（最多 12s）
+  const aiQuota = makePoller({ id: 'ai-quota', collect: () => collectAiQuota(cfg), intervalMs: cfg.aiQuota.pollMs, timeoutMs: 30_000 })
   // DSH 本地会话 usage 聚合（P5：只读 ~/.dsh/sessions 派生投影，无副作用）
   // 2026-09-01：15min 节奏（原 120s——7 天窗口聚合全量扫 ~18s CPU，120s 轮询 ≈15% 核
   // 常驻占用且是冷开 /dashboards/snapshot 的主阻塞源；增量缓存后单次 <1s，
