@@ -17,13 +17,41 @@ DSH 看板插件：在会话区注册「看板」tab（`conversation.view`），
 ## API
 
 ```
-GET /dashboards/status        后端健康 + widget 数
+GET /dashboards/status        后端健康 + widget 数（含 sanity 丢弃计数 / egress 关停项 / 各后端 stale）
 GET /dashboards/los/usage      GET /dashboards/los/trends   GET /dashboards/los/metrics
 GET /dashboards/los/nodes      GET /dashboards/macos        GET /dashboards/macos/history
 GET /dashboards/probe          GET /dashboards/glances      GET /dashboards/kuma
 GET /dashboards/feed/digests  feed 采集摘要报告（scheduler-reports/feed-digest-*.md）
-GET/PUT /dashboards/widgets   widget 配置（PUT 需带 {widgets:[{id,type,endpoint,title,refreshMs}]}）
-GET/PUT /dashboards/probe-targets  服务探活目标（PUT 带 {targets:[{name,url?|port?}]}；空数组=重置回默认）
+GET /dashboards/egress        出网清单（每项外呼的目标/用途/凭据 + 当前开关）
+GET/PUT /dashboards/widgets   widget 配置（PUT 带 {widgets:[…], revision?}；revision 不匹配回 409）
+GET/PUT /dashboards/probe-targets  服务探活目标（PUT 带 {targets:[…], revision?}；空数组=重置回默认；revision 不匹配回 409）
+```
+
+### 诚实性契约（2026-09-19，借鉴 Infomarchy 第一批加固）
+
+报告：`dsfolder/INFOMARCHY-ANALYSIS-2026-09-19.md`。六项约定，改动此处代码时必须保持：
+
+1. **截断必须显式上报**：列表/文本被 cap 时随响应给出 `available`/`totalChars` 与 `truncated`
+   （feed 摘要、surge 事件、history 点数都遵守）；不允许静默 slice 后把截断值当总数。
+2. **差分基线的样本时刻必须与字节数对应**（`lib/safety.mjs:publishNetSample`）：不允许把
+   `Date.now()` 当采样时刻写进基线；dt 过小不出速率，过期发布直接拒绝。
+3. **store 写入一律原子 + revision 守卫**（`writeJsonAtomic` / `saveEnvelopeReplace`）：
+   tmp→rename（0600），PUT 带 `revision` 时做乐观并发（不匹配 409 + 回当前值）；
+   新增任何"读-改-整表写"的 store 都必须走这两个原语。
+4. **时间戳过合理性边界**（`plausibleTimestamp`：≥2000-01-01 且 ≤now+60s）：脏时间不得进入
+   窗口切片、聚合桶或排序；丢弃计数走 `/dashboards/status` 的 `sanity`。
+5. **失败不得伪装新鲜**：poller 快照 `ts`/`dataTs` 只在成功时推进，失败只推进 `attemptedAt`
+   并置 `stale=true`；形状变更时递增 `SNAPSHOT_VERSION` 使旧缓存失效。
+6. **出网清单化 + 逐项开关**：每一项外呼在 `lib/safety.mjs:EGRESS_FEATURES` 登记，并由
+   `Config.egress.<id>=false` 单独关闭；拦断面放在最靠近 socket 的函数里（调用点判断只是省事）。
+
+```yaml
+# 逐项关闭外呼（缺省全开；关闭只停外呼，不影响读本机文件的采集）
+- id: dashboards
+  config:
+    egress:
+      quotaApis: false   # zenmux/packy/deepseek/openrouter 余额 API
+      diskAlert: false   # 飞书 webhook 推送
 ```
 
 ### AI 额度渠道（`/dashboards/ai-quota`，widget type=quota）

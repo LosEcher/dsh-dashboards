@@ -895,6 +895,11 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
   const [probeTargets, setProbeTargets] = useState<ProbeTarget[] | null>(null)
   const [probeSource, setProbeSource] = useState<string>('default')
   const [probeDirty, setProbeDirty] = useState(false)
+  // P0-3（2026-09-19）：两个 store 的 revision —— 编辑面板是「读-改-整表写」，
+  // 两个窗口同时保存会互相覆盖（后写者基于自己读到的旧列表重建）。带上打开面板时
+  // 读到的 revision 后，host 侧发现不匹配即回 409，我们提示重新打开而不是静默覆盖。
+  const [probeRevision, setProbeRevision] = useState<number>(0)
+  const [widgetsRevision, setWidgetsRevision] = useState<number>(0)
   const [editMsg, setEditMsg] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [addName, setAddName] = useState('')
@@ -914,11 +919,18 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
     setEditing(true)
     setEditMsg(null)
     try {
+      // widget revision 不在 snapshot 载荷里（保持快照小），进编辑面板时单独取一次
+      const wRes = await fetch('/dashboards/widgets', { signal: AbortSignal.timeout(8000) })
+      if (wRes.ok) {
+        const wd = await wRes.json() as { revision?: number }
+        if (typeof wd.revision === 'number') setWidgetsRevision(wd.revision)
+      }
       const res = await fetch('/dashboards/probe-targets', { signal: AbortSignal.timeout(8000) })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const d = await res.json() as { targets?: ProbeTarget[]; source?: string }
+      const d = await res.json() as { targets?: ProbeTarget[]; source?: string; revision?: number }
       setProbeTargets(d.targets ?? [])
       setProbeSource(d.source ?? 'default')
+      if (typeof d.revision === 'number') setProbeRevision(d.revision)
     } catch (e) {
       setEditMsg(`探针目标读取失败: ${String(e)}`)
     }
@@ -959,14 +971,19 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
       const res = await fetch('/dashboards/probe-targets', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ targets: [] }),
+        body: JSON.stringify({ targets: [], revision: probeRevision }),
         signal: AbortSignal.timeout(8000),
       })
+      if (res.status === 409) {
+        setEditMsg('探针目标已被其他窗口修改，请关闭编辑面板后重新打开再试')
+        return
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const d = await res.json() as { targets?: ProbeTarget[] }
+      const d = await res.json() as { targets?: ProbeTarget[]; revision?: number }
       setProbeTargets(d.targets ?? [])
       setProbeSource('default')
       setProbeDirty(false)
+      if (typeof d.revision === 'number') setProbeRevision(d.revision)
       setEditMsg('已重置为默认探针目标')
     } catch (e) {
       setEditMsg(`重置失败: ${String(e)}`)
@@ -984,19 +1001,31 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
         const res = await fetch('/dashboards/widgets', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ widgets: remaining }),
+          body: JSON.stringify({ widgets: remaining, revision: widgetsRevision }),
           signal: AbortSignal.timeout(8000),
         })
+        if (res.status === 409) {
+          setEditMsg('widget 配置已被其他窗口修改，请关闭编辑面板后重新打开再试')
+          return
+        }
         if (!res.ok) throw new Error(`widgets HTTP ${res.status}`)
+        const wd = await res.json() as { revision?: number }
+        if (typeof wd.revision === 'number') setWidgetsRevision(wd.revision)
       }
       if (probeDirty && probeTargets) {
         const res = await fetch('/dashboards/probe-targets', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ targets: probeTargets }),
+          body: JSON.stringify({ targets: probeTargets, revision: probeRevision }),
           signal: AbortSignal.timeout(8000),
         })
+        if (res.status === 409) {
+          setEditMsg('探针目标已被其他窗口修改，请关闭编辑面板后重新打开再试')
+          return
+        }
         if (!res.ok) throw new Error(`probe-targets HTTP ${res.status}`)
+        const pd = await res.json() as { revision?: number }
+        if (typeof pd.revision === 'number') setProbeRevision(pd.revision)
       }
       setEditing(false)
       setRemovedIds(new Set())

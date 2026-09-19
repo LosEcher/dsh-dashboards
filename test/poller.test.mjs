@@ -15,6 +15,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { makePoller, startPoller, touchActivity, isIdleSince, _resetActivityForTest } from '../lib/poller.mjs'
+import { SNAPSHOT_VERSION } from '../lib/safety.mjs'
 
 /** 可控 promise：手动 resolve/reject，用于模拟慢/挂起/失败的 collect。 */
 function deferred() {
@@ -170,3 +171,72 @@ test('isIdleSince: 纯判定', () => {
   assert.equal(isIdleSince(1100, 1000, 100), false) // 恰好等于不算 idle
   assert.equal(isIdleSince(1101, 1000, 100), true)
 })
+
+// ── 2026-09-19（借鉴 Infomarchy 第一批加固）：缓存版本戳 + 失败不得伪装新鲜 ──
+
+test('快照带形状版本戳 v（形状不兼容变更后旧缓存须失效）', async () => {
+  const p = makePoller({ id: 't', intervalMs: 60000, collect: async () => ({ ok: 1 }) })
+  const s = await p.get()
+  assert.equal(s.v, SNAPSHOT_VERSION)
+  assert.equal(p.snapshot().v, SNAPSHOT_VERSION)
+  assert.equal(p.stats().v, SNAPSHOT_VERSION)
+})
+
+test('失败不推进 ts/dataTs（旧数据不得被当成刚采集的），且 stale 可见', async () => {
+  let mode = 'ok'
+  const p = makePoller({
+    id: 't', intervalMs: 50,
+    collect: async () => { if (mode === 'fail') throw new Error('boom'); return { n: 1 } },
+  })
+  const first = await p.get(true)
+  assert.equal(first.data.n, 1)
+  assert.equal(first.stale, false)
+  const dataTsBefore = first.dataTs
+  assert.ok(dataTsBefore, '成功采集必须记录 dataTs')
+
+  await sleep(5)
+  mode = 'fail'
+  await p.refresh() // 直接刷新一次，必定失败
+  const afterFail = p.snapshot()
+  assert.equal(afterFail.data.n, 1, '失败时应保留旧数据')
+  assert.equal(String(afterFail.error).includes('boom'), true)
+  assert.equal(afterFail.stale, true, '有旧数据 + 最近一次失败 ⇒ stale 必须为真')
+  assert.equal(afterFail.ts, dataTsBefore, 'ts 是数据时间，不因失败推进')
+  assert.equal(afterFail.dataTs, dataTsBefore)
+  assert.ok(afterFail.attemptedAt, 'attemptedAt 记录尝试时刻（新鲜度门控依据）')
+  assert.equal(p.stats().dataAgeMs >= 0, true, 'stats 暴露数据真实年龄')
+})
+
+test('失败后仍会按 intervalMs 重试（不被伪新鲜度压住），成功后 stale 复位', async () => {
+  let mode = 'fail'
+  let calls = 0
+  const p = makePoller({
+    id: 't', intervalMs: 40,
+    collect: async () => { calls += 1; if (mode === 'fail') throw new Error('boom'); return { n: calls } },
+  })
+  await p.get(true) // 第一次就失败（无数据）
+  const s1 = p.snapshot()
+  assert.equal(s1.data, null)
+  assert.equal(s1.stale, false, '从未成功过 ⇒ 无「旧数据」可言，stale=false')
+  const callsAfterFirst = calls
+
+  mode = 'ok'
+  await sleep(60) // 超过 intervalMs
+  const s2 = await p.get(true)
+  assert.ok(calls > callsAfterFirst, '到期后必须重试（失败不得推迟重试）')
+  assert.equal(s2.data.n, calls)
+  assert.equal(s2.stale, false, '成功一次后 stale 复位')
+  assert.equal(s2.error, null)
+})
+
+test('无数据时 get() 必然尝试（不会因 attemptedAt 已设而空转）', async () => {
+  let calls = 0
+  const p = makePoller({
+    id: 't', intervalMs: 10_000, freshWaitCapMs: 50,
+    collect: async () => { calls += 1; throw new Error('still down') },
+  })
+  await p.get()
+  await p.get()
+  assert.ok(calls >= 2, `无数据时必须持续尝试（calls=${calls}）`)
+})
+

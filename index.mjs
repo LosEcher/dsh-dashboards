@@ -30,8 +30,9 @@ import { join } from 'node:path'
 import { homedir, hostname } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { createConnection } from 'node:net'
-import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints, historyPointChanged, shouldRefreshSlow, bucketKey, accumulateBucket, finalizeBucket, bucketFromRow, downsampleAnchored, HISTORY_METRICS, detectSustainedGrowth, detectStepChange, detectTrendDrift } from './lib/parsers.mjs'
+import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints, historyPointChanged, shouldRefreshSlow, bucketKey, accumulateBucket, finalizeBucket, bucketFromRow, downsampleAnchored, HISTORY_METRICS, detectSustainedGrowth, detectStepChange, detectTrendDrift, z4proToRows } from './lib/parsers.mjs'
 import { makePoller, startPoller, touchActivity, isIdle, sleep } from './lib/poller.mjs'
+import { plausibleTimestamp, publishNetSample, readJsonEnvelope, saveEnvelopeReplace, capList, capText, egressEnabled, egressInventory } from './lib/safety.mjs'
 
 export const name = 'dsh-dashboards'
 export const inject = ['webServer']
@@ -102,6 +103,19 @@ export const Config = Schema.object({
     /** Grok 登录态自动续期（~/.grok/auth.json refresh_token → auth.x.ai，原子写回；默认开）。 */
     autoRefreshGrok: Schema.boolean(),
   }),
+  /** 出网逐项开关（P0-6）：清单见 lib/safety.mjs:EGRESS_FEATURES，
+   * 任一项置 false 即彻底不外呼（GET /dashboards/egress 可核对当前生效值）。 */
+  egress: Schema.object({
+    los: Schema.boolean(),
+    quotaApis: Schema.boolean(),
+    quotaAxi: Schema.boolean(),
+    grokRefresh: Schema.boolean(),
+    kuma: Schema.boolean(),
+    glances: Schema.boolean(),
+    probe: Schema.boolean(),
+    z4pro: Schema.boolean(),
+    diskAlert: Schema.boolean(),
+  }),
 })
 
 const HOME = process.env.DSH_HOME ?? `${homedir()}/.dsh`
@@ -139,6 +153,29 @@ const AGG_HOUR_FLUSH_MS = 1_800_000
 /** feed 采集摘要报告目录（scheduler job「多平台 feed 采集摘要」落盘：feed-digest-*.md 在 scheduler-reports 根目录；feed/ 子目录是原始 JSON，feed-profile/ 是画像）。 */
 const FEED_DIR = join(HOME, 'scheduler-reports')
 
+/** ── P0-4 数据合理性观测 ───────────────────────────────────────────────
+ * 不可信时间戳 / 畸形行被丢弃时必须**可数**：静默丢数据会让「图怎么变短了」
+ * 无从解释（Infomarchy 原话：「一条 2099 年的记录曾同时被算进今天并排在所有
+ * 真实任务之上」）。计数经 /dashboards/status 的 `sanity` 暴露。
+ * 计满上限后不再增长（避免长时间运行后的无意义大数），但 dropped>0 永远可见。 */
+const SANITY_COUNTER_MAX = 1_000_000
+const sanityDropped = {
+  historyMalformed: 0,
+  historyImplausible: 0,
+  historyLiveImplausible: 0,
+  aggregateMalformed: 0,
+  aggregateImplausible: 0,
+  surgeEventsImplausible: 0,
+}
+function bumpSanity(key, by = 1) {
+  sanityDropped[key] = Math.min(SANITY_COUNTER_MAX, (sanityDropped[key] ?? 0) + by)
+}
+
+/** 极空间 Z4Pro 健康巡检脚本（外部 CLI，零依赖 Node）。缺省指向 dsfolder 下的独立工具
+ * （可经 Config.z4pro.script 覆盖）。与 feishu-push.sh 同为"HOME 下的外部脚本"模式：
+ * 设备特定逻辑不进插件仓，插件只负责调度 + 展示形态适配（映射成 list widget 的 results）。 */
+const Z4PRO_HEALTH_SCRIPT = join(HOME, 'syncfolder/project/dsfolder/scripts/z4pro-health.mjs')
+
 /** widget endpoint 白名单（防 PUT 注入任意路径）。 */
 const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/los/usage', '/dashboards/los/trends', '/dashboards/los/metrics', '/dashboards/los/nodes',
@@ -146,6 +183,7 @@ const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/feed/digests', '/dashboards/surge/ai-reputation', '/dashboards/ai-quota',
   '/dashboards/dsh/usage',
   '/dashboards/usage/reconcile',
+  '/dashboards/z4pro',
 ])
 
 /** Surge 节点信誉数据源（surge-auto ai-node-reputation 输出）。 */
@@ -178,6 +216,9 @@ const DEFAULT_WIDGETS = [
   { id: 'ai-quota', type: 'quota', endpoint: '/dashboards/ai-quota', title: 'AI 额度', refreshMs: 60000 },
   { id: 'dsh-usage', type: 'usage', endpoint: '/dashboards/dsh/usage', title: 'DSH 消耗 7d', refreshMs: 120000 },
   { id: 'usage-reconcile', type: 'reconcile', endpoint: '/dashboards/usage/reconcile', title: '消耗对账', refreshMs: 120000 },
+  // 极空间 Z4Pro 设备健康（复用 list widget 渲染，客户端无需新增 widget 类型）
+  // 120s 节奏：SSH + smartctl 全量采集约 3-6s，且盘/池是慢变量
+  { id: 'z4pro-health', type: 'list', endpoint: '/dashboards/z4pro', title: '极空间 Z4Pro', refreshMs: 120000 },
 ]
 
 /** /dashboards/snapshot 单 widget 最坏等待（2026-09-01 per-widget deadline；
@@ -236,6 +277,29 @@ function resolveConfig(config) {
       quotaAxiTimeoutMs: c.aiQuota?.quotaAxiTimeoutMs ?? 15000,
       autoRefreshGrok: c.aiQuota?.autoRefreshGrok ?? true,
     },
+    z4pro: {
+      // 默认开：脚本只读采集（ssh + smartctl + virsh），无副作用；脚本缺失时降级为错误提示
+      enabled: c.z4pro?.enabled ?? true,
+      script: c.z4pro?.script ?? Z4PRO_HEALTH_SCRIPT,
+      // 120s：SSH 往返 + 6 盘 SMART + virsh 约 3-6s，且盘/池/VM 是慢变量
+      pollMs: c.z4pro?.pollMs ?? 120_000,
+      // 采集本身有 45s 内部超时；给 60s 硬上限兜底（与 probe 的 D 态防护同理）
+      timeoutMs: c.z4pro?.timeoutMs ?? 60_000,
+      host: c.z4pro?.host ?? 'z4pro',
+    },
+    // 出网清单开关（P0-6）：未配置 = 全开（保持既有行为）；显式 false 即关闭该项外呼。
+    // 关闭只停「外呼」，不影响读本机文件的采集（feed/history/surge/dsh-usage 照常）。
+    egress: {
+      los: c.egress?.los ?? true,
+      quotaApis: c.egress?.quotaApis ?? true,
+      quotaAxi: c.egress?.quotaAxi ?? true,
+      grokRefresh: c.egress?.grokRefresh ?? true,
+      kuma: c.egress?.kuma ?? true,
+      glances: c.egress?.glances ?? true,
+      probe: c.egress?.probe ?? true,
+      z4pro: c.egress?.z4pro ?? true,
+      diskAlert: c.egress?.diskAlert ?? true,
+    },
   }
 }
 
@@ -288,6 +352,9 @@ function resolveTokens(cfg) {
  * 报错信息误导（把 TimeoutError 吞成「未配置 token」）。现保留真实错误。
  */
 async function losFetch(cfg, tokens, path, { operator = false } = {}) {
+  // P0-6：出网开关在**最靠近 socket 的地方**再判一次（调用点判断只是省事，
+  // 真正的拦断面在这里）——关闭后不可能有任何代码路径绕过它发出请求。
+  if (!egressEnabled(cfg, 'los')) throw new Error(`los 出网已关闭（Config.egress.los=false）: ${path}`)
   const url = `${cfg.losUrl}${path}`
   let lastErr = null
   const tried = []
@@ -460,25 +527,19 @@ async function collectMacos(cfg) {
   const ifaces = netstat.out ? parseNetstatIb(netstat.out) : {}
   const processCount = ps.out ? ps.out.trim().split('\n').filter(Boolean).length : null
 
-  // 网络速率（累计字节差分）
-  const now = Date.now()
-  let netInBps = null
-  let netOutBps = null
-  if (prevNet && now > prevNetAt) {
-    const dt = (now - prevNetAt) / 1000
-    let inB = 0
-    let outB = 0
-    for (const [name, cur] of Object.entries(ifaces)) {
-      const prev = prevNet[name]
-      if (!prev) continue
-      if (cur.ibytes >= prev.ibytes) inB += cur.ibytes - prev.ibytes
-      if (cur.obytes >= prev.obytes) outB += cur.obytes - prev.obytes
-    }
-    netInBps = Math.round(inB / dt)
-    netOutBps = Math.round(outB / dt)
-  }
-  prevNet = ifaces
-  prevNetAt = now
+  // 网络速率（累计字节差分）：**基线的样本时刻必须与它携带的字节数对应**。
+  // 旧实现在这里写 `prevNetAt = Date.now()`（函数返回时刻），而 netstat 输出是
+  // 采样时刻的快照；采集超时后仍在后台跑完、与新一拍交叉完成时，后返回者覆盖
+  // 基线 ⇒ 基线=「旧样本 + 新时刻」，下一拍用不匹配的 dt 差分更长时间窗口的
+  // 差值 → 速率虚高。现交由 publishNetSample 统一守卫（样本时刻 + 最小 dt +
+  // 过期发布拒绝），并把 reason 随快照下发（不可用时要说明原因，而不是静默 null）。
+  const netSampleAt = Date.now()
+  const netStep = publishNetSample(prevNet, ifaces, netSampleAt)
+  prevNet = netStep.next
+  prevNetAt = netStep.next?.at ?? netSampleAt
+  const netInBps = netStep.rate?.inBps ?? null
+  const netOutBps = netStep.rate?.outBps ?? null
+  const netRateReason = netStep.rate ? 'ok' : netStep.reason
 
   return {
     host: hostname(),
@@ -489,7 +550,7 @@ async function collectMacos(cfg) {
     cpu,
     memory: { totalMb: memTotalMb, freeMb, availMb, usedPct: memUsedPct },
     disks,
-    net: { inBps: netInBps, outBps: netOutBps, ifaces: Object.fromEntries(Object.entries(ifaces).slice(0, 8)) },
+    net: { inBps: netInBps, outBps: netOutBps, ifaces: Object.fromEntries(Object.entries(ifaces).slice(0, 8)), rateReason: netRateReason },
     processCount,
   }
 }
@@ -544,11 +605,45 @@ async function probeOne(target) {
 }
 
 async function collectProbe(cfg) {
+  // P0-6：探针目标是用户可编辑列表（可含外部 URL），逐项关闭的唯一开关。
+  if (!egressEnabled(cfg, 'probe')) {
+    return { enabled: false, reason: '探活出网已关闭（Config.egress.probe=false）', total: 0, ok: 0, degraded: 0, down: 0, results: [] }
+  }
   const targets = loadProbeTargets(cfg)
   const results = await Promise.all(targets.map((t) => probeOne(t)))
   const ok = results.filter((r) => r.ok).length
   const degraded = results.filter((r) => r.degraded).length
-  return { total: results.length, ok, degraded, down: results.length - ok - degraded, results }
+  return { enabled: true, total: results.length, ok, degraded, down: results.length - ok - degraded, results }
+}
+
+/** ── 极空间 Z4Pro 设备健康（外部脚本 + list widget 形态适配） ────────
+ * 脚本契约：`node z4pro-health.mjs --json` 输出
+ *   { verdict: 'ok'|'warning'|'critical', summary: {...}, findings: [{level,key,msg}] }
+ * 退出码 0/1/2 表达 verdict —— 但 runExec 在非零退出时会丢弃 stdout，
+ * 故用 `bash -c 'node "$0" --json || true'` 包一层，保证任何 verdict 都能取到 JSON。
+ *
+ * 输出适配成 ListCard 的 results[{name,ok,degraded,detail}]：
+ * 这里刻意输出"固定检查清单"而非直接映射 findings，让列表头部的
+ * `x/y up` 具备"y 项检查中 x 项通过"的确定语义（findings 只用于补充异常行）。
+ */
+async function collectZ4Pro(cfg) {
+  const c = cfg.z4pro
+  if (!c.enabled) return { enabled: false, reason: 'z4pro 未启用（Config.z4pro.enabled）' }
+  if (!existsSync(c.script)) {
+    return { enabled: true, error: `z4pro 巡检脚本不存在: ${c.script}` }
+  }
+  const exec = await runExec('bash', ['-c', 'node "$0" --json 2>/dev/null || true', c.script], c.timeoutMs)
+  if (exec.error) return { enabled: true, error: `z4pro 巡检执行失败: ${exec.error}` }
+  let payload
+  try {
+    payload = JSON.parse(exec.out)
+  } catch (e) {
+    return { enabled: true, error: `z4pro 巡检输出非 JSON: ${String(e?.message ?? e).slice(0, 140)}` }
+  }
+
+  // 形态适配交给纯函数（lib/parsers.mjs:z4proToRows，带单测）——
+  // 本函数只负责 IO（spawn/超时/降级）与 JSON 解析，保持可测性。
+  return { enabled: true, ...z4proToRows(payload) }
 }
 
 /** ── feed 采集摘要报告（scheduler 落盘文件，只读，零持久化） ──────────
@@ -568,17 +663,20 @@ function parseFeedTimestamp(file) {
 }
 
 function collectFeedDigests() {
-  let files = []
+  let all = []
   try {
-    files = readdirSync(FEED_DIR)
+    all = readdirSync(FEED_DIR)
       .filter((f) => /^feed-digest-\d{8}-\d{4}\.md$/.test(f))
       .sort()
       .reverse()
-      .slice(0, FEED_MAX_DIGESTS)
   } catch {
-    return { dir: FEED_DIR, count: 0, digests: [], error: 'feed 报告目录不可读（尚无 job 产出？）' }
+    return { dir: FEED_DIR, count: 0, available: 0, truncated: false, digests: [], error: 'feed 报告目录不可读（尚无 job 产出？）' }
   }
-  const digests = files.map((file) => {
+  // P0-1：截断必须显式上报（available=截断前真实条数），客户端显示「显示 N/M 条」。
+  // 旧实现直接 slice 后把 count 当成总数，看板上「5 份」无法区分「只有 5 份」与
+  // 「有 23 份只给看 5 份」。
+  const capped = capList(all, FEED_MAX_DIGESTS)
+  const digests = capped.items.map((file) => {
     let text = ''
     try {
       text = readFileSync(join(FEED_DIR, file), 'utf8').replace(/^\uFEFF/, '')
@@ -587,16 +685,27 @@ function collectFeedDigests() {
     }
     const first = (text.split('\n')[0] ?? '').trim()
     const title = first.startsWith('#') ? first.replace(/^#+\s*/, '') : (first || file)
+    const body = capText(text, FEED_MAX_TEXT)
     return {
       file,
       at: parseFeedTimestamp(file),
       title: title.slice(0, 120),
+      titleTruncated: title.length > 120,
       lines: text.split('\n').filter((l) => l.trim()).length,
       size: text.length,
-      text: text.slice(0, FEED_MAX_TEXT),
+      text: body.text,
+      textTotalChars: body.totalChars,
+      textTruncated: body.truncated,
     }
   })
-  return { dir: FEED_DIR, count: digests.length, digests }
+  return {
+    dir: FEED_DIR,
+    count: digests.length,
+    available: capped.available,
+    truncated: capped.truncated,
+    limits: { digests: FEED_MAX_DIGESTS, textChars: FEED_MAX_TEXT },
+    digests,
+  }
 }
 
 /** ── Surge AI 节点信誉（surge-auto ai-node-reputation 派生展示） ───── */
@@ -611,15 +720,23 @@ function collectSurgeRep(cfg) {
     stateErr = `状态文件缺失（先运行 ai-node-reputation.mjs run）: ${stateFile}`
   }
 
-  // 事件流尾部（source=ai-node-reputation，最多 8 条）
+  // 事件流尾部（source=ai-node-reputation，最多 8 条）。
+  // P0-1：统计「匹配到多少条」再截断，让看板能区分「只有 3 条」与「有 40 条只给看 8 条」；
+  // P0-4：时间戳不可信的事件丢弃并计数（脏时间会污染排序与「最近事件」语义）。
   const recentEvents = []
+  let matched = 0
+  let implausible = 0
   try {
     const lines = readFileSync(eventsFile, 'utf8').trim().split('\n').filter(Boolean)
-    for (let i = lines.length - 1; i >= 0 && recentEvents.length < 8; i -= 1) {
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
       try {
         const e = JSON.parse(lines[i])
         if (e.source === 'ai-node-reputation') {
-          recentEvents.push({ ts: e.ts, type: e.type, node: e.node ?? null, reason: e.reason ?? null })
+          matched += 1
+          if (!plausibleTimestamp(e.ts)) { implausible += 1; continue }
+          if (recentEvents.length < 8) {
+            recentEvents.push({ ts: e.ts, type: e.type, node: e.node ?? null, reason: e.reason ?? null })
+          }
         }
       } catch { /* 忽略坏行 */ }
     }
@@ -662,6 +779,10 @@ function collectSurgeRep(cfg) {
     summary,
     nodes,
     recentEvents,
+    eventsAvailable: matched,
+    // 截断只统计「可信事件」中被裁掉的（不可信事件单列 eventsImplausible，不混算）
+    eventsTruncated: (matched - implausible) > recentEvents.length,
+    eventsImplausible: implausible,
     error: stateErr,
   }
 }
@@ -674,10 +795,12 @@ function loadHistoryFromDisk(maxPoints) {
   try {
     const lines = readFileSync(HISTORY_FILE, 'utf8').trim().split('\n').filter(Boolean)
     if (lines.length > maxPoints * 3) {
-      // 文件超长 → 压缩只保留最近 maxPoints 行（30s/点 ≈ 2 天/1200 行后触发）
+      // 文件超长 → 压缩只保留最近 maxPoints 行（30s/点 ≈ 2 天/1200 行后触发）。
+      // P0-3：整文件替换走原子写（tmp→rename），避免压缩途中崩溃留下半截文件，
+      // 下次启动把整个历史当成损坏而清零。
       const keep = lines.slice(-maxPoints)
       mkdirSync(DEFAULTS_DIR, { recursive: true })
-      writeFileSync(HISTORY_FILE, keep.join('\n') + '\n')
+      writeJsonAtomic(HISTORY_FILE, keep.join('\n') + '\n')
       return keep.map(parseHistoryLine).filter(Boolean)
     }
     const from = Math.max(0, lines.length - maxPoints)
@@ -690,8 +813,11 @@ function loadHistoryFromDisk(maxPoints) {
 function parseHistoryLine(line) {
   try {
     const p = JSON.parse(line)
-    if (p && typeof p.ts === 'string') return p
-  } catch { /* 坏行跳过 */ }
+    if (!p || typeof p.ts !== 'string') { bumpSanity('historyMalformed'); return null }
+    // P0-4：脏时间（2099 / 1970 前 / 非数字）不得进入窗口切片与聚合桶
+    if (!plausibleTimestamp(new Date(p.ts).getTime())) { bumpSanity('historyImplausible'); return null }
+    return p
+  } catch { bumpSanity('historyMalformed') /* 坏行跳过 */ }
   return null
 }
 
@@ -707,17 +833,26 @@ function appendHistoryToDisk(point) {
  * 全量重写 + 按保留窗口裁剪（文件小：7d×1440 桶 + 90d×24 桶 ≈ 万级行）。
  * 启动加载最近桶继续聚合（bucketFromRow 无损恢复 sum/count）。 */
 function loadAggregates(file) {
+  let lines = []
   try {
-    const lines = readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)
-    const buckets = new Map()
-    for (const line of lines) {
-      const row = JSON.parse(line)
-      if (row && typeof row.bucket === 'number') buckets.set(row.bucket, bucketFromRow(row))
-    }
-    return buckets
+    lines = readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)
   } catch {
     return new Map()
   }
+  const buckets = new Map()
+  // 逐行容错：原实现把整个 for 包在一个 try 里，**一行畸形就让整份聚合归零**
+  // （而且是静默的）。聚合是长窗口（7d/90d）的唯一来源，不能因一行坏数据全丢。
+  for (const line of lines) {
+    let row
+    try {
+      row = JSON.parse(line)
+    } catch { bumpSanity('aggregateMalformed'); continue }
+    if (!row || typeof row.bucket !== 'number') { bumpSanity('aggregateMalformed'); continue }
+    // P0-4：桶时间同样过合理性边界（未来桶会被 aggregatesToPoints 当成"当前窗口"）
+    if (!plausibleTimestamp(row.bucket)) { bumpSanity('aggregateImplausible'); continue }
+    buckets.set(row.bucket, bucketFromRow(row))
+  }
+  return buckets
 }
 
 function saveAggregates(file, buckets, retentionMs) {
@@ -730,7 +865,8 @@ function saveAggregates(file, buckets, retentionMs) {
     }
     rows.sort((a, b) => a.bucket - b.bucket)
     mkdirSync(DEFAULTS_DIR, { recursive: true })
-    writeFileSync(file, rows.map((r) => JSON.stringify(r)).join('\n') + '\n')
+    // P0-3：全量重写走原子写——半截文件会让长窗口历史整体失效
+    writeJsonAtomic(file, rows.map((r) => JSON.stringify(r)).join('\n') + '\n')
   } catch { /* 忽略 */ }
 }
 
@@ -976,6 +1112,7 @@ const GROK_AUTH_FILE = join(homedir(), '.grok', 'auth.json')
  * Kimi 由其官方 CLI 自行续期（实测 usage 端点自愈），无需本插件处理。 */
 async function refreshGrokIfNeeded(cfg) {
   if (!cfg.aiQuota?.autoRefreshGrok) return
+  if (!egressEnabled(cfg, 'grokRefresh')) return // P0-6：续期是唯一会**写凭据文件**的外呼，单独可关
   try {
     const auth = JSON.parse(readFileSync(GROK_AUTH_FILE, 'utf8'))
     const entry = Object.entries(auth).find(([, v]) => v && typeof v === 'object' && v.refresh_token && v.oidc_client_id)
@@ -1010,6 +1147,7 @@ async function refreshGrokIfNeeded(cfg) {
 /** 订阅窗口渠道：spawn quota-axi（本机官方 CLI/App 登录态直连，1-3s）。 */
 async function collectQuotaAxi(cfg) {
   if (!cfg.aiQuota.quotaAxiEnabled) return { channels: [], errors: [] }
+  if (!egressEnabled(cfg, 'quotaAxi')) return { channels: [], errors: [], disabled: '订阅窗口采集已关闭（Config.egress.quotaAxi=false）' }
   if (!existsSync(QUOTA_AXI_JS)) {
     return { channels: [], errors: ['quota-axi: 未安装（到插件目录执行 npm install quota-axi@0.1.29）'] }
   }
@@ -1033,14 +1171,20 @@ async function collectQuotaAxi(cfg) {
 /** AI 额度总采集（legacy zenmux/packy 字段保留给对账卡；channels 为统一视图）。 */
 async function collectAiQuota(cfg) {
   const out = { generatedAt: isoNow(), zenmux: null, packy: null, channels: [], errors: [] }
-  const mgmtKey = readCredential('ZENMUX_MANAGEMENT_API_KEY')
+  // P0-6：余额 API 是「带凭据出网」的一组，整体可关；关闭后订阅窗口（另一项
+  // 开关）仍可独立工作，看板显示明确原因而不是空卡片。
+  const apisOn = egressEnabled(cfg, 'quotaApis')
+  if (!apisOn) out.errors.push('余额 API 出网已关闭（Config.egress.quotaApis=false）')
+  const mgmtKey = apisOn ? readCredential('ZENMUX_MANAGEMENT_API_KEY') : null
   if (mgmtKey) {
     const r = await collectZenmux(mgmtKey).catch((e) => ({ error: e?.message ?? e }))
     if (r.error) out.errors.push(`zenmux: ${r.error}`)
     else { out.zenmux = r.data; out.channels.push(r.channel) }
   }
   const now = Date.now()
-  if (packyRetryAtMs && now < packyRetryAtMs) {
+  if (!apisOn) {
+    // 关闭时跳过 packy/deepseek/openrouter
+  } else if (packyRetryAtMs && now < packyRetryAtMs) {
     out.errors.push(`packy: 上次查询被限流，${Math.ceil((packyRetryAtMs - now) / 60000)} 分钟后自动重试`)
   } else {
     const packyToken = readCredential('PACKY_SYSTEM_TOKEN')
@@ -1055,13 +1199,13 @@ async function collectAiQuota(cfg) {
     }
   }
   // 官方余额 API（有 key 才查；缺 key 不出错不打扰）
-  const dsKey = readCredential('DEEPSEEK_API_KEY')
+  const dsKey = apisOn ? readCredential('DEEPSEEK_API_KEY') : null
   if (dsKey) {
     const r = await collectDeepseek(dsKey).catch((e) => ({ error: e?.message ?? e }))
     if (r.error) out.errors.push(`deepseek: ${r.error}`)
     else out.channels.push(r)
   }
-  const orKey = readCredential('OPENROUTER_API_KEY')
+  const orKey = apisOn ? readCredential('OPENROUTER_API_KEY') : null
   if (orKey) {
     const r = await collectOpenrouter(orKey).catch((e) => ({ error: e?.message ?? e }))
     if (r.error) out.errors.push(`openrouter: ${r.error}`)
@@ -1141,26 +1285,33 @@ async function collectUsageReconcile(dshUsageRef, losUsageRef, aiQuotaRef) {
 }
 function round2(n) { return Math.round(n * 100) / 100 }
 
-/** ── widget 配置存取 ──────────────────────────────────────────────── */
-function loadWidgets() {
-  try {
-    const raw = JSON.parse(readFileSync(WIDGETS_FILE, 'utf8'))
-    if (Array.isArray(raw.widgets)) return raw.widgets
-    if (Array.isArray(raw)) return raw
-  } catch { /* 缺失/损坏 → 默认 */ }
-  return DEFAULT_WIDGETS.map((w) => ({ ...w }))
+/** ── widget 配置存取 ────────────────────────────────────────────────
+ * P0-3（2026-09-19）：store 带 revision + 原子写。
+ * 原实现每次 PUT 都用 writeFileSync 整文件重写且无版本：两个写者（例如两个页面
+ * 同时保存、或「改探针目标」与「移除 widget」几乎同时）会互相覆盖——后写者基于
+ * 自己读到的旧列表重建，前者的改动静默消失（Infomarchy TODO 里同款缺陷，
+ * 他们的结论是「read-merge-write + revision」）。 */
+function loadWidgetStore() {
+  const env = readJsonEnvelope(WIDGETS_FILE, 'widgets')
+  if (env.exists && Array.isArray(env.items)) {
+    return { widgets: env.items, revision: env.revision, updatedAt: env.updatedAt, exists: true }
+  }
+  return { widgets: DEFAULT_WIDGETS.map((w) => ({ ...w })), revision: env.revision, updatedAt: env.updatedAt, exists: false }
 }
 
-function saveWidgets(widgets) {
-  const cleaned = widgets
+function loadWidgets() {
+  return loadWidgetStore().widgets
+}
+
+function saveWidgets(widgets, expectedRevision = null) {
+  const cleaned = (Array.isArray(widgets) ? widgets : [])
     .filter((w) => w && typeof w.id === 'string' && ALLOWED_ENDPOINTS.has(w.endpoint))
     .map((w) => ({
       id: w.id, type: w.type ?? 'stat', endpoint: w.endpoint,
       title: String(w.title ?? w.id), refreshMs: Number(w.refreshMs ?? 30000),
     }))
-  mkdirSync(DEFAULTS_DIR, { recursive: true })
-  writeFileSync(WIDGETS_FILE, JSON.stringify({ updatedAt: new Date().toISOString(), widgets: cleaned }, null, 2) + '\n')
-  return cleaned
+  const res = saveEnvelopeReplace(WIDGETS_FILE, 'widgets', cleaned, expectedRevision)
+  return { ...res, widgets: res.ok ? cleaned : (res.items ?? loadWidgets()) }
 }
 
 /** ── 探针目标配置存取（UI 可编辑；store 优先于 Config.probe.targets 与 DEFAULT_TARGETS） ── */
@@ -1176,30 +1327,39 @@ function sanitizeTarget(t) {
   return null
 }
 
+function loadProbeStore() {
+  const env = readJsonEnvelope(PROBE_FILE, 'targets')
+  if (env.exists && Array.isArray(env.items)) {
+    const targets = env.items.map(sanitizeTarget).filter(Boolean)
+    if (targets.length) return { targets, revision: env.revision, updatedAt: env.updatedAt, exists: true }
+  }
+  return { targets: null, revision: env.revision, updatedAt: env.updatedAt, exists: env.exists }
+}
+
 function loadProbeTargets(cfg) {
-  try {
-    const raw = JSON.parse(readFileSync(PROBE_FILE, 'utf8'))
-    if (Array.isArray(raw.targets)) {
-      const targets = raw.targets.map(sanitizeTarget).filter(Boolean)
-      if (targets.length) return targets
-    }
-  } catch { /* 缺失/损坏 → 下一级 */ }
+  const store = loadProbeStore()
+  if (store.targets) return store.targets
   if (Array.isArray(cfg.probe?.targets) && cfg.probe.targets.length) {
     return cfg.probe.targets.map(sanitizeTarget).filter(Boolean)
   }
   return DEFAULT_TARGETS.map((t) => ({ ...t }))
 }
 
-function saveProbeTargets(targets) {
+function saveProbeTargets(targets, expectedRevision = null) {
   const cleaned = (Array.isArray(targets) ? targets : []).map(sanitizeTarget).filter(Boolean)
+  // revision 守卫先于写：冲突时不删也不写，回当前值让调用方决定
+  const current = loadProbeStore()
+  const expected = expectedRevision === null || expectedRevision === undefined ? null : Number(expectedRevision)
+  if (expected !== null && (!Number.isSafeInteger(expected) || expected !== current.revision)) {
+    return { ok: false, conflict: true, revision: current.revision, targets: current.targets, currentRevision: current.revision }
+  }
   if (!cleaned.length) {
     // 空列表 = 重置回默认（删除 store，回落 Config.probe.targets / DEFAULT_TARGETS）
     try { rmSync(PROBE_FILE, { force: true }) } catch { /* ignore */ }
-    return []
+    return { ok: true, conflict: false, reset: true, revision: 0, targets: [] }
   }
-  mkdirSync(DEFAULTS_DIR, { recursive: true })
-  writeFileSync(PROBE_FILE, JSON.stringify({ updatedAt: new Date().toISOString(), targets: cleaned }, null, 2) + '\n')
-  return cleaned
+  const res = saveEnvelopeReplace(PROBE_FILE, 'targets', cleaned, null)
+  return { ...res, targets: res.ok ? cleaned : (res.items ?? []) }
 }
 
 /** 读请求 JSON body（失败 → 空对象，与 widgets PUT 同语义）。 */
@@ -1248,6 +1408,7 @@ export function apply(ctx, config) {
     intervalMs: cfg.glances.pollMs,
     collect: async () => {
       if (!cfg.glances.enabled) return { enabled: false, reason: 'glances 未启用（Config.glances.enabled）' }
+      if (!egressEnabled(cfg, 'glances')) return { enabled: false, reason: 'glances 出网已关闭（Config.egress.glances=false）' }
       const res = await fetch(`${cfg.glances.url}/api/4/all`, { signal: AbortSignal.timeout(6000) })
       if (!res.ok) return { enabled: true, error: `glances HTTP ${res.status}` }
       const d = await res.json()
@@ -1259,6 +1420,7 @@ export function apply(ctx, config) {
     intervalMs: cfg.kuma.pollMs,
     collect: async () => {
       if (!cfg.kuma.enabled) return { enabled: false, reason: 'kuma 未启用（Config.kuma.enabled；配置 url+token 后启用）' }
+      if (!egressEnabled(cfg, 'kuma')) return { enabled: false, reason: 'kuma 出网已关闭（Config.egress.kuma=false）' }
       if (!cfg.kuma.url || !cfg.kuma.token) return { enabled: true, error: 'kuma 缺 url/token' }
       // Kuma 2.x 无 /api/v1 REST；唯一鉴权数据端点 = /metrics（Prometheus 文本）。
       // API key 以 Basic auth 密码传入（username 任意，kuma apiAuthorizer 取 password）。
@@ -1273,6 +1435,14 @@ export function apply(ctx, config) {
   })
   // feed 摘要（读本机报告文件，成本低；60s 节奏 + 快照缓存即可）
   const feedDigests = makePoller({ id: 'feed', collect: collectFeedDigests, intervalMs: 60000 })
+  // 极空间 Z4Pro 设备健康（SSH 采集：负载/内存/6 盘 SMART/池/VM/VNC/frp；120s 节奏）
+  // 采集全程只读；脚本缺失或 SSH 不通时降级为 error 展示，不影响其它 widget
+  const z4pro = makePoller({
+    id: 'z4pro',
+    collect: () => collectZ4Pro(cfg),
+    intervalMs: cfg.z4pro.pollMs,
+    timeoutMs: cfg.z4pro.timeoutMs,
+  })
   // Surge AI 节点信誉（读本机 state 文件 + 事件流，成本低）
   const surgeRep = makePoller({ id: 'surge-rep', collect: () => collectSurgeRep(cfg), intervalMs: cfg.surgeRep.pollMs })
   // AI 额度（多渠道：余额 API + quota-axi 订阅窗口；5min 节奏，独立于 los）
@@ -1302,6 +1472,10 @@ export function apply(ctx, config) {
     const d = snap?.data
     if (!d) return
     if (history.length && history[history.length - 1].ts === snap.ts) return
+    // P0-4：写入侧同样过合理性边界。采样时刻本身出错（NTP 跳变/时钟回拨）时
+    // 不进内存窗口、不进聚合桶、不落盘——否则一个脏点会永久污染 7d/90d 长窗口。
+    const tsMs = new Date(snap.ts).getTime()
+    if (!plausibleTimestamp(tsMs)) { bumpSanity('historyLiveImplausible'); return }
     const point = {
       ts: snap.ts,
       load1: d.loadavg?.load1 ?? null,
@@ -1312,13 +1486,10 @@ export function apply(ctx, config) {
     }
     history.push(point)
     // B3：同步累加聚合桶（raw 点 → minute/hour；bucket 幂等由时间锚定保证）
-    const tsMs = new Date(point.ts).getTime()
-    if (Number.isFinite(tsMs)) {
-      const minKey = bucketKey(tsMs, AGG_MIN_MS)
-      minBuckets.set(minKey, accumulateBucket(minBuckets.get(minKey), point))
-      const hourKey = bucketKey(tsMs, AGG_HOUR_MS)
-      hourBuckets.set(hourKey, accumulateBucket(hourBuckets.get(hourKey), point))
-    }
+    const minKey = bucketKey(tsMs, AGG_MIN_MS)
+    minBuckets.set(minKey, accumulateBucket(minBuckets.get(minKey), point))
+    const hourKey = bucketKey(tsMs, AGG_HOUR_MS)
+    hourBuckets.set(hourKey, accumulateBucket(hourBuckets.get(hourKey), point))
     if (cfg.macos.writeGate) {
       // 门控：与上次实际写入磁盘的点无实质变化 → 只留内存窗口，跳过磁盘写
       if (lastWrittenPoint === null || historyPointChanged(lastWrittenPoint, point)) {
@@ -1352,6 +1523,8 @@ export function apply(ctx, config) {
     get: async (searchParams) => {
       pushHistory(macos.snapshot())
       const windowArg = searchParams?.get?.('window') ?? '1h'
+      // P0-1：raw 档固定切最近 60 点——把「窗口里共有多少点」一并告知，
+      // 客户端才能区分「1h 只有 60 点」与「有 300 点只画了 60 点」。
       const raw = history.slice(-60)
       if (windowArg === '1h') {
         return {
@@ -1361,6 +1534,9 @@ export function apply(ctx, config) {
             sampleMs: cfg.macos.pollMs,
             windowStart: raw[0]?.ts ?? null,
             windowEnd: raw[raw.length - 1]?.ts ?? null,
+            pointsAvailable: history.length,
+            pointsTruncated: history.length > raw.length,
+            pointLimit: 60,
           },
           error: null,
         }
@@ -1382,6 +1558,10 @@ export function apply(ctx, config) {
           granularity: win.sampleMs === AGG_MIN_MS ? 'minute' : 'hour',
           windowStart: pts[0]?.ts ?? null,
           windowEnd: pts[pts.length - 1]?.ts ?? null,
+          // 聚合桶是首过降采样（绝对时间锚定），这里再降到 ≤120 点：两段都要可见
+          pointsAvailable: pts.length,
+          pointsTruncated: pts.length > downsampled.length,
+          pointLimit: 120,
         },
         error: null,
       }
@@ -1430,6 +1610,7 @@ export function apply(ctx, config) {
     '/dashboards/ai-quota': aiQuota,
     '/dashboards/dsh/usage': dshUsage,
     '/dashboards/usage/reconcile': usageReconcile,
+    '/dashboards/z4pro': z4pro,
   }
 
   const timers = [
@@ -1446,6 +1627,7 @@ export function apply(ctx, config) {
     startPoller(aiQuota, cfg.aiQuota.pollMs),
     startPoller(dshUsage, 15 * 60_000),
     startPoller(usageReconcile, 5 * 60_000),
+    startPoller(z4pro, cfg.z4pro.pollMs),
   ]
 
   // ── 磁盘水位告警（独立于看板 idle 门控：看板未打开也持续检查，主动推飞书） ──
@@ -1469,9 +1651,15 @@ export function apply(ctx, config) {
         diskAlertState.lastAlertAt = now
         diskAlertState.lastAlertPct = pct
         const text = `[磁盘告警] ${disk.mount} 已用 ${disk.capacity}（${disk.used}/${disk.size}，剩余 ${disk.avail}）。建议运行 mole clean 或 CleanMyMac 清理。`
-        execFile('bash', [join(HOME, 'scripts/feishu-push.sh'), text], { timeout: 20000 }, (err) => {
-          if (err) ctx.logger.warn?.(`[dsh-dashboards] 磁盘告警推送失败: ${err.message}`)
-        })
+        // P0-6：推送走飞书 webhook（本插件唯一的「往外部发内容」路径），单独可关。
+        // 关闭时仍记 lastAlertAt（冷却照走），只跳过推送本身。
+        if (egressEnabled(cfg, 'diskAlert')) {
+          execFile('bash', [join(HOME, 'scripts/feishu-push.sh'), text], { timeout: 20000 }, (err) => {
+            if (err) ctx.logger.warn?.(`[dsh-dashboards] 磁盘告警推送失败: ${err.message}`)
+          })
+        } else {
+          ctx.logger.info?.(`[dsh-dashboards] 磁盘告警推送已关闭（Config.egress.diskAlert=false），跳过: ${disk.capacity}`)
+        }
         ctx.logger.info?.(`[dsh-dashboards] 磁盘水位告警: ${disk.mount} ${disk.capacity}（阈值 ${threshold}%）`)
       }
     } else if (pct < threshold - 3) {
@@ -1489,10 +1677,23 @@ export function apply(ctx, config) {
       const snap = p.snapshot()
       // stats（2026-09-01 轮询基座观测）：刷新次数/成败/最近耗时/最近错误/连续失败
       const stats = p.stats?.() ?? null
-      return { ts: snap.ts, error: snap.error ?? null, hasData: snap.data !== null, stats }
+      // P0-5：把「数据时间」与「尝试时间」分开暴露，并显式给出 stale——
+      // 失败后数据仍在但已过期，运维面必须一眼看出来（而不是靠 ts 猜）。
+      return {
+        ts: snap.ts,
+        attemptedAt: snap.attemptedAt ?? null,
+        stale: !!snap.stale,
+        error: snap.error ?? null,
+        hasData: snap.data !== null,
+        stats,
+      }
     }
     return {
       ts: new Date().toISOString(),
+      // P0-4 观测：脏数据丢弃计数（全 0 = 采集链路干净）
+      sanity: { ...sanityDropped },
+      // P0-6 观测：出网清单与开关状态（哪些外呼被关掉了）
+      egress: { disabled: egressInventory(cfg).filter((f) => !f.enabled).map((f) => f.id), total: egressInventory(cfg).length },
       backends: {
         los: { usage: s(losUsage), trends: s(losTrends), metrics: s(losMetrics), nodes: s(losNodes) },
         macos: { ...s(macos), enabled: cfg.macos.enabled },
@@ -1580,18 +1781,29 @@ export function apply(ctx, config) {
         }
         if (method === 'GET' && path === '/dashboards/probe') { sendJson(res, 200, await probe.get()); return }
         if (method === 'GET' && path === '/dashboards/probe-targets') {
+          const store = loadProbeStore()
           const targets = loadProbeTargets(cfg)
-          const source = existsSync(PROBE_FILE)
+          const source = store.exists
             ? 'store'
             : (Array.isArray(cfg.probe?.targets) && cfg.probe.targets.length ? 'config' : 'default')
-          sendJson(res, 200, { ts: new Date().toISOString(), targets, source })
+          sendJson(res, 200, { ts: new Date().toISOString(), targets, source, revision: store.revision })
           return
         }
         if (method === 'PUT' && path === '/dashboards/probe-targets') {
           const body = await readJsonBody(req)
-          const targets = saveProbeTargets(body.targets)
+          // revision 可选：带上即启用『乐观并发』（不匹配回 409 + 当前值），
+          // 不带保持旧的最后写入者获胜语义（老客户端不受影响）。
+          const saved = saveProbeTargets(body.targets, body.revision)
+          if (saved.conflict) {
+            sendJson(res, 409, { ok: false, error: 'revision 冲突（store 已被其他写者更新）', revision: saved.revision, currentRevision: saved.currentRevision, targets: saved.targets })
+            return
+          }
+          if (!saved.ok) {
+            sendJson(res, 500, { ok: false, error: saved.error ?? '写入失败', revision: saved.revision })
+            return
+          }
           await probe.refresh()
-          sendJson(res, 200, { ok: true, targets, snap: probe.snapshot() })
+          sendJson(res, 200, { ok: true, targets: saved.targets, revision: saved.revision, reset: !!saved.reset, snap: probe.snapshot() })
           return
         }
         if (method === 'GET' && path === '/dashboards/glances') { sendJson(res, 200, await glances.get()); return }
@@ -1601,14 +1813,30 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/ai-quota') { sendJson(res, 200, await aiQuota.get()); return }
         if (method === 'GET' && path === '/dashboards/dsh/usage') { sendJson(res, 200, await dshUsage.get()); return }
         if (method === 'GET' && path === '/dashboards/usage/reconcile') { sendJson(res, 200, await usageReconcile.get()); return }
+        if (method === 'GET' && path === '/dashboards/z4pro') { sendJson(res, 200, await z4pro.get()); return }
         if (method === 'GET' && path === '/dashboards/widgets') {
-          sendJson(res, 200, { ts: new Date().toISOString(), widgets: loadWidgets() })
+          const store = loadWidgetStore()
+          sendJson(res, 200, { ts: new Date().toISOString(), widgets: store.widgets, revision: store.revision, source: store.exists ? 'store' : 'default' })
           return
         }
         if (method === 'PUT' && path === '/dashboards/widgets') {
           const body = await readJsonBody(req)
           const widgets = Array.isArray(body.widgets) ? body.widgets : (Array.isArray(body) ? body : [])
-          sendJson(res, 200, { ok: true, widgets: saveWidgets(widgets) })
+          const saved = saveWidgets(widgets, body.revision)
+          if (saved.conflict) {
+            sendJson(res, 409, { ok: false, error: 'revision 冲突（widget 配置已被其他写者更新）', revision: saved.revision, currentRevision: saved.currentRevision, widgets: saved.widgets })
+            return
+          }
+          if (!saved.ok) {
+            sendJson(res, 500, { ok: false, error: saved.error ?? '写入失败', revision: saved.revision })
+            return
+          }
+          sendJson(res, 200, { ok: true, widgets: saved.widgets, revision: saved.revision })
+          return
+        }
+        // 出网清单（P0-6）：有哪些外呼、去哪、为什么、用什么凭据、当前是否开启
+        if (method === 'GET' && path === '/dashboards/egress') {
+          sendJson(res, 200, { ts: new Date().toISOString(), features: egressInventory(cfg) })
           return
         }
         sendJson(res, 404, { error: 'not found', path })
