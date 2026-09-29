@@ -1,3 +1,6 @@
 node_modules/
 
 .DS_Store
+
+# publish-readiness 门禁台账（本地判定记录，不进提交）
+.publish-readiness/
