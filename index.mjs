@@ -199,9 +199,14 @@ const SURGE_EVENTS_FILE = join(homedir(), '.local/state/surge-auto/health-watch-
 /** PackyCode 端点可达性数据源（surge-auto scripts/packy-probe.py 输出）。 */
 const PACKY_PROBE_FILE = join(homedir(), '.local/state/surge-auto/packy-probe-state.json')
 /**
- * 探针能给到的最强结论。本仓没有 Packy 推理凭据（PACKY_SYSTEM_TOKEN 是面板令牌，
- * /v1/models 对它返回 401），所以只能断言"网络可达且服务端应答"，不能断言账号可用。
- * 卡片必须把这个强度显示出来，否则"绿色"会被读成"能用"。
+ * Fallback probe strength, used only when the state file does not say.
+ *
+ * The probe itself reports `authenticated` when it managed to load a Packy API
+ * key (keychain `PACKYCODE_API_KEY`, or `~/.grok/config.toml`) and got HTTP 200
+ * from `/v1/models`; that is the N5 "认证业务" bar. It reports
+ * `unauthenticated` when no credential was available, which only proves network
+ * reachability. Defaulting to the weaker claim means a missing or malformed
+ * state file can never make the card look stronger than the evidence.
  */
 const PACKY_PROBE_KIND = 'unauthenticated'
 /** ai-node-reputation 状态 → 看板展示标签（client 侧同样维护一份 locale，这里只用于后端聚合兜底）。 */
@@ -847,7 +852,14 @@ function collectPackyProbe(cfg) {
     ageMs,
     stale,
     probeUrl: state?.probeUrl ?? null,
-    probeKind: PACKY_PROBE_KIND,
+    // probeKind comes from the probe itself -- it is the only party that knows
+    // whether it actually sent a credential. Unknown/missing state falls back to
+    // "unauthenticated"; never the other way round, because claiming
+    // business-level on no evidence is exactly the failure this field prevents.
+    probeKind: typeof state?.probeKind === 'string' && state.probeKind
+      ? state.probeKind
+      : PACKY_PROBE_KIND,
+    keySource: state?.keySource ?? null,
     samples: state?.samples ?? null,
     okCount: state?.okCount ?? 0,
     standbyCandidates: Array.isArray(state?.standbyCandidates) ? state.standbyCandidates : [],

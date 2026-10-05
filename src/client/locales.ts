@@ -68,9 +68,11 @@ export const zh = {
   'packy.col.latency': '中位延迟',
   'packy.verdict.ok': '可达',
   'packy.verdict.blocked': '被拦(403)',
+  'packy.verdict.unauthorized': '凭据被拒(401)',
   'packy.verdict.dead': '不可达',
   'packy.verdict.flaky': '不稳定',
   'packy.standby': '备用',
+  'packy.keySource': '凭据来源',
   'packy.empty': '暂无探测结果（先运行 surge-auto scripts/packy-probe.py）',
   'packy.url': '探测目标',
 }
@@ -140,9 +142,11 @@ export const en = {
   'packy.col.latency': 'Median',
   'packy.verdict.ok': 'reachable',
   'packy.verdict.blocked': 'blocked (403)',
+  'packy.verdict.unauthorized': 'credential refused (401)',
   'packy.verdict.dead': 'unreachable',
   'packy.verdict.flaky': 'flaky',
   'packy.standby': 'standby',
+  'packy.keySource': 'Credential source',
   'packy.empty': 'No probe yet (run surge-auto scripts/packy-probe.py)',
   'packy.url': 'Probe target',
 }

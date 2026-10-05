@@ -668,6 +668,7 @@ interface PackyData {
   stale?: boolean
   probeUrl?: string | null
   probeKind?: string
+  keySource?: string | null
   samples?: number | null
   okCount?: number
   standbyCandidates?: string[]
@@ -710,6 +711,14 @@ function PackyTable({ data, t }: { data: unknown; t: (k: string) => string }) {
         <span className={authed ? css.okText : css.muted}>
           {t(`packy.probeKind.${d.probeKind ?? 'unknown'}`)}
         </span>
+        {d.keySource ? (
+          <>
+            {' · '}
+            <span className={css.muted}>
+              {t('packy.keySource')}: <span className={css.mono}>{d.keySource}</span>
+            </span>
+          </>
+        ) : null}
       </p>
       {d.error ? <p className={css.error}>{d.error}</p> : null}
       {results.length > 0 && (

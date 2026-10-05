@@ -104,7 +104,9 @@ test('host 冒烟：真实宿主库加载入口 + 路由注册 + P0 行为', { s
   const packyState = join(dshHome, 'packy-probe-state.json')
   writeFileSync(packyState, JSON.stringify({
     capturedAt: new Date().toISOString(),
-    probeUrl: 'https://www.packyapi.ai/',
+    probeUrl: 'https://www.packyapi.ai/v1/models',
+    probeKind: 'authenticated',
+    keySource: 'keychain:PACKYCODE_API_KEY',
     samples: 3,
     okCount: 1,
     standbyCandidates: ['tencent-sin-mesh'],
@@ -222,11 +224,13 @@ test('host 冒烟：真实宿主库加载入口 + 路由注册 + P0 行为', { s
     const pk = await callRoute(dash, '/dashboards/surge/packy')
     assert.equal(pk.status, 200)
     const pd = pk.json.data
-    assert.equal(pd.probeKind, 'unauthenticated',
-      '探针强度必须自曝：本仓没有 packy 推理凭据，绿色只能表示网络可达')
+    // 探针强度必须由 state 自曝：探针报什么就显示什么。硬编码成 unauthenticated
+    // 会在探针已经升级为带凭据的业务级探测时，让卡片继续低估（声明与生效不一致）。
+    assert.equal(pd.probeKind, 'authenticated')
+    assert.equal(pd.keySource, 'keychain:PACKYCODE_API_KEY')
     assert.equal(pd.stale, false)
     assert.deepEqual(pd.standbyCandidates, ['tencent-sin-mesh'])
-    assert.equal(pd.probeUrl, 'https://www.packyapi.ai/')
+    assert.equal(pd.probeUrl, 'https://www.packyapi.ai/v1/models')
     const blocked = pd.results.find((r) => r.policy === 'www.packyapi.com')
     assert.equal(blocked.verdict, 'blocked', '403 不得被当成可达（这正是分组健康检查做不到的事）')
     assert.equal(blocked.statuses[0], 403)
