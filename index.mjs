@@ -1372,12 +1372,56 @@ function round2(n) { return Math.round(n * 100) / 100 }
  * 同时保存、或「改探针目标」与「移除 widget」几乎同时）会互相覆盖——后写者基于
  * 自己读到的旧列表重建，前者的改动静默消失（Infomarchy TODO 里同款缺陷，
  * 他们的结论是「read-merge-write + revision」）。 */
+/** P1-2 补（2026-10-05）：**新增内置 widget 对已有安装是不可见的**。
+ * store 一旦存在就完全取代 DEFAULT_WIDGETS，于是 `surge-packy`（本次）与
+ * `z4pro-health`（更早）都只出现在新装的机器上——本机 GUI 里根本没有这两张卡，
+ * 而 `/dashboards/widgets` 返回 200、路由本身也是好的，症状是"什么都对但卡片不存在"。
+ * 修法是**带版本的增量迁移**，不是把 store 删掉重来（那会抹掉用户自己的增删改）：
+ *   - 信封记 `widgetsVersion`；低于 DEFAULT_WIDGETS_VERSION 时把缺失的内置项
+ *     **追加**在末尾（不动既有顺序、不动用户改过的标题/刷新率）；
+ *   - 信封记 `removedDefaults`：用户显式删掉过的内置 id。迁移**不会复活**它们
+ *     （否则"删了又回来"就是永久的对抗）；
+ *   - 版本已是最新则完全不写盘（幂等，避免每次 GET 都 churn 一次 revision）。
+ * 判据：新内置项进入既有 store、用户删过的不复活、已最新的 store 零写入。 */
+const DEFAULT_WIDGETS_VERSION = 1
+
 function loadWidgetStore() {
   const env = readJsonEnvelope(WIDGETS_FILE, 'widgets')
-  if (env.exists && Array.isArray(env.items)) {
-    return { widgets: env.items, revision: env.revision, updatedAt: env.updatedAt, exists: true }
+  if (!env.exists || !Array.isArray(env.items)) {
+    // 无 store：直接用内置列表，**不写盘**（首次 GET/PUT 之前保持只读）
+    return {
+      widgets: DEFAULT_WIDGETS.map((w) => ({ ...w })),
+      revision: env.revision, updatedAt: env.updatedAt, exists: false,
+      removedDefaults: [], migrated: false,
+    }
   }
-  return { widgets: DEFAULT_WIDGETS.map((w) => ({ ...w })), revision: env.revision, updatedAt: env.updatedAt, exists: false }
+  const version = Number(env.meta?.widgetsVersion ?? 0)
+  const removed = new Set(Array.isArray(env.meta?.removedDefaults) ? env.meta.removedDefaults : [])
+  if (Number.isFinite(version) && version >= DEFAULT_WIDGETS_VERSION) {
+    return {
+      widgets: env.items, revision: env.revision, updatedAt: env.updatedAt,
+      exists: true, removedDefaults: [...removed], migrated: false,
+    }
+  }
+  const present = new Set(env.items.map((w) => w?.id))
+  const added = DEFAULT_WIDGETS.filter((d) => !present.has(d.id) && !removed.has(d.id)).map((w) => ({ ...w }))
+  const migrated = added.length > 0
+  const widgets = migrated ? [...env.items, ...added] : env.items
+  const res = saveEnvelopeReplace(WIDGETS_FILE, 'widgets', widgets, env.revision, {
+    widgetsVersion: DEFAULT_WIDGETS_VERSION, removedDefaults: [...removed],
+  })
+  if (!res.ok) {
+    // 迁移写失败（磁盘满/权限）不该把用户已有的卡片一起弄丢：返回内存合并结果，
+    // 只是本次不落盘，下次再试。
+    return {
+      widgets, revision: env.revision, updatedAt: env.updatedAt,
+      exists: true, removedDefaults: [...removed], migrated,
+    }
+  }
+  return {
+    widgets, revision: res.revision, updatedAt: new Date().toISOString(),
+    exists: true, removedDefaults: [...removed], migrated,
+  }
 }
 
 function loadWidgets() {
@@ -1391,7 +1435,20 @@ function saveWidgets(widgets, expectedRevision = null) {
       id: w.id, type: w.type ?? 'stat', endpoint: w.endpoint,
       title: String(w.title ?? w.id), refreshMs: Number(w.refreshMs ?? 30000),
     }))
-  const res = saveEnvelopeReplace(WIDGETS_FILE, 'widgets', cleaned, expectedRevision)
+  // 记录"用户删掉了哪些内置项"。只能记录**用户当时看得见**的那些：拿迁移前的
+  // store 内容作基准，否则一个尚未出现在该 store 里的新内置项会被误记为"已删除"，
+  // 于是永远进不来（这正是要修的 bug 的镜像版本）。
+  const before = loadWidgetStore()
+  const beforeIds = new Set((before.widgets ?? []).map((w) => w?.id))
+  const kept = new Set(cleaned.map((w) => w.id))
+  const previouslyRemoved = new Set(before.removedDefaults ?? [])
+  for (const d of DEFAULT_WIDGETS) {
+    if (kept.has(d.id)) previouslyRemoved.delete(d.id)             // 用户又加回来了
+    else if (beforeIds.has(d.id)) previouslyRemoved.add(d.id)      // 看得见却没保留 = 显式删除
+  }
+  const res = saveEnvelopeReplace(WIDGETS_FILE, 'widgets', cleaned, expectedRevision, {
+    widgetsVersion: DEFAULT_WIDGETS_VERSION, removedDefaults: [...previouslyRemoved],
+  })
   return { ...res, widgets: res.ok ? cleaned : (res.items ?? loadWidgets()) }
 }
 

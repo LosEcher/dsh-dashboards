@@ -18,7 +18,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { register } from 'node:module'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -248,6 +248,80 @@ test('host 冒烟：真实宿主库加载入口 + 路由注册 + P0 行为', { s
     // 未注册路径仍 404（前缀路由不得吞掉一切）
     const nf = await callRoute(dash, '/dashboards/definitely-not-a-route')
     assert.equal(nf.status, 404)
+  } finally {
+    try { ctx.dispose() } catch { /* ignore */ }
+    rmSync(dshHome, { recursive: true, force: true })
+  }
+})
+
+/**
+ * P1-2 补：**新增内置 widget 必须进入既有 store**。
+ *
+ * 这条门禁存在的理由是一个真实缺口：store 一旦存在就完全取代 DEFAULT_WIDGETS，
+ * 于是 `z4pro-health`（更早加）与 `surge-packy`（本次加）在新装的机器上有、在已有
+ * 安装上没有——HTTP 200、路由正常、测试全绿，**只有 GUI 里少两张卡**。
+ * "新内置项对已有安装可见"此前没有任何断言，所以它静默了很久。
+ *
+ * 四个方向都要钉住：补齐缺失项 / 不复活用户删过的 / 已最新则零写入 /
+ * 反向控制（用户没见过的项不得被误记为"已删除"，否则它永远进不来）。
+ */
+test('host 冒烟：新增内置 widget 迁移进既有 store + 用户删除不复活', { skip: HOST_ROOT ? false : '未找到宿主 node_modules，跳过而非假装通过' }, async () => {
+  const dshHome = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'dsh-dash-migrate-'))
+  const storeDir = join(dshHome, 'storages', 'dsh-dashboards')
+  mkdirSync(storeDir, { recursive: true })
+  const storePath = join(storeDir, 'widgets.json')
+
+  // 夹具 = 本机真实形态：2026-08-22 的 store 快照，无 widgetsVersion，
+  // 且缺 z4pro-health 与 surge-packy（这正是 GUI 里少卡的全部原因）。
+  const legacy = [
+    { id: 'los-usage', type: 'stat', endpoint: '/dashboards/los/usage', title: 'LLM 用量 24h', refreshMs: 60000 },
+    { id: 'surge-ai-rep', type: 'surge', endpoint: '/dashboards/surge/ai-reputation', title: 'Surge 节点信誉', refreshMs: 30000 },
+  ]
+  writeFileSync(storePath, JSON.stringify({ revision: 7, updatedAt: '2026-08-22T15:53:00.000Z', widgets: legacy }, null, 2))
+
+  const packyState = join(dshHome, 'packy-probe-state.json')
+  writeFileSync(packyState, JSON.stringify({
+    capturedAt: new Date().toISOString(), probeKind: 'authenticated',
+    keySource: 'keychain:PACKYCODE_API_KEY', samples: 1, results: [],
+  }))
+
+  const ctx = makeCtx()
+  try {
+    const mod = await loadPlugin(dshHome)
+    mod.apply(ctx, { packyProbe: { stateFile: packyState } })
+    const dash = findRoute(ctx.routes, '/dashboards')
+
+    const w1 = await callRoute(dash, '/dashboards/widgets')
+    assert.equal(w1.status, 200)
+    const ids = w1.json.widgets.map((x) => x.id)
+    assert.ok(ids.includes('surge-packy'), '新增内置 widget 必须进入既有 store，否则 GUI 永远看不到卡片')
+    assert.ok(ids.includes('z4pro-health'), '更早新增的内置项同样必须补齐（同一缺陷的另一半）')
+    // 既有顺序与用户内容不得被迁移改动
+    assert.equal(ids[0], 'los-usage')
+    assert.equal(ids[1], 'surge-ai-rep')
+    assert.equal(w1.json.widgets[1].title, 'Surge 节点信誉')
+
+    const disk1 = JSON.parse(readFileSync(storePath, 'utf8'))
+    assert.equal(disk1.widgetsVersion, 1, '迁移必须把版本写进信封（否则每次读都重迁）')
+    assert.equal(disk1.revision, 8, '迁移应走同一个 revision 守卫写，递增而非重置')
+
+    // 幂等：版本已最新 ⇒ 第二次读不得再写盘
+    const w2 = await callRoute(dash, '/dashboards/widgets')
+    const disk2 = JSON.parse(readFileSync(storePath, 'utf8'))
+    assert.equal(disk2.revision, 8, '已最新的 store 不得被 GET 反复 churn revision')
+    assert.deepEqual(w2.json.widgets.map((x) => x.id), ids)
+
+    // 用户显式删掉一个内置项 ⇒ 记进 removedDefaults，且不得被迁移复活
+    const keep = w2.json.widgets.filter((x) => x.id !== 'surge-packy')
+    const put = await callRoute(dash, '/dashboards/widgets', 'PUT', { widgets: keep, revision: w2.json.revision })
+    assert.equal(put.status, 200)
+    const disk3 = JSON.parse(readFileSync(storePath, 'utf8'))
+    assert.ok(disk3.removedDefaults.includes('surge-packy'), '删除必须被记录')
+    assert.ok(!disk3.removedDefaults.includes('z4pro-health'),
+      '反向控制：用户没见过的内置项不得被误记为"已删除"，否则它永远进不来')
+    const w3 = await callRoute(dash, '/dashboards/widgets')
+    assert.ok(!w3.json.widgets.map((x) => x.id).includes('surge-packy'), '用户删过的内置项不得复活')
+    assert.ok(w3.json.widgets.map((x) => x.id).includes('z4pro-health'), '未删除的内置项应保持在场')
   } finally {
     try { ctx.dispose() } catch { /* ignore */ }
     rmSync(dshHome, { recursive: true, force: true })
