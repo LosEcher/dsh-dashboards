@@ -13,7 +13,7 @@ import css from './DashboardView.module.css'
 
 export interface WidgetConfig {
   id: string
-  type: 'stat' | 'matrix' | 'chart' | 'list' | 'feed' | 'surge'
+  type: 'stat' | 'matrix' | 'chart' | 'list' | 'feed' | 'surge' | 'packy'
   endpoint: string
   title: string
   refreshMs: number
@@ -644,6 +644,112 @@ function SurgeNodeTable({ data, t }: { data: unknown; t: (k: string) => string }
   )
 }
 
+/** ── PackyCode 出口可达性（type 'packy'，后端 /dashboards/surge/packy） ──
+ *
+ * 判定的语义（由 surge-auto scripts/packy-probe.py 定义）：
+ *   ok      每个样本都 200/401 —— 可达且服务端应答；
+ *   blocked 任一样本 403 —— WAF/地区拒绝，禁止当备用；
+ *   dead    没有样本可达；
+ *   flaky   部分可达 —— 不足以当备用。
+ * 403 压过 ok 是刻意的：被拦是策略判定而不是抖动，滚到被拦的出口比不动更糟。
+ *
+ * probeKind 必须显示出来。本仓没有 Packy 推理凭据，所以探针只能到"未认证可达"；
+ * 绿色只是"网络通"，不是"账号能用"。未认证时用空心点，避免误读。
+ */
+interface PackyResult {
+  policy: string
+  verdict: string
+  statuses?: (number | null)[]
+  median_ms?: number | null
+}
+interface PackyData {
+  updatedAt?: string | null
+  ageMs?: number | null
+  stale?: boolean
+  probeUrl?: string | null
+  probeKind?: string
+  samples?: number | null
+  okCount?: number
+  standbyCandidates?: string[]
+  results?: PackyResult[]
+  error?: string | null
+}
+
+function PackyTable({ data, t }: { data: unknown; t: (k: string) => string }) {
+  if (data == null || typeof data !== 'object') {
+    return <p className={css.muted}>—</p>
+  }
+  const d = data as PackyData
+  const results = d.results ?? []
+  const authed = d.probeKind === 'authenticated'
+  const verdictDot = (v: string): StateDotState => {
+    if (!authed) return 'ongoing' // 未认证：不给"完成"的点，避免读成可用
+    if (v === 'ok') return 'done'
+    if (v === 'blocked' || v === 'flaky') return 'warning'
+    return 'error'
+  }
+  const verdictCls = (v: string) => (
+    !authed ? css.muted
+      : v === 'ok' ? css.okText
+        : v === 'blocked' || v === 'flaky' ? css.warnText
+          : css.errText
+  )
+  const fmtStatuses = (list: (number | null)[] | undefined): string => (
+    list && list.length ? list.map((s) => (s == null ? '000' : String(s))).join('/') : '—'
+  )
+  const verdictLabel = (v: string) => t(`packy.verdict.${v}`) || v
+  return (
+    <div>
+      <p className={css.muted}>
+        {t('packy.updated')}: {fmtAgo(d.updatedAt)}
+        {' · '}
+        <span className={d.stale ? css.warnText : css.okText}>
+          {d.stale ? t('packy.stale') : t('packy.fresh')}
+        </span>
+        {' · '}
+        <span className={authed ? css.okText : css.muted}>
+          {t(`packy.probeKind.${d.probeKind ?? 'unknown'}`)}
+        </span>
+      </p>
+      {d.error ? <p className={css.error}>{d.error}</p> : null}
+      {results.length > 0 && (
+        <table className={css.table}>
+          <thead>
+            <tr>
+              <th>{t('packy.col.policy')}</th>
+              <th>{t('packy.col.verdict')}</th>
+              <th>{t('packy.col.samples')}</th>
+              <th className={css.num}>{t('packy.col.latency')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {results.map((r) => (
+              <tr key={r.policy}>
+                <td>
+                  <span className={css.mono}>{r.policy}</span>
+                  {(d.standbyCandidates ?? []).includes(r.policy)
+                    ? <span className={`${css.muted} ${css.hostSub}`}>{t('packy.standby')}</span>
+                    : null}
+                </td>
+                <td>
+                  <span className={css.rowDot}><StateDot state={verdictDot(r.verdict)} size={8} /></span>
+                  <span className={verdictCls(r.verdict)}>{verdictLabel(r.verdict)}</span>
+                </td>
+                <td><span className={css.mono}>{fmtStatuses(r.statuses)}</span></td>
+                <td className={css.num}>{fmtDur(r.median_ms ?? null)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {!results.length && !d.error && <p className={css.muted}>{t('packy.empty')}</p>}
+      {d.probeUrl ? (
+        <p className={css.muted}>{t('packy.url')}: <span className={css.mono}>{d.probeUrl}</span></p>
+      ) : null}
+    </div>
+  )
+}
+
 function TrendChart({ data, t }: { data: unknown; t: (k: string) => string }) {
   if (data == null || typeof data !== 'object') {
     return <p className={css.muted}>—</p>
@@ -859,6 +965,8 @@ function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
           <ListCard data={d} />
         ) : widget.type === 'surge' ? (
           <SurgeNodeTable data={d} t={t} />
+        ) : widget.type === 'packy' ? (
+          <PackyTable data={d} t={t} />
         ) : widget.type === 'feed' ? (
           <FeedCard data={d} t={t} />
         ) : widget.type === 'quota' ? (

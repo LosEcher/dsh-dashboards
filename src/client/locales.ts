@@ -55,6 +55,24 @@ export const zh = {
   'surge.evt.quarantine_recover': '解隔离',
   'surge.evt.quarantine_extend': '续隔离',
   'surge.evt.config_applied': '配置已应用',
+  // PackyCode 出口可达性（type 'packy'）
+  'packy.updated': '探测于',
+  'packy.fresh': '结果新鲜',
+  'packy.stale': '结果已过期',
+  'packy.probeKind.unauthenticated': '仅网络可达（未认证探针）',
+  'packy.probeKind.authenticated': '业务级（已认证）',
+  'packy.probeKind.unknown': '探针强度未知',
+  'packy.col.policy': '出口',
+  'packy.col.verdict': '判定',
+  'packy.col.samples': '样本(状态码)',
+  'packy.col.latency': '中位延迟',
+  'packy.verdict.ok': '可达',
+  'packy.verdict.blocked': '被拦(403)',
+  'packy.verdict.dead': '不可达',
+  'packy.verdict.flaky': '不稳定',
+  'packy.standby': '备用',
+  'packy.empty': '暂无探测结果（先运行 surge-auto scripts/packy-probe.py）',
+  'packy.url': '探测目标',
 }
 
 export const en = {
@@ -109,6 +127,24 @@ export const en = {
   'surge.evt.quarantine_recover': 'recovered',
   'surge.evt.quarantine_extend': 'extended',
   'surge.evt.config_applied': 'config applied',
+  // PackyCode egress reachability (type 'packy')
+  'packy.updated': 'Probed',
+  'packy.fresh': 'fresh',
+  'packy.stale': 'stale',
+  'packy.probeKind.unauthenticated': 'Network reachability only (unauthenticated probe)',
+  'packy.probeKind.authenticated': 'Business-level (authenticated)',
+  'packy.probeKind.unknown': 'Probe strength unknown',
+  'packy.col.policy': 'Egress',
+  'packy.col.verdict': 'Verdict',
+  'packy.col.samples': 'Samples (status)',
+  'packy.col.latency': 'Median',
+  'packy.verdict.ok': 'reachable',
+  'packy.verdict.blocked': 'blocked (403)',
+  'packy.verdict.dead': 'unreachable',
+  'packy.verdict.flaky': 'flaky',
+  'packy.standby': 'standby',
+  'packy.empty': 'No probe yet (run surge-auto scripts/packy-probe.py)',
+  'packy.url': 'Probe target',
 }
 
 export type DashboardKey = keyof typeof zh

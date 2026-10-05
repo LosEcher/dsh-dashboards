@@ -99,6 +99,34 @@ test('host 冒烟：真实宿主库加载入口 + 路由注册 + P0 行为', { s
   mkdirSync(join(dshHome, 'scheduler-reports'), { recursive: true })
   writeFileSync(join(dshHome, 'scheduler-reports', 'feed-digest-20260919-0900.md'), '# 测试摘要\n正文一行\n')
 
+  // P1-2：Packy 出口探测状态（形状与 surge-auto scripts/packy-probe.py 一致）。
+  // 刻意让两个出口一个 ok 一个 403 —— 这个卡片存在的全部理由就是"403 不能算可达"。
+  const packyState = join(dshHome, 'packy-probe-state.json')
+  writeFileSync(packyState, JSON.stringify({
+    capturedAt: new Date().toISOString(),
+    probeUrl: 'https://www.packyapi.ai/',
+    samples: 3,
+    okCount: 1,
+    standbyCandidates: ['tencent-sin-mesh'],
+    results: [
+      { policy: 'tencent-sin-mesh', verdict: 'ok', statuses: [200, 200, 200], median_ms: 300 },
+      { policy: 'www.packyapi.com', verdict: 'blocked', statuses: [403, 403, 403], median_ms: 90 },
+    ],
+  }, null, 2))
+
+  // P1-2 附带修复：ai-node-reputation 事件的 ts 是 ISO 串，曾被 Number() 判成不可信而**全部丢弃**。
+  // 一份「1 条可信 + 1 条脏时间」的夹具同时钉住"不再全丢"和"脏时间仍然丢"。
+  const surgeEvents = join(dshHome, 'health-watch-events.jsonl')
+  writeFileSync(surgeEvents, [
+    JSON.stringify({ ts: new Date().toISOString(), source: 'ai-node-reputation', type: 'quarantine', node: 'n1' }),
+    JSON.stringify({ ts: 'not-a-timestamp', source: 'ai-node-reputation', type: 'quarantine', node: 'n2' }),
+    JSON.stringify({ ts: new Date().toISOString(), source: 'other', type: 'ignored' }),
+  ].join('\n') + '\n')
+  const surgeState = join(dshHome, 'ai-reputation-state.json')
+  writeFileSync(surgeState, JSON.stringify({
+    lastRunAt: new Date().toISOString(), lastReport: { probeResults: {} }, quarantined: {},
+  }))
+
   const ctx = makeCtx()
   try {
     const mod = await loadPlugin(dshHome)
@@ -107,7 +135,10 @@ test('host 冒烟：真实宿主库加载入口 + 路由注册 + P0 行为', { s
     assert.ok(mod.Config, 'Config schema 应导出')
 
     // apply 不应抛（Config 校验 + 路由注册 + 定时器建立）
-    mod.apply(ctx, {})
+    mod.apply(ctx, {
+      packyProbe: { stateFile: packyState },
+      surgeRep: { eventsFile: surgeEvents, stateFile: surgeState },
+    })
 
     const dash = findRoute(ctx.routes, '/dashboards')
     const status = findRoute(ctx.routes, '/plugins/dsh-dashboards/status')
@@ -186,6 +217,29 @@ test('host 冒烟：真实宿主库加载入口 + 路由注册 + P0 行为', { s
     assert.equal(fd.truncated, false)
     assert.equal(fd.digests[0].textTruncated, false)
     assert.equal(fd.digests[0].textTotalChars > 0, true)
+
+    // ── P1-2 Packy 出口可达性：端点级判定，403 与 ok 必须分开 ──
+    const pk = await callRoute(dash, '/dashboards/surge/packy')
+    assert.equal(pk.status, 200)
+    const pd = pk.json.data
+    assert.equal(pd.probeKind, 'unauthenticated',
+      '探针强度必须自曝：本仓没有 packy 推理凭据，绿色只能表示网络可达')
+    assert.equal(pd.stale, false)
+    assert.deepEqual(pd.standbyCandidates, ['tencent-sin-mesh'])
+    assert.equal(pd.probeUrl, 'https://www.packyapi.ai/')
+    const blocked = pd.results.find((r) => r.policy === 'www.packyapi.com')
+    assert.equal(blocked.verdict, 'blocked', '403 不得被当成可达（这正是分组健康检查做不到的事）')
+    assert.equal(blocked.statuses[0], 403)
+
+    // ── 附带修复：surge 事件的 ISO ts 不再被全量判成不可信 ──
+    const sr = await callRoute(dash, '/dashboards/surge/ai-reputation')
+    assert.equal(sr.status, 200)
+    const sd = sr.json.data
+    assert.equal(sd.eventsAvailable, 2, '只统计 source=ai-node-reputation 的事件')
+    assert.equal(sd.eventsImplausible, 1, '脏时间仍须被丢弃并计数（不能矫枉过正）')
+    assert.equal(sd.recentEvents.length, 1)
+    assert.equal(sd.recentEvents[0].type, 'quarantine')
+    assert.equal(sd.recentEvents[0].node, 'n1')
 
     // 未注册路径仍 404（前缀路由不得吞掉一切）
     const nf = await callRoute(dash, '/dashboards/definitely-not-a-route')

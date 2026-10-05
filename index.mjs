@@ -91,6 +91,13 @@ export const Config = Schema.object({
     /** 事件流（与 surge-health-watch 共用）。 */
     eventsFile: Schema.string(),
   }),
+  packyProbe: Schema.object({
+    pollMs: Schema.number(),
+    /** packy-probe.py 状态文件（~/.local/state/surge-auto/packy-probe-state.json）。 */
+    stateFile: Schema.string(),
+    /** 超过该时长（ms）的探测结果视为过期，卡片显示 stale。 */
+    freshMs: Schema.number(),
+  }),
   aiQuota: Schema.object({
     /** AI 额度整体刷新间隔 ms（余额 API 缓存 + quota-axi 本地采集，默认 5min）。 */
     pollMs: Schema.number(),
@@ -180,7 +187,7 @@ const Z4PRO_HEALTH_SCRIPT = join(HOME, 'syncfolder/project/dsfolder/scripts/z4pr
 const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/los/usage', '/dashboards/los/trends', '/dashboards/los/metrics', '/dashboards/los/nodes',
   '/dashboards/macos', '/dashboards/macos/history', '/dashboards/macos/insights', '/dashboards/probe', '/dashboards/glances', '/dashboards/kuma',
-  '/dashboards/feed/digests', '/dashboards/surge/ai-reputation', '/dashboards/ai-quota',
+  '/dashboards/feed/digests', '/dashboards/surge/ai-reputation', '/dashboards/surge/packy', '/dashboards/ai-quota',
   '/dashboards/dsh/usage',
   '/dashboards/usage/reconcile',
   '/dashboards/z4pro',
@@ -189,6 +196,14 @@ const ALLOWED_ENDPOINTS = new Set([
 /** Surge 节点信誉数据源（surge-auto ai-node-reputation 输出）。 */
 const SURGE_STATE_FILE = join(homedir(), '.local/state/surge-auto/ai-reputation-state.json')
 const SURGE_EVENTS_FILE = join(homedir(), '.local/state/surge-auto/health-watch-events.jsonl')
+/** PackyCode 端点可达性数据源（surge-auto scripts/packy-probe.py 输出）。 */
+const PACKY_PROBE_FILE = join(homedir(), '.local/state/surge-auto/packy-probe-state.json')
+/**
+ * 探针能给到的最强结论。本仓没有 Packy 推理凭据（PACKY_SYSTEM_TOKEN 是面板令牌，
+ * /v1/models 对它返回 401），所以只能断言"网络可达且服务端应答"，不能断言账号可用。
+ * 卡片必须把这个强度显示出来，否则"绿色"会被读成"能用"。
+ */
+const PACKY_PROBE_KIND = 'unauthenticated'
 /** ai-node-reputation 状态 → 看板展示标签（client 侧同样维护一份 locale，这里只用于后端聚合兜底）。 */
 const SURGE_STATUS_LABEL = {
   healthy: 'healthy', grok_403: 'grok_403', xai_blocked: 'xai_blocked',
@@ -213,6 +228,7 @@ const DEFAULT_WIDGETS = [
   { id: 'kuma-status', type: 'list', endpoint: '/dashboards/kuma', title: '服务状态', refreshMs: 30000 },
   { id: 'feed-digests', type: 'feed', endpoint: '/dashboards/feed/digests', title: 'feed 采集摘要', refreshMs: 60000 },
   { id: 'surge-ai-rep', type: 'surge', endpoint: '/dashboards/surge/ai-reputation', title: 'Surge 节点信誉', refreshMs: 30000 },
+  { id: 'surge-packy', type: 'packy', endpoint: '/dashboards/surge/packy', title: 'PackyCode 出口', refreshMs: 60000 },
   { id: 'ai-quota', type: 'quota', endpoint: '/dashboards/ai-quota', title: 'AI 额度', refreshMs: 60000 },
   { id: 'dsh-usage', type: 'usage', endpoint: '/dashboards/dsh/usage', title: 'DSH 消耗 7d', refreshMs: 120000 },
   { id: 'usage-reconcile', type: 'reconcile', endpoint: '/dashboards/usage/reconcile', title: '消耗对账', refreshMs: 120000 },
@@ -267,6 +283,12 @@ function resolveConfig(config) {
       pollMs: c.surgeRep?.pollMs ?? 30000,
       stateFile: c.surgeRep?.stateFile ?? SURGE_STATE_FILE,
       eventsFile: c.surgeRep?.eventsFile ?? SURGE_EVENTS_FILE,
+    },
+    packyProbe: {
+      pollMs: c.packyProbe?.pollMs ?? 60000,
+      stateFile: c.packyProbe?.stateFile ?? PACKY_PROBE_FILE,
+      // 探针由 external 调度（建议 ≥15min）；60min 之后的结果不再当实时状态。
+      freshMs: c.packyProbe?.freshMs ?? 3_600_000,
     },
     aiQuota: {
       pollMs: c.aiQuota?.pollMs ?? 300_000,
@@ -733,7 +755,11 @@ function collectSurgeRep(cfg) {
         const e = JSON.parse(lines[i])
         if (e.source === 'ai-node-reputation') {
           matched += 1
-          if (!plausibleTimestamp(e.ts)) { implausible += 1; continue }
+          // e.ts 是 ISO 串，而 plausibleTimestamp 内部走 Number(ts) —— 对 ISO 得 NaN，
+          // 于是**每一条**事件都被判成不可信：实测线上 eventsAvailable==eventsImplausible==4479、
+          // recentEvents 恒为空（"最近事件"整块从未显示过）。必须先 parse 成毫秒再判。
+          const tsMs = typeof e.ts === 'string' ? Date.parse(e.ts) : NaN
+          if (!Number.isFinite(tsMs) || !plausibleTimestamp(tsMs)) { implausible += 1; continue }
           if (recentEvents.length < 8) {
             recentEvents.push({ ts: e.ts, type: e.type, node: e.node ?? null, reason: e.reason ?? null })
           }
@@ -784,6 +810,49 @@ function collectSurgeRep(cfg) {
     eventsTruncated: (matched - implausible) > recentEvents.length,
     eventsImplausible: implausible,
     error: stateErr,
+  }
+}
+
+/** ── PackyCode 端点可达性（type 'packy'，/dashboards/surge/packy） ────────
+ *
+ * 这个卡片存在的原因：Surge 的 `fallback`/`url-test` 只问"请求是否完成"，而被 WAF
+ * 拒绝的成员答得很快 —— 一个 403 的节点能在延迟 urltest 里胜出，fallback 也会一直
+ * 当它健康。能区分"可达(200/401)"与"被拦(403)"的信号在两个代理里都表达不出来：
+ * Surge 组的 `url=` 无认证也无状态类策略；sing-box 的 urltest 直接拒绝 `headers`
+ * 字段（1.14.2 报 `json: unknown field "headers"`）。所以探针在代理之外跑
+ * （surge-auto scripts/packy-probe.py），卡片只读它的结论。
+ *
+ * 诚实边界：probeKind 固定为 unauthenticated —— 见 PACKY_PROBE_KIND 注释。
+ */
+function collectPackyProbe(cfg) {
+  let state = null
+  let error = null
+  try {
+    state = JSON.parse(readFileSync(cfg.packyProbe.stateFile, 'utf8'))
+  } catch {
+    error = `探测状态文件缺失（先运行 surge-auto scripts/packy-probe.py）: ${cfg.packyProbe.stateFile}`
+  }
+
+  const capturedAt = state?.capturedAt ?? null
+  // plausibleTimestamp 收的是**数字**时间戳（内部 Number(ts)），而 packy-probe.py 写的是
+  // ISO 串；直接传字符串会 NaN ⇒ 永远判成不可信 ⇒ stale 恒 true。先 parse 再判。
+  const capturedMs = typeof capturedAt === 'string' ? Date.parse(capturedAt) : NaN
+  const plausible = Number.isFinite(capturedMs) && plausibleTimestamp(capturedMs)
+  const ageMs = plausible ? Date.now() - capturedMs : null
+  // 时间戳不可信或缺失一律按 stale 处理：宁可显示"结果过期"，也不能把旧探测当实时。
+  const stale = ageMs == null || ageMs > cfg.packyProbe.freshMs
+
+  return {
+    updatedAt: capturedAt,
+    ageMs,
+    stale,
+    probeUrl: state?.probeUrl ?? null,
+    probeKind: PACKY_PROBE_KIND,
+    samples: state?.samples ?? null,
+    okCount: state?.okCount ?? 0,
+    standbyCandidates: Array.isArray(state?.standbyCandidates) ? state.standbyCandidates : [],
+    results: Array.isArray(state?.results) ? state.results : [],
+    error,
   }
 }
 
@@ -1445,6 +1514,7 @@ export function apply(ctx, config) {
   })
   // Surge AI 节点信誉（读本机 state 文件 + 事件流，成本低）
   const surgeRep = makePoller({ id: 'surge-rep', collect: () => collectSurgeRep(cfg), intervalMs: cfg.surgeRep.pollMs })
+  const packyProbe = makePoller({ id: 'packy-probe', collect: () => collectPackyProbe(cfg), intervalMs: cfg.packyProbe.pollMs })
   // AI 额度（多渠道：余额 API + quota-axi 订阅窗口；5min 节奏，独立于 los）
   // timeoutMs 放宽到 30s：quota-axi spawn（15s 上限）+ Grok 自动续期（最多 12s）
   const aiQuota = makePoller({ id: 'ai-quota', collect: () => collectAiQuota(cfg), intervalMs: cfg.aiQuota.pollMs, timeoutMs: 30_000 })
@@ -1607,6 +1677,7 @@ export function apply(ctx, config) {
     '/dashboards/kuma': kuma,
     '/dashboards/feed/digests': feedDigests,
     '/dashboards/surge/ai-reputation': surgeRep,
+    '/dashboards/surge/packy': packyProbe,
     '/dashboards/ai-quota': aiQuota,
     '/dashboards/dsh/usage': dshUsage,
     '/dashboards/usage/reconcile': usageReconcile,
@@ -1624,6 +1695,7 @@ export function apply(ctx, config) {
     startPoller(kuma, cfg.kuma.pollMs),
     startPoller(feedDigests, 60000),
     startPoller(surgeRep, cfg.surgeRep.pollMs),
+    startPoller(packyProbe, cfg.packyProbe.pollMs),
     startPoller(aiQuota, cfg.aiQuota.pollMs),
     startPoller(dshUsage, 15 * 60_000),
     startPoller(usageReconcile, 5 * 60_000),
@@ -1702,6 +1774,7 @@ export function apply(ctx, config) {
         kuma: { enabled: cfg.kuma.enabled, ...s(kuma) },
         feed: s(feedDigests),
         surgeRep: s(surgeRep),
+        packyProbe: s(packyProbe),
         dsh: { usage: s(dshUsage), reconcile: s(usageReconcile) },
       },
       widgets: loadWidgets().length,
@@ -1810,6 +1883,7 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/kuma') { sendJson(res, 200, await kuma.get()); return }
         if (method === 'GET' && path === '/dashboards/feed/digests') { sendJson(res, 200, await feedDigests.get()); return }
         if (method === 'GET' && path === '/dashboards/surge/ai-reputation') { sendJson(res, 200, await surgeRep.get()); return }
+        if (method === 'GET' && path === '/dashboards/surge/packy') { sendJson(res, 200, await packyProbe.get()); return }
         if (method === 'GET' && path === '/dashboards/ai-quota') { sendJson(res, 200, await aiQuota.get()); return }
         if (method === 'GET' && path === '/dashboards/dsh/usage') { sendJson(res, 200, await dshUsage.get()); return }
         if (method === 'GET' && path === '/dashboards/usage/reconcile') { sendJson(res, 200, await usageReconcile.get()); return }
