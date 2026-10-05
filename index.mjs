@@ -1857,7 +1857,7 @@ export function apply(ctx, config) {
       widgets: loadWidgets().length,
     }
   }
-  ctx.webServer.register({
+  ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: '/plugins/dsh-dashboards/status',
     handler: (_req, res) => {
@@ -1876,9 +1876,9 @@ export function apply(ctx, config) {
         detail: { backends, widgets: status.widgets ?? 0 },
       })
     },
-  })
+  }), 'dsh-dashboards: route /plugins/dsh-dashboards/status')
 
-  ctx.webServer.register({
+  ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: '/dashboards',
     handler: async (req, res) => {
@@ -1995,7 +1995,7 @@ export function apply(ctx, config) {
         sendJson(res, 500, { error: String(e) })
       }
     },
-  })
+  }), 'dsh-dashboards: route /dashboards')
 
   ctx.on('dispose', () => {
     for (const t of timers) clearInterval(t)

@@ -38,19 +38,54 @@ function findHostRoot() {
 
 const HOST_ROOT = findHostRoot()
 
-/** 桩 ctx：捕获路由与日志，提供 dispose 句柄（apply 内注册了 dispose 清理定时器）。 */
-function makeCtx() {
+/**
+ * 桩 webServer：复刻真实服务语义 —— 重复 (kind, path) 抛错、register 返回 disposer。
+ * 真实实现见 harness packages/host/webserver/src/index.ts:163-171。
+ * 不复制这条语义，「路由未随 fiber 回收 → config 重放撞 duplicate route」这类缺陷
+ * 在门禁里就是隐形的（2026-10-05 dsh-scheduler 实证）。
+ */
+function makeWebServer() {
+  const tables = { exact: new Map(), prefix: new Map() }
   const routes = []
-  const logs = []
-  let disposeFn = null
   return {
     routes,
+    register: (r) => {
+      const table = r.kind === 'exact' ? tables.exact : tables.prefix
+      if (table.has(r.path)) throw new Error(`webserver: duplicate ${r.kind} route "${r.path}"`)
+      table.set(r.path, r)
+      routes.push(r)
+      return () => { table.delete(r.path) }
+    },
+    /** 当前仍注册的路由数 —— 「重放安全」的直接判据。 */
+    get size() { return tables.exact.size + tables.prefix.size },
+  }
+}
+
+/**
+ * 桩 ctx：捕获路由与日志，提供 dispose 句柄。
+ * `effect` 按真实 cordis 语义收集 disposer（vendor/cordis/src/fiber.ts:418），
+ * dispose 时逆序执行；不这么做，注册泄漏就测不出来。
+ */
+function makeCtx(webServer = makeWebServer()) {
+  const logs = []
+  const effectDisposers = []
+  const disposeHandlers = []
+  return {
+    routes: webServer.routes,
     logs,
-    webServer: { register: (r) => { routes.push(r); return () => {} } },
+    webServer,
     logger: { info: (m) => logs.push(String(m)), warn: (m) => logs.push(String(m)) },
-    on: (event, fn) => { if (event === 'dispose') disposeFn = fn },
-    effect: (fn) => { try { return fn?.() } catch { return undefined } },
-    dispose: () => disposeFn?.(),
+    on: (event, fn) => { if (event === 'dispose') disposeHandlers.push(fn) },
+    effect: (fn) => {
+      const result = fn?.()
+      const dispose = typeof result === 'function' ? result : undefined
+      if (dispose) effectDisposers.push(dispose)
+      return dispose
+    },
+    dispose: () => {
+      for (const d of effectDisposers.splice(0).reverse()) { try { d() } catch { /* ignore */ } }
+      for (const h of disposeHandlers.splice(0).reverse()) { try { h() } catch { /* ignore */ } }
+    },
   }
 }
 
@@ -342,6 +377,39 @@ test('host 冒烟：新增内置 widget 迁移进既有 store + 用户删除不�
     assert.ok(w3.json.widgets.map((x) => x.id).includes('z4pro-health'), '未删除的内置项应保持在场')
   } finally {
     try { ctx.dispose() } catch { /* ignore */ }
+    rmSync(dshHome, { recursive: true, force: true })
+  }
+})
+
+/**
+ * 回归守卫（2026-10-05）：路由注册必须随插件 fiber 回收。
+ *
+ * 复现路径：宿主对插件做 config-only 重放时，先销毁旧实例再 apply 新实例。
+ * 只要旧实例的路由没被注销，新实例注册同一 (kind, path) 就抛 duplicate route，
+ * 整次 reapply 被放弃（dsh-scheduler 已因此假活过一次：状态接口 200、任务不再触发）。
+ * 本用例在同一个 webServer 上跑 apply → dispose → apply，断言全程不抛、无残留。
+ */
+test('host 冒烟：config 重放安全 —— apply → dispose → apply 不得留下残留路由', { skip: HOST_ROOT ? false : '未找到宿主 node_modules（profile 未安装 @deepseek-ai/schemastery），跳过而非假装通过' }, async () => {
+  const dshHome = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'dsh-dash-route-'))
+  try {
+    const mod = await loadPlugin(dshHome)
+    const webServer = makeWebServer()
+
+    const ctx1 = makeCtx(webServer)
+    mod.apply(ctx1, {})
+    const afterApply = webServer.size
+    assert.ok(afterApply > 0, 'apply 后应有路由注册')
+
+    ctx1.dispose()
+    assert.equal(webServer.size, 0, 'dispose 后路由必须全部注销，否则 config 重放必然撞 duplicate route')
+
+    const ctx2 = makeCtx(webServer)
+    assert.doesNotThrow(() => mod.apply(ctx2, {}), 'config 重放（第二次 apply）不得抛 duplicate route')
+    assert.equal(webServer.size, afterApply, '重放后路由数应与首次一致')
+
+    ctx2.dispose()
+    assert.equal(webServer.size, 0)
+  } finally {
     rmSync(dshHome, { recursive: true, force: true })
   }
 })
