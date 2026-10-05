@@ -179,9 +179,17 @@ function bumpSanity(key, by = 1) {
 }
 
 /** 极空间 Z4Pro 健康巡检脚本（外部 CLI，零依赖 Node）。缺省指向 dsfolder 下的独立工具
- * （可经 Config.z4pro.script 覆盖）。与 feishu-push.sh 同为"HOME 下的外部脚本"模式：
- * 设备特定逻辑不进插件仓，插件只负责调度 + 展示形态适配（映射成 list widget 的 results）。 */
-const Z4PRO_HEALTH_SCRIPT = join(HOME, 'syncfolder/project/dsfolder/scripts/z4pro-health.mjs')
+ * （可经 Config.z4pro.script 覆盖）。与 feishu-push.sh 同为"外部脚本"模式：
+ * 设备特定逻辑不进插件仓，插件只负责调度 + 展示形态适配（映射成 list widget 的 results）。
+ *
+ * ⚠️ 必须用 `homedir()` 而**不是** `HOME`：本文件里的 `HOME` 是 **DSH home**
+ * （`DSH_HOME` ?? `~/.dsh`），它只适用于 `.credentials.yaml` / `storages/...` /
+ * `~/.dsh/scripts/feishu-push.sh` 这类**装在 DSH 家目录下**的东西。这个巡检脚本住在
+ * **用户真实家目录**的 `syncfolder/...` 下，曾经误用 `HOME` 拼出
+ * `~/.dsh/syncfolder/project/dsfolder/scripts/z4pro-health.mjs`，于是卡片永远显示
+ * 「z4pro 巡检脚本不存在」——磁盘上脚本好好的，只是被指到了一个不存在的路径。
+ * 同类正确写法见 SURGE_STATE_FILE / PACKY_PROBE_FILE / GROK_AUTH_FILE（都用 homedir()）。 */
+const Z4PRO_HEALTH_SCRIPT = join(homedir(), 'syncfolder/project/dsfolder/scripts/z4pro-health.mjs')
 
 /** widget endpoint 白名单（防 PUT 注入任意路径）。 */
 const ALLOWED_ENDPOINTS = new Set([

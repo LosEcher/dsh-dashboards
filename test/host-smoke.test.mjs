@@ -254,6 +254,24 @@ test('host 冒烟：真实宿主库加载入口 + 路由注册 + P0 行为', { s
   }
 })
 
+test('host 冒烟：z4pro 巡检脚本默认路径取自 homedir()，不是 DSH home', { skip: HOST_ROOT ? false : '未找到宿主 node_modules，跳过而非假装通过' }, async () => {
+  const dshHome = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'dsh-dash-z4path-'))
+  const ctx = makeCtx()
+  try {
+    const mod = await loadPlugin(dshHome)
+    // 断言挂在真实入口上（loadPlugin 已把 DSH_HOME 指向临时目录，复现当时的运行条件）
+    mod.apply(ctx, {})
+    const src = readFileSync(new URL('../index.mjs', import.meta.url), 'utf8')
+    assert.match(src, /join\(homedir\(\),\s*'syncfolder\//,
+      'z4pro 默认脚本路径必须由 homedir() 拼（脚本住在用户真实家目录）')
+    assert.doesNotMatch(src, /join\(HOME,\s*'syncfolder\//,
+      '不得用 HOME（=DSH home ~/.dsh）拼 syncfolder/ 路径——那会解析到 ~/.dsh/syncfolder/... 这个不存在的路径，卡片永远显示「脚本不存在」')
+  } finally {
+    try { ctx.dispose() } catch { /* ignore */ }
+    rmSync(dshHome, { recursive: true, force: true })
+  }
+})
+
 /**
  * P1-2 补：**新增内置 widget 必须进入既有 store**。
  *
