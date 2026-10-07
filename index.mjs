@@ -150,6 +150,10 @@ const HISTORY_FILE = join(HOME, 'storages/dsh-dashboards/history.jsonl')
  * raw 档保留 2h（historyPoints×pollMs≈1h，内存窗口）；长窗口读聚合档。 */
 const HISTORY_MIN_FILE = join(HOME, 'storages/dsh-dashboards/history-min.jsonl')
 const HISTORY_HOUR_FILE = join(HOME, 'storages/dsh-dashboards/history-hour.jsonl')
+/** 磁盘水位采样（只有 {t,pct}，每小时一个、7 天滚动）：**仅供磁盘告警文案写趋势**。
+ *  不复用上面两份 HISTORY_*：它们记的是 load/cpu/mem/net，**不含 disk**，且只在看板被
+ *  打开时写（2026-10-06 起已停更）。见 FEISHU-MESSAGE-COPY-REVIEW-2026-10-07.md §2.6。 */
+const DISK_SAMPLE_FILE = join(HOME, 'storages/dsh-dashboards/disk-samples.json')
 const AGG_MIN_MS = 60_000
 const AGG_HOUR_MS = 3_600_000
 const AGG_MIN_RETENTION_MS = 7 * 86_400_000
@@ -1783,6 +1787,43 @@ export function apply(ctx, config) {
   // 状态：{ lastAlertAt, lastAlertPct } —— 冷却期内同水位区间不重复推；水位再升
   // 3pp 跨档也触发（避免高水位下完全静默）；显著回落（< 阈值-3）复位冷却。
   const diskAlertState = { lastAlertAt: 0, lastAlertPct: 0 }
+
+  // ── 磁盘趋势采样（2026-10-07 加；只为告警文案的「涨了还是降了」）──────────
+  // ⚠️ 只服务文案，**不**参与冷却判定：把告警冷却状态落盘是「投递频率」问题，
+  //    与本轮「文案可读性」是两件事（前者见 FEISHU-MESSAGE-AUDIT §3.1 的 P1-2）。
+  const DISK_SAMPLE_MAX_AGE_MS = 7 * 24 * 3600_000
+  const DISK_SAMPLE_MIN_GAP_MS = 3600_000
+  function readDiskSamples() {
+    try {
+      const arr = JSON.parse(readFileSync(DISK_SAMPLE_FILE, 'utf8'))
+      return Array.isArray(arr)
+        ? arr.filter((x) => x && Number.isFinite(x.t) && Number.isFinite(x.pct))
+        : []
+    } catch { return [] }
+  }
+  function recordDiskSample(pct, now) {
+    const kept = readDiskSamples().filter((x) => x.t >= now - DISK_SAMPLE_MAX_AGE_MS)
+    const last = kept[kept.length - 1]
+    if (!last || now - last.t >= DISK_SAMPLE_MIN_GAP_MS) kept.push({ t: now, pct })
+    try {
+      mkdirSync(DEFAULTS_DIR, { recursive: true })
+      const tmp = `${DISK_SAMPLE_FILE}.tmp`
+      writeFileSync(tmp, `${JSON.stringify(kept.slice(-200))}\n`, 'utf8')
+      renameSync(tmp, DISK_SAMPLE_FILE)
+    } catch { /* 采样尽力而为：写不进去就不写趋势行，绝不影响告警本身 */ }
+    return kept
+  }
+  /** 找 ~24 小时前的采样点（容忍 18–30h），返回 {hours, refPct, delta}；没有则 null。 */
+  function diskTrendFrom(samples, pct, now) {
+    let best = null
+    for (const s of samples) {
+      const h = (now - s.t) / 3600_000
+      if (h < 18 || h > 30) continue
+      if (!best || Math.abs(h - 24) < Math.abs(best.h - 24)) best = { h, pct: s.pct }
+    }
+    if (!best) return null
+    return { hours: Math.round(best.h), refPct: best.pct, delta: pct - best.pct }
+  }
   async function checkDiskAlert() {
     const threshold = cfg.macos.diskAlertPct
     if (!cfg.macos.enabled || !threshold || threshold <= 0) return
@@ -1793,13 +1834,31 @@ export function apply(ctx, config) {
     const pct = parseInt(String(disk.capacity).replace('%', ''), 10)
     if (!Number.isFinite(pct)) return
     const now = Date.now()
+    // 每次检查都采样（函数内保证每小时最多一个）——否则「24 小时前的采样」只在告警
+    // 频繁时才存在，趋势行会长期退化成「采样不足 24 小时」，等于没加。
+    const samples = recordDiskSample(pct, now)
     if (pct >= threshold) {
       const inCooldown = now - diskAlertState.lastAlertAt < cfg.macos.diskAlertCooldownMs
       const escalated = pct >= diskAlertState.lastAlertPct + 3
       if (!inCooldown || escalated) {
         diskAlertState.lastAlertAt = now
         diskAlertState.lastAlertPct = pct
-        const text = `[磁盘告警] ${disk.mount} 已用 ${disk.capacity}（${disk.used}/${disk.size}，剩余 ${disk.avail}）。建议运行 mole clean 或 CleanMyMac 清理。`
+        // 文案契约（FEISHU-MESSAGE-COPY-REVIEW-2026-10-07.md §2.6）
+        //   旧版：「[磁盘告警] /System/Volumes/Data 已用 85%（355Gi/460Gi，剩余 63Gi）。建议运行 mole clean 或 CleanMyMac 清理。」
+        //   三个问题：① 同一事实写两遍（used/size 与 剩余）；② **没有趋势** ⇒ 读者判断不了
+        //   在变好还是变坏，于是同一句 10 天发了 54 次、零新增信息；③ 建议是固定咒语，
+        //   且已被现实否证（85% 一路涨到 94%）。增量信息只有「趋势」和「下一步」。
+        const trend = diskTrendFrom(samples, pct, now)
+        const lines = [`🟡 磁盘数据卷 ${disk.capacity}（剩 ${disk.avail}）`]
+        if (trend) {
+          const sign = trend.delta > 0 ? '+' : ''
+          const verb = trend.delta > 0 ? '，还在涨' : (trend.delta < 0 ? '，在回落' : '，持平')
+          lines.push(`· ${trend.hours} 小时 ${sign}${trend.delta}pp（${trend.refPct}% → ${pct}%）${verb}`)
+        } else {
+          lines.push('· 采样不足 24 小时，本次只报水位')
+        }
+        lines.push('→ 按目录归因：缓存 / 镜像 / 构建产物')
+        const text = lines.join('\n')
         // P0-6：推送走飞书 webhook（本插件唯一的「往外部发内容」路径），单独可关。
         // 关闭时仍记 lastAlertAt（冷却照走），只跳过推送本身。
         if (egressEnabled(cfg, 'diskAlert')) {
