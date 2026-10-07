@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """DSH 本地会话 usage 聚合（纯派生投影，只读 ~/.dsh/sessions，零副作用）。
 
-读取所有 workspace 的 session.jsonl.zstd（checksummed Zstandard frames），
+读取所有 workspace 的 session*.jsonl.zstd（v1/v3/v4 三种命名，checksummed
+Zstandard frames），
 从 request/header（provider/model）与 assistant/message（TokenUsage）事件
 聚合 token 与估算成本。定价口径对齐 los model-profiles：DeepSeek 的
 inputTokens 含 cache-read，付费 prompt = inputTokens - cacheReadTokens。
@@ -240,7 +241,11 @@ def main():
         if files_cache is not None:
             files_cache.clear()
 
-    for path in sorted(glob.glob(os.path.join(args.sessions_root, "*", "*", "session.jsonl.zstd"))):
+    # 会话日志有三种命名（harness 迁移遗留）：session.jsonl.zstd（v1）、
+    # session.v3.jsonl.zstd、session.v4.jsonl.zstd。2026-10-05 实证：只匹配
+    # session.jsonl.zstd 会让聚合对 v3+ 会话全盲 —— 症状是看板冻结在 v3 切换日
+    # （maxHour=2026-09-11）且成本少算约 4×，而脚本本身"跑成功"。
+    for path in sorted(glob.glob(os.path.join(args.sessions_root, "*", "*", "session*.jsonl.zstd"))):
         seen_paths.add(path)
         key = stat_key(path)
         if key is None:
