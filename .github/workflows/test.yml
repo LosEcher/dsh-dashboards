@@ -1,0 +1,20 @@
+name: test
+
+# 与 dsh-scheduler 的 CI 同款（node 22、ubuntu-latest）。
+# 本仓 dependencies/devDependencies 均为 0 ⇒ 不需要 install 步骤，直接跑仓库自己声明的
+# test 命令（CI 必须复用仓库自身的命令，不要在 workflow 里另写一套）。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Unit tests (no DSH host)
+        run: npm test

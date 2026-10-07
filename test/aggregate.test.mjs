@@ -7,7 +7,7 @@
  *   - B5 绝对时间锚定降采样（chartDownsampled）：桶宽=span/maxCount 锚定
  *     epoch，追加/裁剪只改变最右桶（形状稳定）；压力类取峰值
  *
- * 运行：node --test test/
+ * 运行：node --test test/*.test.mjs
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
