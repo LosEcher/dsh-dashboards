@@ -202,6 +202,7 @@ const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/feed/digests', '/dashboards/surge/ai-reputation', '/dashboards/surge/packy', '/dashboards/ai-quota',
   '/dashboards/dsh/usage',
   '/dashboards/usage/reconcile',
+  '/dashboards/xproj/sessions', '/dashboards/xproj/pain',
   '/dashboards/z4pro',
 ])
 
@@ -249,6 +250,8 @@ const DEFAULT_WIDGETS = [
   { id: 'ai-quota', type: 'quota', endpoint: '/dashboards/ai-quota', title: 'AI 额度', refreshMs: 60000 },
   { id: 'dsh-usage', type: 'usage', endpoint: '/dashboards/dsh/usage', title: 'DSH 消耗 7d', refreshMs: 120000 },
   { id: 'usage-reconcile', type: 'reconcile', endpoint: '/dashboards/usage/reconcile', title: '消耗对账', refreshMs: 120000 },
+  { id: 'xproj-sessions', type: 'chart', endpoint: '/dashboards/xproj/sessions', title: '跨项目会话（三态）', refreshMs: 300000 },
+  { id: 'xproj-pain', type: 'list', endpoint: '/dashboards/xproj/pain', title: '跨项目重复痛点', refreshMs: 300000 },
   // 极空间 Z4Pro 设备健康（复用 list widget 渲染，客户端无需新增 widget 类型）
   // 120s 节奏：SSH + smartctl 全量采集约 3-6s，且盘/池是慢变量
   { id: 'z4pro-health', type: 'list', endpoint: '/dashboards/z4pro', title: '极空间 Z4Pro', refreshMs: 120000 },
@@ -486,6 +489,77 @@ async function collectLosNodes(cfg, tokens) {
       ? Math.max(0, Math.round((Date.now() - new Date(n.lastHeartbeatAt).getTime()) / 1000))
       : null,
   }))
+}
+
+/**
+ * 跨项目事实面（los `/cross-project/summary`，契约 `los.cross-project-summary`）。
+ *
+ * 由 **los 网关**提供数据（los 拥有那三张投影表）；本插件只做代理与呈现，
+ * **不**直连 Postgres —— 否则"谁拥有投影"的边界就破了。
+ *
+ * ★ 段 `degraded` 必须**原样透传**给卡片：los 侧用它是为了表达"投影从未跑过"，
+ *   与"确实没有会话/没有痛点"是两件不同的事。在这里吞掉它，就等于把
+ *   "没数据"伪装成"数据是零"（本仓与 los 都反复登记过的反模式）。
+ */
+async function collectXproj(cfg, tokens) {
+  const res = await losFetch(cfg, tokens, '/cross-project/summary')
+  const d = await res.json()
+  const catalog = d.catalog ?? {}
+  const pain = d.pain ?? {}
+  const injection = d.injection ?? {}
+  return {
+    asOf: d.asOf ?? null,
+    // 原样透传：{ isDegraded, reasons[] }
+    degraded: d.degraded ?? { isDegraded: true, reasons: ['los 未返回 degraded 字段（契约不符）'] },
+    catalog: {
+      sessions: catalog.sessions ?? 0,
+      byState: catalog.byState ?? { current: 0, resolved: 0, unknown: 0 },
+      projects: catalog.projects ?? [],
+      lastEventAt: catalog.lastEventAt ?? null,
+    },
+    pain: {
+      patternVersion: pain.patternVersion ?? null,
+      totalSessions: pain.totalSessions ?? 0,
+      patterns: pain.patterns ?? [],
+    },
+    injection: {
+      markerVersion: injection.markerVersion ?? null,
+      days: injection.days ?? 0,
+      runtimeContextInjections: injection.runtimeContextInjections ?? 0,
+      skillCatalogInjections: injection.skillCatalogInjections ?? 0,
+      daily: injection.daily ?? [],
+    },
+  }
+}
+
+/** 跨项目会话：按三态汇总（current / resolved / unknown）。 */
+async function collectXprojSessions(cfg, tokens) {
+  const d = await collectXproj(cfg, tokens)
+  return {
+    asOf: d.asOf,
+    degraded: d.degraded,
+    sessions: d.catalog.sessions,
+    byState: d.catalog.byState,
+    projects: d.catalog.projects.slice(0, 20),
+    lastEventAt: d.catalog.lastEventAt,
+  }
+}
+
+/** 跨项目痛点：按 sessions 去重排序（"多少会话踩了"比"踩了多少次"更代表影响面）。 */
+async function collectXprojPain(cfg, tokens) {
+  const d = await collectXproj(cfg, tokens)
+  return {
+    asOf: d.asOf,
+    degraded: d.degraded,
+    patternVersion: d.pain.patternVersion,
+    totalSessions: d.pain.totalSessions,
+    patterns: d.pain.patterns,
+    injection: {
+      days: d.injection.days,
+      runtimeContextInjections: d.injection.runtimeContextInjections,
+      skillCatalogInjections: d.injection.skillCatalogInjections,
+    },
+  }
 }
 
 /** ── macOS 原生探针（零安装，异步 execFile，绝不阻塞事件循环） ──────
@@ -1419,7 +1493,10 @@ function round2(n) { return Math.round(n * 100) / 100 }
  *     （否则"删了又回来"就是永久的对抗）；
  *   - 版本已是最新则完全不写盘（幂等，避免每次 GET 都 churn 一次 revision）。
  * 判据：新内置项进入既有 store、用户删过的不复活、已最新的 store 零写入。 */
-const DEFAULT_WIDGETS_VERSION = 1
+// 2026-10-08：1 → 2，新增 xproj-sessions / xproj-pain 两张内置卡。
+// ★ 必须 bump：store 一旦存在就完全取代 DEFAULT_WIDGETS，不 bump 则新卡对
+//   **已有安装静默不可见**（surge-packy / z4pro-health 踩过同一个坑）。
+const DEFAULT_WIDGETS_VERSION = 2
 
 function loadWidgetStore() {
   const env = readJsonEnvelope(WIDGETS_FILE, 'widgets')
@@ -1574,6 +1651,9 @@ export function apply(ctx, config) {
   const losTrends = makePoller({ id: 'los-trends', collect: () => collectLosTrends(cfg, tokens), intervalMs: Math.max(cfg.losPollMs, 120000) })
   const losMetrics = makePoller({ id: 'los-metrics', collect: () => collectLosMetrics(cfg, tokens), intervalMs: Math.max(cfg.losPollMs, 120000) })
   const losNodes = makePoller({ id: 'los-nodes', collect: () => collectLosNodes(cfg, tokens), intervalMs: Math.max(cfg.losPollMs, 90000) })
+  // 跨项目事实面：变化慢（投影每小时刷新）⇒ 5 分钟足够，不必跟着 losPollMs
+  const xprojSessions = makePoller({ id: 'xproj-sessions', collect: () => collectXprojSessions(cfg, tokens), intervalMs: 300000 })
+  const xprojPain = makePoller({ id: 'xproj-pain', collect: () => collectXprojPain(cfg, tokens), intervalMs: 300000 })
   // 看门狗：单次采集整体 12s 硬上限（基座 timeoutMs 兜底），df/iostat 卡挂载也只降级该拍
   const macos = makePoller({ id: 'macos', collect: () => collectMacos(cfg), intervalMs: cfg.macos.pollMs, timeoutMs: PROBE_TOTAL_TIMEOUT_MS })
   const probe = makePoller({ id: 'probe', collect: () => collectProbe(cfg), intervalMs: cfg.probe.pollMs })
@@ -1776,6 +1856,8 @@ export function apply(ctx, config) {
     '/dashboards/los/trends': losTrends,
     '/dashboards/los/metrics': losMetrics,
     '/dashboards/los/nodes': losNodes,
+    '/dashboards/xproj/sessions': xprojSessions,
+    '/dashboards/xproj/pain': xprojPain,
     '/dashboards/macos': macos,
     '/dashboards/macos/history': historyPoller,
     '/dashboards/macos/insights': insightsPoller,
@@ -2020,6 +2102,8 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/los/trends') { sendJson(res, 200, await losTrends.get()); return }
         if (method === 'GET' && path === '/dashboards/los/metrics') { sendJson(res, 200, await losMetrics.get()); return }
         if (method === 'GET' && path === '/dashboards/los/nodes') { sendJson(res, 200, await losNodes.get()); return }
+        if (method === 'GET' && path === '/dashboards/xproj/sessions') { sendJson(res, 200, await xprojSessions.get()); return }
+        if (method === 'GET' && path === '/dashboards/xproj/pain') { sendJson(res, 200, await xprojPain.get()); return }
         if (method === 'GET' && path === '/dashboards/macos') { const s = await macos.get(); if (cfg.macos.enabled && !s.data) await macos.refresh(); sendJson(res, 200, s); return }
         if (method === 'GET' && path === '/dashboards/macos/history') {
           // 统一走 historyPoller（含 gap 填充 + sampleMs/window 元信息，与 snapshot 聚合同构）
