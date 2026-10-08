@@ -240,3 +240,41 @@ test('无数据时 get() 必然尝试（不会因 attemptedAt 已设而空转）
   assert.ok(calls >= 2, `无数据时必须持续尝试（calls=${calls}）`)
 })
 
+
+test('失败考古：成功路径不清空 lastFailAt/lastFailError/recentFailures', async () => {
+  let mode = 'boom'
+  const p = makePoller({
+    id: 'arch',
+    intervalMs: 60000,
+    collect: async () => {
+      if (mode === 'boom') throw new Error('boom')
+      return { v: 1 }
+    },
+  })
+  await p.refresh()
+  await p.refresh()
+  let st = p.stats()
+  assert.equal(st.lastError, 'Error: boom')
+  assert.equal(st.lastFailError, 'Error: boom')
+  assert.ok(st.lastFailAt, 'lastFailAt 必须落时间戳')
+  assert.equal(st.recentFailures.length, 2)
+  assert.equal(st.recentFailures[0].error, 'Error: boom')
+
+  mode = 'ok'
+  await p.refresh()
+  st = p.stats()
+  // 自愈后 lastError 清空（现状），但考古字段保留（本次新增）
+  assert.equal(st.lastError, null)
+  assert.equal(st.lastFailError, 'Error: boom')
+  assert.ok(st.lastFailAt)
+  assert.equal(st.recentFailures.length, 2)
+  assert.equal(st.failCount, 2)
+  assert.equal(st.successCount, 1)
+
+  // 环形缓冲有界：再失败 6 次只留最近 5 条
+  mode = 'boom'
+  for (let i = 0; i < 6; i += 1) await p.refresh()
+  st = p.stats()
+  assert.equal(st.recentFailures.length, 5)
+  assert.equal(st.failCount, 8)
+})

@@ -1949,6 +1949,22 @@ export function apply(ctx, config) {
       const status = dashStatus()
       const backends = status.backends ?? {}
       const healthy = (b) => (b && b.error === null && b.hasData) ? 1 : 0
+      // 最近一次失败（2026-10-08）：原实现 lastError 硬编码 null ⇒ 间歇性故障在
+      // 状态端点上只剩 failCount，成功一次后根因彻底消失（dsh-usage 7 连败就是这么
+      // 变得不可回溯的）。改用轮询基座的失败考古字段（成功不清空）。
+      const failures = []
+      const walk = (v) => {
+        if (Array.isArray(v)) { v.forEach(walk); return }
+        if (!v || typeof v !== 'object') return
+        for (const [k, x] of Object.entries(v)) {
+          if (k === 'stats' && x && typeof x === 'object') {
+            const err = x.lastFailError ?? x.recentFailures?.[0]?.error
+            if (err) failures.push({ backend: x.id, at: x.lastFailAt ?? x.recentFailures?.[0]?.at ?? null, error: err, failCount: x.failCount, consecutiveFails: x.consecutiveFails })
+          } else walk(x)
+        }
+      }
+      walk(backends)
+      failures.sort((a, b) => String(b.at ?? '').localeCompare(String(a.at ?? '')))
       sendJson(res, 200, {
         ok: true,
         plugin: 'dsh-dashboards',
@@ -1957,8 +1973,8 @@ export function apply(ctx, config) {
           widgets: status.widgets ?? 0,
           backendsOk: healthy(backends.probe) + healthy(backends.macos) + healthy(backends.los?.usage),
         },
-        lastError: null,
-        detail: { backends, widgets: status.widgets ?? 0 },
+        lastError: failures[0]?.error ?? null,
+        detail: { backends, widgets: status.widgets ?? 0, recentFailures: failures.slice(0, 5) },
       })
     },
   }), 'dsh-dashboards: route /plugins/dsh-dashboards/status')
