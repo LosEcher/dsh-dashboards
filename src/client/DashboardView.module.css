@@ -180,7 +180,7 @@
 }
 
 .barDanger {
-  background: var(--dsw-alias-state-danger-primary);
+  background: var(--dsw-alias-state-error-primary);
 }
 
 .table {
@@ -232,9 +232,12 @@
   margin-right: 5px;
 }
 
-.okText { color: var(--dsw-alias-state-success-primary); }
-.errText { color: var(--dsw-alias-state-error-primary); }
-.warnText { color: var(--dsw-alias-state-warn-primary); }
+/* 状态色作纯文字必须 color-mix 提对比度（2026-10-08）：state-*-primary 直接当
+   color 只有 2.2:1（success/warn），浅色主题几乎看不清；label-primary 随主题
+   反转（浅=近黑/深=近白），同一表达式双主题可达标。 */
+.okText { color: color-mix(in srgb, var(--dsw-alias-state-success-primary) 55%, var(--dsw-alias-label-primary)); }
+.errText { color: color-mix(in srgb, var(--dsw-alias-state-error-primary) 55%, var(--dsw-alias-label-primary)); }
+.warnText { color: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 55%, var(--dsw-alias-label-primary)); }
 
 .legend {
   display: flex;
@@ -507,7 +510,7 @@
 .usageTable th {
   padding: 4px 6px;
   border-bottom: 1px solid var(--dsw-alias-border-l2);
-  color: var(--dsw-alias-text-secondary);
+  color: var(--dsw-alias-label-secondary);
   text-align: left;
   font-size: 10px;
   font-weight: 600;
@@ -541,5 +544,5 @@
 }
 
 .dayCell span:first-child {
-  color: var(--dsw-alias-text-secondary);
+  color: var(--dsw-alias-label-secondary);
 }

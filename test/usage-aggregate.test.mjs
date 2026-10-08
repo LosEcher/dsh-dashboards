@@ -7,7 +7,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -46,6 +46,24 @@ function runForceFull(root, cache) {
   const out = execFileSync('python3', [SCRIPT, '--sessions-root', root, '--cache', cache, '--force-full'], { maxBuffer: 1 << 20 })
   return JSON.parse(out.toString())
 }
+
+/** 带任意附加参数的运行（窗口预剪枝等）。 */
+function runArgs(root, cache, extra) {
+  const args = [SCRIPT, '--sessions-root', root]
+  if (cache) args.push('--cache', cache)
+  args.push(...extra)
+  return JSON.parse(execFileSync('python3', args, { maxBuffer: 1 << 20 }).toString())
+}
+
+/** 把 session 文件 mtime 改成指定 epoch ms（模拟「窗口外的历史会话」）。 */
+function setMtime(root, name, ms) {
+  const p = join(root, 'ws', name, 'session.jsonl.zstd')
+  utimesSync(p, ms / 1000, ms / 1000)
+  return p
+}
+
+const readCache = (p) => JSON.parse(readFileSync(p, 'utf8'))
+const writeCache = (p, c) => writeFileSync(p, JSON.stringify(c))
 
 /** 重写某 session 文件（追加事件；zstd 整文件重压，mtime 必变）。 */
 function rewriteSession(root, name, events) {
@@ -158,6 +176,95 @@ test('增量缓存 24h 校准：--force-full 全量重扫且结果一致', () =>
     // 校准后缓存恢复增量
     const r3 = runWithCache(root, cache)
     assert.equal(r3.cacheReusedSessions, 2)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ── 2026-10-08 加固回归：窗口预剪枝 / 轮转校准 / 增量拍不推进校准计时 ──────────
+// 背景：宿主用 execFile 硬超时（20s）跑本脚本。7d 窗口下一拍全量扫描 ~30s
+// （1114 文件/1090MB）⇒ 被 SIGKILL ⇒ 缓存写不回去 ⇒ lastFullScanMs 永不推进 ⇒
+// 每拍都超时，「DSH 消耗 7d」卡片长期显示 Command failed。
+const HEADER = (ts) => ({ type: 'request/header', time: ts, data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } } } })
+const MSG = (ts) => ({ type: 'assistant/message', time: ts, data: { usage: { inputTokens: 100_000, cacheReadTokens: 800_000, outputTokens: 50_000 } } })
+// 非整点（小时桶边界之外），便于验证「同小时算窗内」
+const T_EVENT = 1787038200000
+
+test('窗口预剪枝：mtime 早于 --from-ms 的文件跳过扫描，结果与不剪枝一致', () => {
+  const root = makeFixture({ old: [HEADER(T_EVENT), MSG(T_EVENT)] })
+  try {
+    // 1) 无窗口（from-ms 0）⇒ 不剪枝，正常计数
+    assert.equal(run(root).totals.modelResponseCount, 1)
+
+    // 2) 文件 mtime 设为其事件时间 → 用「事件所在小时之后」的窗口 ⇒ 被剪枝
+    setMtime(root, 'old', T_EVENT)
+    const after = T_EVENT + 3_600_000
+    const pruned = runArgs(root, null, ['--from-ms', String(after)])
+    assert.equal(pruned.windowPrunedFiles, 1)
+    assert.equal(pruned.scannedSessions, 0)
+    assert.equal(pruned.totals.modelResponseCount, 0)
+
+    // 3) 同样窗口但关闭剪枝：不剪枝，仅靠窗口过滤兜底 ⇒ 结果必须一致（剪枝只是优化）
+    const noPrune = runArgs(root, null, ['--from-ms', String(after), '--no-window-prune'])
+    assert.equal(noPrune.windowPrunedFiles, 0)
+    assert.equal(noPrune.scannedSessions, 1)
+    assert.equal(noPrune.totals.modelResponseCount, 0)
+
+    // 4) 窗口起点早于 mtime ⇒ 不剪枝且事件落在窗内
+    const inWindow = runArgs(root, null, ['--from-ms', String(T_EVENT - 1)])
+    assert.equal(inWindow.windowPrunedFiles, 0)
+    assert.equal(inWindow.totals.modelResponseCount, 1)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('轮转校准：被中断（部分条目已重扫）后下一拍接着扫，结果不重不漏且校准收敛', () => {
+  const root = makeFixture({ a: [HEADER(T_EVENT), MSG(T_EVENT)], b: [HEADER(T_EVENT), MSG(T_EVENT)], c: [HEADER(T_EVENT), MSG(T_EVENT)] })
+  const cache = join(root, 'cache.json')
+  try {
+    const base = runWithCache(root, cache)
+    assert.equal(base.totals.modelResponseCount, 3)
+
+    // 伪造「24h 校准已开始、只重扫了 a 就被 SIGKILL」的缓存状态
+    const c = readCache(cache)
+    const started = Date.now()
+    c.lastFullScanMs = Date.now() - 25 * 3600_000 // 已过校准周期
+    c.calibrateStartedMs = started
+    const paths = Object.keys(c.files)
+    assert.equal(paths.length, 3)
+    c.files[paths[0]].at = started // 本周期内已重扫
+    c.files[paths[1]].at = started - 60_000
+    c.files[paths[2]].at = started - 60_000
+    writeCache(cache, c)
+
+    // 恢复拍：只重扫未完成的 2 个，结果与基线一致（不重复计入）
+    const resumed = runWithCache(root, cache)
+    assert.equal(resumed.cacheReusedSessions, 1)
+    assert.equal(resumed.calibrating, true)
+    assert.deepEqual(resumed.totals, base.totals)
+    assert.deepEqual(resumed.byProviderModel, base.byProviderModel)
+
+    // 再一拍：周期内条目齐了 ⇒ 校准完成，恢复纯增量
+    const done = runWithCache(root, cache)
+    assert.equal(done.calibrating, false)
+    assert.equal(done.cacheReusedSessions, 3)
+    assert.deepEqual(done.totals, base.totals)
+    assert.equal(readCache(cache).calibrateStartedMs, null)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('增量拍不推进全量校准计时（否则 24h 校准永不触发）', () => {
+  const root = makeFixture({ a: [HEADER(T_EVENT), MSG(T_EVENT)] })
+  const cache = join(root, 'cache.json')
+  try {
+    runWithCache(root, cache)
+    const after = readCache(cache).lastFullScanMs
+    assert.ok(after > 0, '首次运行必须记录一次全量校准完成')
+    runWithCache(root, cache)
+    assert.equal(readCache(cache).lastFullScanMs, after, '普通增量拍不得改写 lastFullScanMs')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

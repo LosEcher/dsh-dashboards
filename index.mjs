@@ -498,6 +498,15 @@ const PROBE_CMD_TIMEOUT_MS = 3000
 /** 单次采集整体硬上限（看门狗；超时记 error，下一拍重试）。 */
 const PROBE_TOTAL_TIMEOUT_MS = 12000
 
+/** 执行外部命令并归一化失败信息。
+ *
+ * 2026-10-08 修诊断可读性：原实现 `String(err.message).slice(0, 200)` 对 execFile
+ * 的「Command failed: <整条命令>\n<stderr>」直接从命令中间截断 —— 真正的原因
+ * （stderr / 超时被杀）全被切掉，界面上只剩半条命令行。实测「DSH 消耗 7d」卡片
+ * 长期显示 `dsh-usage: Command failed: python3 …/dsh-usage-aggregate.py --from-ms
+ * 1790819552068 --cache /Users/echerlos/.dsh/storages/dsh-dashboards/usage-ag`，
+ * 完全看不出是 20s 硬超时。现在：失败原因前置（截断也不会丢），stderr 保留尾部。
+ */
 function runExec(cmd, args, timeoutMs = PROBE_CMD_TIMEOUT_MS) {
   return new Promise((resolve) => {
     execFile(cmd, args, {
@@ -506,10 +515,14 @@ function runExec(cmd, args, timeoutMs = PROBE_CMD_TIMEOUT_MS) {
       maxBuffer: 4 * 1024 * 1024,
       encoding: 'utf8',
       windowsHide: true,
-    }, (err, stdout) => {
+    }, (err, stdout, stderr) => {
       if (err) {
         // D 态子进程 SIGKILL 也可能被延迟到 I/O 返回——异步等待不会阻塞事件循环。
-        resolve({ error: String(err.message ?? err.code ?? err).slice(0, 200) })
+        const reason = err.killed || err.signal
+          ? `超时/killed ${err.signal ?? 'SIGKILL'} after ${timeoutMs}ms`
+          : `exit ${err.code ?? '?'}`
+        const tail = String(stderr ?? '').trim().slice(-300)
+        resolve({ error: `[${reason}] ${cmd} ${args.join(' ')}${tail ? ` :: ${tail}` : ''}`.slice(0, 400) })
         return
       }
       resolve({ out: stdout })
@@ -1316,7 +1329,12 @@ async function collectAiQuota(cfg) {
  * 输出形状对齐 los.usage-summary（evidenceClass=dsh_sessions），供统一对账。
  */
 const DSH_USAGE_SCRIPT = fileURLToPath(new URL('./scripts/dsh-usage-aggregate.py', import.meta.url))
-const DSH_USAGE_TIMEOUT_MS = 20000
+/** 脚本硬超时。2026-10-08 由 20s 放宽到 40s：实测 7d 窗口下窗口预剪枝后最坏全量
+ * 重扫 7.4s（剪掉 820 文件/859MB 窗口外会话）、增量拍 0.1s，40s ≈ 5× 余量。
+ * 原 20s 小于当时的全量耗时（30s）⇒ 每 24h 校准必被 SIGKILL ⇒ 缓存写不回 ⇒
+ * 之后每拍都超时（卡片长期「Command failed」）。轮询基座是 stale-while-revalidate
+ * （get() 最多等 2.5s 就回旧快照），放宽这里不会拖慢看板首帧。 */
+const DSH_USAGE_TIMEOUT_MS = 40_000
 /** 聚合增量缓存（脚本按 mtime+size 跳过未变 session 文件，2026-09-01）。 */
 const DSH_USAGE_CACHE = join(HOME, 'storages/dsh-dashboards/usage-aggregate-cache.json')
 
@@ -1327,7 +1345,13 @@ async function collectDshUsage() {
   // 与 collectLosUsage 等其它 collector 一致。旧实现返回 {data, error} 会被
   // poller 再包一层（snapshot.data.data），导致客户端与对账读 .totals 全部
   // undefined →「DSH 消耗 7d」与「DSH sessions」永远显示无数据（2026-08-23 定位）。
-  if (error) throw new Error(`dsh-usage: ${error}`)
+  if (error) {
+    // 超时（唯一已知的历史故障形态）给出可执行的下一步，别让界面只说 Command failed。
+    const hint = /超时\/killed/.test(error)
+      ? '（7d 聚合超时：手动跑一次 scripts/dsh-usage-aggregate.py --from-ms 0 --force-full 重建缓存）'
+      : ''
+    throw new Error(`dsh-usage: ${error}${hint}`)
+  }
   try {
     const parsed = JSON.parse(out)
     if (parsed.error) throw new Error(`dsh-usage: ${parsed.error}`)
@@ -1603,7 +1627,9 @@ export function apply(ctx, config) {
   // 2026-09-01：15min 节奏（原 120s——7 天窗口聚合全量扫 ~18s CPU，120s 轮询 ≈15% 核
   // 常驻占用且是冷开 /dashboards/snapshot 的主阻塞源；增量缓存后单次 <1s，
   // 15min 节奏对「7d 消耗」展示无感知差异）。timeoutMs 覆盖脚本内部 20s 上限。
-  const dshUsage = makePoller({ id: 'dsh-usage', collect: collectDshUsage, intervalMs: 15 * 60_000, timeoutMs: 25_000 })
+  // 2026-10-08：脚本内超时 20s→40s（窗口预剪枝后全量 7.4s / 增量 0.1s），
+  // 轮询基座硬超时同步放宽到 45s 且必须 > 内层，让内层的可读错误先返回。
+  const dshUsage = makePoller({ id: 'dsh-usage', collect: collectDshUsage, intervalMs: 15 * 60_000, timeoutMs: 45_000 })
   // 统一消耗对账（P6：DSH + los + 配额 三源合并；5min——los/ai 各自 60s 已足够新）
   const usageReconcile = makePoller({ id: 'usage-reconcile', collect: () => collectUsageReconcile(dshUsage, losUsage, aiQuota), intervalMs: 5 * 60_000 })
 
