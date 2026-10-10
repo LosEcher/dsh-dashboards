@@ -33,6 +33,7 @@ import { createConnection } from 'node:net'
 import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints, historyPointChanged, shouldRefreshSlow, bucketKey, accumulateBucket, finalizeBucket, bucketFromRow, downsampleAnchored, HISTORY_METRICS, detectSustainedGrowth, detectStepChange, detectTrendDrift, z4proToRows } from './lib/parsers.mjs'
 import { makePoller, startPoller, touchActivity, isIdle, sleep } from './lib/poller.mjs'
 import { plausibleTimestamp, publishNetSample, readJsonEnvelope, saveEnvelopeReplace, capList, capText, egressEnabled, egressInventory } from './lib/safety.mjs'
+import { degradeAuthChannels } from './lib/quota-degrade.mjs'
 
 export const name = 'dsh-dashboards'
 export const inject = ['webServer']
@@ -144,6 +145,9 @@ const QUOTA_AXI_SIGNIN_HINT = {
   grok: 'grok login --oauth',
   copilot: 'github-copilot-cli auth login',
 }
+/** 订阅渠道的「最近良好读数」（仅内存，不落盘）：供 `auth` 降级为 `stale` 时复用。
+ *  由 collectQuotaAxi 每轮整体换引用（degradeAuthChannels 返回新 Map，不就地改写）。 */
+let lastGoodAxiChannels = new Map()
 const WIDGETS_FILE = join(HOME, 'storages/dsh-dashboards/widgets.json')
 /** 探针目标 store：UI 编辑（PUT /dashboards/probe-targets）落盘于此，优先于 Config.probe.targets 与 DEFAULT_TARGETS。 */
 const PROBE_FILE = join(HOME, 'storages/dsh-dashboards/probe-targets.json')
@@ -1329,50 +1333,22 @@ async function refreshGrokIfNeeded(cfg) {
   } catch { /* 续期失败/文件不可读：静默，保留上次状态，下次采样再试 */ }
 }
 
-/** Kimi Code 登录态文件（~/.kimi-code/credentials/kimi-code.json；KIMI_CODE_HOME 可覆盖，
- *  与 quota-axi 的 kimi-code-cli source 保持同一解析顺序）。 */
-const KIMI_CODE_HOME = process.env.KIMI_CODE_HOME?.trim() || join(homedir(), '.kimi-code')
-const KIMI_CRED_FILE = join(KIMI_CODE_HOME, 'credentials', 'kimi-code.json')
-/** Kimi Code CLI 自己的 OAuth client_id（MoonshotAI/kimi-code packages/oauth/src/oauth.ts）。 */
-const KIMI_OAUTH_CLIENT_ID = '17e5f671-d194-4dfb-9706-5516cb48c098'
+/** Kimi Code 登录态续期**脚本**（唯一实现；带跨进程锁 + 锁后二次判过期 + CAS 写回）。
+ *  插件**刻意不再内联**续期逻辑：refresh_token 单次有效且会轮换（2026-10-10 实测），
+ *  多一份无锁实现就多一个「后到者持废 token」的故障面 —— 宁可多一次 50ms 的 spawn，
+ *  也不要有第二条写凭据的代码路径。脚本未部署 ⇒ 直接跳过，绝不阻断采集。 */
+const KIMI_REFRESH_SCRIPT = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'scripts', 'kimi-refresh.mjs')
 
 /** Kimi Code 登录态自动续期：access_token 只有 **900s** 寿命，而 quota-axi 契约上**只读不刷新**
  * （自述 "without routing or mutation"）⇒ 不续期则长闲置（>15min 不跑 kimi CLI）后必然显示
- * 「需登录：kimi login」。用同文件的 refresh_token 走 Kimi OAuth 换新并原子写回
- * （凭据归 CLI 所有，写回失败不致命；token 不落日志）。
- * ⚠️ refresh_token **会轮换（单次有效，2026-10-10 实测）** ⇒ 并发双刷会让后到者持废 token；
- * 故只在距过期 <5min 时才动手，把竞争窗口压到最小。 */
+ * 「需登录：kimi login」。这里只负责**触发**，策略与写回全在脚本里（距过期 <5min 才动手）。
+ * 失败静默：本次采集照常进行，下一轮再试。 */
 async function refreshKimiIfNeeded(cfg) {
   if (!cfg.aiQuota?.autoRefreshKimi) return
-  if (!egressEnabled(cfg, 'kimiRefresh')) return // 与 grok 同理：写凭据文件的外呼单独可关
-  try {
-    const cred = JSON.parse(readFileSync(KIMI_CRED_FILE, 'utf8'))
-    const refreshToken = typeof cred?.refresh_token === 'string' ? cred.refresh_token.trim() : ''
-    if (!refreshToken) return // 无 refresh_token = 真需登录，交给看板显示 auth
-    const expSeconds = typeof cred.expires_at === 'number' ? cred.expires_at : Number(cred.expires_at)
-    if (Number.isFinite(expSeconds) && Date.now() / 1000 < expSeconds - 300) return // 仍有效
-    const res = await fetch('https://auth.kimi.com/api/oauth/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: refreshToken,
-        client_id: KIMI_OAUTH_CLIENT_ID,
-      }).toString(),
-      signal: AbortSignal.timeout(20000),
-    })
-    const body = await res.json().catch(() => ({}))
-    if (!res.ok || !body.access_token) return
-    const updated = {
-      ...cred, // 保留 scope/expires_in/token_type 等未知字段
-      access_token: body.access_token,
-      expires_at: Math.floor(Date.now() / 1000) + (Number.isFinite(body.expires_in) ? body.expires_in : 900),
-    }
-    if (typeof body.refresh_token === 'string' && body.refresh_token.trim()) updated.refresh_token = body.refresh_token
-    const tmp = KIMI_CRED_FILE + '.refresh-tmp'
-    writeFileSync(tmp, JSON.stringify(updated, null, 2) + '\n', { mode: 0o600 })
-    renameSync(tmp, KIMI_CRED_FILE)
-  } catch { /* 续期失败/文件不可读：静默，保留上次状态，下次采样再试 */ }
+  if (!egressEnabled(cfg, 'kimiRefresh')) return // 写凭据文件的外呼单独可关
+  if (!existsSync(KIMI_REFRESH_SCRIPT)) return
+  // 30s > 脚本内部 20s fetch 超时，避免父进程先杀掉子进程留下半程状态
+  await runExec(process.execPath, [KIMI_REFRESH_SCRIPT], 30_000)
 }
 
 /** 订阅窗口渠道：spawn quota-axi（本机官方 CLI/App 登录态直连，1-3s）。 */
@@ -1397,7 +1373,12 @@ async function collectQuotaAxi(cfg) {
     return { channels: [], errors: ['quota-axi: 输出非 JSON（schema 版本不兼容？）'] }
   }
   const list = Array.isArray(parsed?.providers) ? parsed.providers : []
-  return { channels: list.map(quotaAxiChannel), errors: [] }
+  // 「登录态过期」降级：quota-axi 对 access token 过期一律报 auth_required 且**主动删缓存**
+  // ⇒「token 过期但 refresh_token 尚在（本可自愈）」与「真的没登录」文案完全相同，这正是
+  // 「需登录：kimi login」反复假警报的根因。近期确读过真实数据的，降级为 stale 并显示读数年龄。
+  const degraded = degradeAuthChannels(list.map(quotaAxiChannel), lastGoodAxiChannels, Date.now(), QUOTA_AXI_SIGNIN_HINT)
+  lastGoodAxiChannels = degraded.lastGood
+  return { channels: degraded.channels, errors: [] }
 }
 
 /** AI 额度总采集（legacy zenmux/packy 字段保留给对账卡；channels 为统一视图）。 */
