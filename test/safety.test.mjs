@@ -257,7 +257,9 @@ test('egressEnabled: 缺省放行；显式 false 关闭；未登记 id 不影响
 
 test('egressInventory: 清单条目齐全（出网清单是唯一真源，不得有调用点漏登记）', () => {
   const ids = EGRESS_FEATURES.map((f) => f.id).sort()
-  assert.deepEqual(ids, ['diskAlert', 'glances', 'grokRefresh', 'kuma', 'los', 'probe', 'quotaApis', 'quotaAxi', 'z4pro'])
+  // kimiRefresh 系 2026-10-10 新增（900s 短命 token ⇒ 只读采集必然过期）：本断言是**故意的门禁**，
+  // 新增外呼必须在此显式登记 —— 即"出网清单是唯一真源"，不许有调用点漏登记。
+  assert.deepEqual(ids, ['diskAlert', 'glances', 'grokRefresh', 'kimiRefresh', 'kuma', 'los', 'probe', 'quotaApis', 'quotaAxi', 'z4pro'])
   for (const f of EGRESS_FEATURES) {
     assert.ok(f.label && f.target && f.purpose && f.auth, `${f.id} 缺说明字段`)
   }

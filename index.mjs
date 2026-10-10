@@ -109,6 +109,9 @@ export const Config = Schema.object({
     quotaAxiTimeoutMs: Schema.number(),
     /** Grok 登录态自动续期（~/.grok/auth.json refresh_token → auth.x.ai，原子写回；默认开）。 */
     autoRefreshGrok: Schema.boolean(),
+    /** Kimi Code 登录态自动续期（~/.kimi-code/credentials/kimi-code.json → auth.kimi.com，原子写回；默认开）。
+     *  access_token 只有 900s 寿命且 quota-axi 只读不刷新 ⇒ 不续期则长闲置后必然显示「需登录」。 */
+    autoRefreshKimi: Schema.boolean(),
   }),
   /** 出网逐项开关（P0-6）：清单见 lib/safety.mjs:EGRESS_FEATURES，
    * 任一项置 false 即彻底不外呼（GET /dashboards/egress 可核对当前生效值）。 */
@@ -117,6 +120,7 @@ export const Config = Schema.object({
     quotaApis: Schema.boolean(),
     quotaAxi: Schema.boolean(),
     grokRefresh: Schema.boolean(),
+    kimiRefresh: Schema.boolean(),
     kuma: Schema.boolean(),
     glances: Schema.boolean(),
     probe: Schema.boolean(),
@@ -318,6 +322,7 @@ function resolveConfig(config) {
         : [...QUOTA_AXI_PROVIDERS],
       quotaAxiTimeoutMs: c.aiQuota?.quotaAxiTimeoutMs ?? 15000,
       autoRefreshGrok: c.aiQuota?.autoRefreshGrok ?? true,
+      autoRefreshKimi: c.aiQuota?.autoRefreshKimi ?? true,
     },
     z4pro: {
       // 默认开：脚本只读采集（ssh + smartctl + virsh），无副作用；脚本缺失时降级为错误提示
@@ -336,6 +341,7 @@ function resolveConfig(config) {
       quotaApis: c.egress?.quotaApis ?? true,
       quotaAxi: c.egress?.quotaAxi ?? true,
       grokRefresh: c.egress?.grokRefresh ?? true,
+      kimiRefresh: c.egress?.kimiRefresh ?? true,
       kuma: c.egress?.kuma ?? true,
       glances: c.egress?.glances ?? true,
       probe: c.egress?.probe ?? true,
@@ -1288,11 +1294,10 @@ function quotaAxiChannel(p) {
 const GROK_AUTH_FILE = join(homedir(), '.grok', 'auth.json')
 
 /** Grok 登录态自动续期：key 距过期 <1h 时用 refresh_token 换新并原子写回
- * （OIDC refresh，Grok CLI/OpenTokenUsage 同款；失败静默，token 不落日志）。
- * Kimi 由其官方 CLI 自行续期（实测 usage 端点自愈），无需本插件处理。 */
+ * （OIDC refresh，Grok CLI/OpenTokenUsage 同款；失败静默，token 不落日志）。 */
 async function refreshGrokIfNeeded(cfg) {
   if (!cfg.aiQuota?.autoRefreshGrok) return
-  if (!egressEnabled(cfg, 'grokRefresh')) return // P0-6：续期是唯一会**写凭据文件**的外呼，单独可关
+  if (!egressEnabled(cfg, 'grokRefresh')) return // P0-6：续期是会**写凭据文件**的外呼，单独可关
   try {
     const auth = JSON.parse(readFileSync(GROK_AUTH_FILE, 'utf8'))
     const entry = Object.entries(auth).find(([, v]) => v && typeof v === 'object' && v.refresh_token && v.oidc_client_id)
@@ -1324,6 +1329,52 @@ async function refreshGrokIfNeeded(cfg) {
   } catch { /* 续期失败/文件不可读：静默，保留上次状态，下次采样再试 */ }
 }
 
+/** Kimi Code 登录态文件（~/.kimi-code/credentials/kimi-code.json；KIMI_CODE_HOME 可覆盖，
+ *  与 quota-axi 的 kimi-code-cli source 保持同一解析顺序）。 */
+const KIMI_CODE_HOME = process.env.KIMI_CODE_HOME?.trim() || join(homedir(), '.kimi-code')
+const KIMI_CRED_FILE = join(KIMI_CODE_HOME, 'credentials', 'kimi-code.json')
+/** Kimi Code CLI 自己的 OAuth client_id（MoonshotAI/kimi-code packages/oauth/src/oauth.ts）。 */
+const KIMI_OAUTH_CLIENT_ID = '17e5f671-d194-4dfb-9706-5516cb48c098'
+
+/** Kimi Code 登录态自动续期：access_token 只有 **900s** 寿命，而 quota-axi 契约上**只读不刷新**
+ * （自述 "without routing or mutation"）⇒ 不续期则长闲置（>15min 不跑 kimi CLI）后必然显示
+ * 「需登录：kimi login」。用同文件的 refresh_token 走 Kimi OAuth 换新并原子写回
+ * （凭据归 CLI 所有，写回失败不致命；token 不落日志）。
+ * ⚠️ refresh_token **会轮换（单次有效，2026-10-10 实测）** ⇒ 并发双刷会让后到者持废 token；
+ * 故只在距过期 <5min 时才动手，把竞争窗口压到最小。 */
+async function refreshKimiIfNeeded(cfg) {
+  if (!cfg.aiQuota?.autoRefreshKimi) return
+  if (!egressEnabled(cfg, 'kimiRefresh')) return // 与 grok 同理：写凭据文件的外呼单独可关
+  try {
+    const cred = JSON.parse(readFileSync(KIMI_CRED_FILE, 'utf8'))
+    const refreshToken = typeof cred?.refresh_token === 'string' ? cred.refresh_token.trim() : ''
+    if (!refreshToken) return // 无 refresh_token = 真需登录，交给看板显示 auth
+    const expSeconds = typeof cred.expires_at === 'number' ? cred.expires_at : Number(cred.expires_at)
+    if (Number.isFinite(expSeconds) && Date.now() / 1000 < expSeconds - 300) return // 仍有效
+    const res = await fetch('https://auth.kimi.com/api/oauth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        client_id: KIMI_OAUTH_CLIENT_ID,
+      }).toString(),
+      signal: AbortSignal.timeout(20000),
+    })
+    const body = await res.json().catch(() => ({}))
+    if (!res.ok || !body.access_token) return
+    const updated = {
+      ...cred, // 保留 scope/expires_in/token_type 等未知字段
+      access_token: body.access_token,
+      expires_at: Math.floor(Date.now() / 1000) + (Number.isFinite(body.expires_in) ? body.expires_in : 900),
+    }
+    if (typeof body.refresh_token === 'string' && body.refresh_token.trim()) updated.refresh_token = body.refresh_token
+    const tmp = KIMI_CRED_FILE + '.refresh-tmp'
+    writeFileSync(tmp, JSON.stringify(updated, null, 2) + '\n', { mode: 0o600 })
+    renameSync(tmp, KIMI_CRED_FILE)
+  } catch { /* 续期失败/文件不可读：静默，保留上次状态，下次采样再试 */ }
+}
+
 /** 订阅窗口渠道：spawn quota-axi（本机官方 CLI/App 登录态直连，1-3s）。 */
 async function collectQuotaAxi(cfg) {
   if (!cfg.aiQuota.quotaAxiEnabled) return { channels: [], errors: [] }
@@ -1334,6 +1385,7 @@ async function collectQuotaAxi(cfg) {
   const providers = (cfg.aiQuota.quotaAxiProviders ?? QUOTA_AXI_PROVIDERS).filter((p) => QUOTA_AXI_PROVIDERS.includes(p))
   if (!providers.length) return { channels: [], errors: [] }
   if (providers.includes('grok')) await refreshGrokIfNeeded(cfg)
+  if (providers.includes('kimi')) await refreshKimiIfNeeded(cfg)
   const args = ['--json', '--full']
   if (providers.length < QUOTA_AXI_PROVIDERS.length) args.push('--provider', providers.join(','))
   const res = await runExec(process.execPath, [QUOTA_AXI_JS, ...args], cfg.aiQuota.quotaAxiTimeoutMs)

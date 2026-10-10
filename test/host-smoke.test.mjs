@@ -187,7 +187,8 @@ test('host 冒烟：真实宿主库加载入口 + 路由注册 + P0 行为', { s
     // ── P0-6 egress 清单 ──
     const eg = await callRoute(dash, '/dashboards/egress')
     assert.equal(eg.status, 200)
-    assert.equal(eg.json.features.length, 9)
+    assert.equal(eg.json.features.length, 10) // 2026-10-10：9 → 10，+kimiRefresh（900s 短命 token 须自动续期）
+    assert.ok(eg.json.features.some((f) => f.id === 'kimiRefresh'), '新增的续期外呼必须出现在出网清单里')
     assert.equal(eg.json.features.every((f) => f.enabled), true, '默认全开（未配置 egress 时保持既有行为）')
 
     // ── P0-3 widget store revision ──
