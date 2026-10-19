@@ -353,13 +353,14 @@ test('host 冒烟：新增内置 widget 迁移进既有 store + 用户删除不�
     // 2026-10-08（v1→v2）：跨项目两张卡必须同样进入既有 store
     assert.ok(ids.includes('xproj-sessions'), 'v2 新增的 xproj-sessions 必须补齐进既有 store')
     assert.ok(ids.includes('xproj-pain'), 'v2 新增的 xproj-pain 必须补齐进既有 store')
+    assert.ok(ids.includes('los-tasks'), 'v3 新增的 los-tasks 必须补齐进既有 store')
     // 既有顺序与用户内容不得被迁移改动
     assert.equal(ids[0], 'los-usage')
     assert.equal(ids[1], 'surge-ai-rep')
     assert.equal(w1.json.widgets[1].title, 'Surge 节点信誉')
 
     const disk1 = JSON.parse(readFileSync(storePath, 'utf8'))
-    assert.equal(disk1.widgetsVersion, 2, '迁移必须把版本写进信封（否则每次读都重迁）')
+    assert.equal(disk1.widgetsVersion, 3, '迁移必须把版本写进信封（否则每次读都重迁）')
     assert.equal(disk1.revision, 8, '迁移应走同一个 revision 守卫写，递增而非重置')
 
     // 幂等：版本已最新 ⇒ 第二次读不得再写盘

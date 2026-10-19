@@ -13,7 +13,7 @@ import css from './DashboardView.module.css'
 
 export interface WidgetConfig {
   id: string
-  type: 'stat' | 'matrix' | 'chart' | 'list' | 'feed' | 'surge' | 'packy'
+  type: 'stat' | 'matrix' | 'chart' | 'list' | 'feed' | 'surge' | 'packy' | 'tasks'
   endpoint: string
   title: string
   refreshMs: number
@@ -267,6 +267,10 @@ function UsageCard({ data }: { data: unknown }) {
       cacheReadTokens: number
       estimatedCostUsd: number
     }>
+    /** 未计价路由的 provider/model（后端 dsh-usage 聚合输出）：成本归零时点名 */
+    unpricedModels?: string[]
+    /** 定价表版本（后端常量），改价后必须变化 */
+    pricingAsOf?: string
   }
   const t = d.totals
   if (!t) return <p className={css.muted}>—</p>
@@ -281,7 +285,20 @@ function UsageCard({ data }: { data: unknown }) {
         <span className={`${css.pill} ${css.pillDim}`}>缓存命中 {t.cacheHitRate != null ? `${(t.cacheHitRate * 100).toFixed(1)}%` : '—'}</span>
         <span className={`${css.pill} ${t.costUnknownCount ? css.pillWarn : ''}`}>成本 {usd(t.estimatedCostUsd)}</span>
         <span className={`${css.pill} ${css.pillDim}`}>缓存省 {usd(t.cacheSavingsUsd)}</span>
-        {t.costUnknownCount ? <span className={`${css.pill} ${css.pillWarn}`}>未计价 {t.costUnknownCount}</span> : null}
+        {/*
+          未计价必须点名到模型：2026-09~10 站点把 flash 改名 deepseek-flash，
+          后端定价表只有旧名 ⇒ 成本静默归零，卡片却只显示「未计价 4 万」而看不出
+          是哪个模型名没登记。显示 provider/model 让下一次漂移一眼可见。
+        */}
+        {t.costUnknownCount ? (
+          <span
+            className={`${css.pill} ${css.pillWarn}`}
+            title={(d.unpricedModels ?? []).join('\n') || '未登记模型名'}
+          >
+            未计价 {t.costUnknownCount}
+            {d.unpricedModels?.length ? `（${d.unpricedModels.join('、')}）` : ''}
+          </span>
+        ) : null}
       </div>
       <table className={css.usageTable}>
         <thead>
@@ -328,7 +345,7 @@ function ReconcileCard({ data }: { data: unknown }) {
       los?: { from?: number | string | null; to?: number | string | null }
     }
     sources?: {
-      dshSessions?: { totals?: UsageTotals } | null
+      dshSessions?: { totals?: UsageTotals; unpricedModels?: string[] } | null
       losRuntime?: { totals?: UsageTotals } | null
       quotas?: { zenmux?: { paygBalanceUsd?: number } | null; packy?: { remainingUsd?: number } | null; errors?: string[] } | null
     }
@@ -337,6 +354,7 @@ function ReconcileCard({ data }: { data: unknown }) {
   interface UsageTotals {
     modelResponseCount?: number; promptTokens?: number; completionTokens?: number
     cacheReadTokens?: number; totalTokens?: number; estimatedCostUsd?: number; cacheSavingsUsd?: number
+    costUnknownCount?: number
   }
   const c = d.combined
   const s = d.sources
@@ -384,6 +402,18 @@ function ReconcileCard({ data }: { data: unknown }) {
       )}
       {winDsh && winLos && (
         <p className={css.muted}>综合值为 {winDsh} DSH + {winLos} los 跨窗口相加，近似参考</p>
+      )}
+      {/*
+        综合成本由 DSH + los 相加；DSH 侧只要有未计价路由，综合值就是**下限**而非估计。
+        2026-09~10 的 flash 改名事故里，卡片显示 $0.32 而实际 ≈$70.8（差 220×），
+        原因正是这里没有一个「不完整」告警。缺口必须显式说出来。
+      */}
+      {(s?.dshSessions?.totals?.costUnknownCount ?? 0) > 0 && (
+        <p className={css.muted}>
+          ⚠ 综合成本为下限：DSH 侧 {s?.dshSessions?.totals?.costUnknownCount} 次调用未计价
+          {s?.dshSessions?.unpricedModels?.length ? `（${s.dshSessions.unpricedModels.join('、')}）` : ''}
+          ，实际成本高于上方数值
+        </p>
       )}
       <div className={css.quotaGrid}>
         {block('DSH sessions', s?.dshSessions?.totals, winDsh)}
@@ -528,6 +558,13 @@ interface SurgeRepData {
   nodes: SurgeNodeRow[]
   recentEvents?: { ts: string; type: string; node: string | null; reason: string | null }[]
   error?: string | null
+}
+
+const fmtAgeSec = (sec: number | null | undefined): string => {
+  if (sec == null) return '—'
+  if (sec < 60) return `${sec}s`
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`
+  return `${(sec / 3600).toFixed(1)}h`
 }
 
 const fmtAgo = (iso: string | null | undefined): string => {
@@ -759,6 +796,54 @@ function PackyTable({ data, t }: { data: unknown; t: (k: string) => string }) {
   )
 }
 
+function TasksCard({ data }: { data: unknown }) {
+  if (data == null || typeof data !== 'object') {
+    return <p className={css.muted}>—</p>
+  }
+  const d = data as {
+    totals?: { queued?: number; running?: number; blocked?: number; blocked24h?: number; succeeded24h?: number; failed24h?: number }
+    oldestQueuedSec?: number | null
+    nodes?: { online?: number | null; total?: number | null }
+    recent?: { id?: string; status?: string; nodeId?: string | null; ageSec?: number }[]
+    sampled?: number
+    truncated?: boolean
+  }
+  if (!d.totals) return <p className={css.muted}>—</p>
+  const t = d.totals
+  const nodes = d.nodes
+  return (
+    <div>
+      <div className={css.pillRow}>
+        <span className={`${css.pill} ${css.pillDim}`}>queued {t.queued ?? 0}</span>
+        <span className={`${css.pill} ${(t.running ?? 0) > 0 ? css.pill : css.pillDim}`}>running {t.running ?? 0}</span>
+        <span className={`${css.pill} ${css.pillDim}`}>ok 24h {t.succeeded24h ?? 0}</span>
+        <span className={`${css.pill} ${(t.failed24h ?? 0) > 0 ? css.pillWarn : css.pillDim}`}>fail 24h {t.failed24h ?? 0}</span>
+        {(t.blocked24h ?? 0) > 0 && <span className={`${css.pill} ${css.pillWarn}`}>blocked 24h {t.blocked24h}</span>}
+        <span className={`${css.pill} ${css.pillDim}`}>executors {nodes?.online ?? '—'}/{nodes?.total ?? '—'}</span>
+      </div>
+      <p className={css.muted}>
+        最老 queued：{fmtAgeSec(d.oldestQueuedSec)}
+        {d.truncated ? ` · 仅最新 ${d.sampled ?? 500} 条` : ''}
+      </p>
+      {(d.recent ?? []).length > 0 && (
+        <table className={css.table}>
+          <thead><tr><th>任务</th><th>状态</th><th>节点</th><th className={css.num}>年龄</th></tr></thead>
+          <tbody>
+            {(d.recent ?? []).slice(0, 8).map((r, i) => (
+              <tr key={i}>
+                <td className={css.mono}>{(r.id ?? '').replace(/^task-/, '').slice(0, 8)}</td>
+                <td className={r.status === 'failed' ? css.errText : r.status === 'blocked' ? css.warnText : css.okText}>{r.status ?? '—'}</td>
+                <td>{r.nodeId ?? '—'}</td>
+                <td className={css.num}>{fmtAgeSec(r.ageSec)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
 function TrendChart({ data, t }: { data: unknown; t: (k: string) => string }) {
   if (data == null || typeof data !== 'object') {
     return <p className={css.muted}>—</p>
@@ -964,6 +1049,8 @@ function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
       <div className={css.cardBody}>
         {hasError ? (
           <p className={css.error}>⚠️ {snap?.error || (d as { error?: string }).error}</p>
+        ) : widget.type === 'tasks' ? (
+          <TasksCard data={d} />
         ) : widget.type === 'stat' ? (
           <StatCard data={d} t={t} />
         ) : widget.type === 'matrix' ? (

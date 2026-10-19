@@ -25,7 +25,7 @@
 
 import Schema from '@deepseek-ai/schemastery'
 import { execFile } from 'node:child_process'
-import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync, appendFileSync, renameSync } from 'node:fs'
+import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync, appendFileSync, renameSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir, hostname } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -39,6 +39,17 @@ export const name = 'dsh-dashboards'
 export const inject = ['webServer']
 
 export const Config = Schema.object({
+  /**
+   * 角色：primary（默认）= 本实例负责采集/落盘/告警；mirror = 完全不采集、不落盘、
+   * 不告警，只把 /dashboards/* 透明反代到 upstreamUrl —— 用于第二个 DSH 宿主
+   * （如 Electron 桌面档）只想显示同一块看板。理由：两宿主共用 ~/.dsh，各自采集
+   * 会重复外呼，并把同一批 history/store 文件双写（无跨进程锁）。
+   */
+  role: Schema.string().description('primary（默认）| mirror（只反代，不采集不落盘）'),
+  /** mirror 模式的上游宿主基址（默认 http://127.0.0.1:3080，即常驻 web 宿主）。 */
+  upstreamUrl: Schema.string().description('mirror 上游宿主基址，如 http://127.0.0.1:3080'),
+  /** mirror 反代超时 ms。 */
+  upstreamTimeoutMs: Schema.number().description('mirror 反代超时 ms（默认 30000）'),
   /** los-gateway 基址（默认 127.0.0.1:8080）。 */
   losUrl: Schema.string(),
   /** los .env 文件路径；未显式给 operatorToken 时从中读取 LOS_OPERATOR_TOKEN。 */
@@ -205,7 +216,7 @@ const Z4PRO_HEALTH_SCRIPT = join(homedir(), 'syncfolder/project/dsfolder/scripts
 
 /** widget endpoint 白名单（防 PUT 注入任意路径）。 */
 const ALLOWED_ENDPOINTS = new Set([
-  '/dashboards/los/usage', '/dashboards/los/trends', '/dashboards/los/metrics', '/dashboards/los/nodes',
+  '/dashboards/los/usage', '/dashboards/los/trends', '/dashboards/los/metrics', '/dashboards/los/nodes', '/dashboards/los/tasks',
   '/dashboards/macos', '/dashboards/macos/history', '/dashboards/macos/insights', '/dashboards/probe', '/dashboards/glances', '/dashboards/kuma',
   '/dashboards/feed/digests', '/dashboards/surge/ai-reputation', '/dashboards/surge/packy', '/dashboards/ai-quota',
   '/dashboards/dsh/usage',
@@ -247,6 +258,7 @@ const DEFAULT_TARGETS = [
 const DEFAULT_WIDGETS = [
   { id: 'los-usage', type: 'stat', endpoint: '/dashboards/los/usage', title: 'LLM 用量 24h', refreshMs: 60000 },
   { id: 'los-nodes', type: 'matrix', endpoint: '/dashboards/los/nodes', title: '执行节点', refreshMs: 30000 },
+  { id: 'los-tasks', type: 'tasks', endpoint: '/dashboards/los/tasks', title: '任务队列', refreshMs: 30000 },
   { id: 'los-latency', type: 'chart', endpoint: '/dashboards/los/trends', title: 'provider 延迟', refreshMs: 300000 },
   { id: 'mbp-load', type: 'chart', endpoint: '/dashboards/macos/history', title: '本机负载', refreshMs: 30000 },
   { id: 'mbp-mem', type: 'stat', endpoint: '/dashboards/macos', title: '本机内存', refreshMs: 30000 },
@@ -275,6 +287,10 @@ function resolveConfig(config) {
   const losUrl = c.losUrl ?? process.env.LOS_GATEWAY_URL ?? 'http://127.0.0.1:8080'
   const losEnvFile = c.losEnvFile ?? process.env.LOS_ENV_FILE ?? null
   return {
+    // 角色与 mirror 上游（不认识的值一律当 primary，避免拼错配置就静默不采集）
+    role: c.role === 'mirror' ? 'mirror' : 'primary',
+    upstreamUrl: String(c.upstreamUrl ?? process.env.DSH_DASHBOARDS_UPSTREAM ?? 'http://127.0.0.1:3080').replace(/\/+$/, ''),
+    upstreamTimeoutMs: c.upstreamTimeoutMs ?? 30_000,
     losUrl,
     losEnvFile,
     losPollMs: c.losPollMs ?? 60000,
@@ -499,6 +515,80 @@ async function collectLosNodes(cfg, tokens) {
       ? Math.max(0, Math.round((Date.now() - new Date(n.lastHeartbeatAt).getTime()) / 1000))
       : null,
   }))
+}
+
+/**
+ * los 任务队列快照（只读）。数据来自网关 `/tasks` + `/nodes`，本插件只做聚合，
+ * 不直连 Postgres、不触发/取消任务。
+ *
+ * 口径说明（卡片上也要能看到）：
+ * - `succeeded24h` / `failed24h` 按 `updatedAt`（终止态的任务没有 `finishedAt`；
+ *   实测 succeeded/failed 的 finishedAt 为 null，用 finishedAt 会把所有终态漏掉）。
+ * - `/tasks?limit=500` 是最新 500 条；`truncated` 表示可能还有更老的终态没被计入。
+ * - `oldestQueuedSec` 只对当前 queued 计算；没有 queued 时为 null。
+ */
+async function collectLosTasks(cfg, tokens) {
+  const [tasksRes, nodesRes] = await Promise.all([
+    losFetch(cfg, tokens, '/tasks?limit=500', { operator: true }),
+    losFetch(cfg, tokens, '/nodes', { operator: true }),
+  ])
+  const tasks = await tasksRes.json()
+  const nodes = await nodesRes.json()
+  if (!Array.isArray(tasks)) return { error: 'los /tasks 返回非数组' }
+  const now = Date.now()
+  const cutoff = now - 24 * 3600_000
+  const byStatus = {}
+  let oldestQueuedAt = null
+  const recent = []
+  for (const t of tasks) {
+    const st = String(t?.status ?? 'unknown')
+    byStatus[st] = (byStatus[st] ?? 0) + 1
+    const created = t?.createdAt ? Date.parse(t.createdAt) : NaN
+    if (st === 'queued' && Number.isFinite(created) && (oldestQueuedAt == null || created < oldestQueuedAt)) oldestQueuedAt = created
+    const updated = t?.updatedAt ? Date.parse(t.updatedAt) : NaN
+    // 只把“当前活跃”或“24h 内失败/阻塞”放进最近列表；10-07 的 77 条 blocked
+    // 是历史遗留，计入 totals 但不能霸占卡片。
+    const active = st === 'running' || st === 'queued'
+    const recentTerminal = (st === 'failed' || st === 'blocked') && Number.isFinite(updated) && updated >= cutoff
+    if ((active || recentTerminal) && Number.isFinite(updated)) {
+      recent.push({
+        id: String(t.id ?? ''),
+        status: st,
+        nodeId: t.nodeId ?? null,
+        projectId: t.projectId ?? null,
+        ageSec: Math.max(0, Math.round((now - (Number.isFinite(created) ? created : updated)) / 1000)),
+        updatedAt: t.updatedAt ?? null,
+      })
+    }
+  }
+  recent.sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')))
+  const executors = Array.isArray(nodes)
+    ? nodes.filter((n) => (n?.nodeKind ?? 'executor') === 'executor')
+    : []
+  const online = Array.isArray(nodes) ? executors.filter((n) => n?.status === 'online').length : null
+  const total = Array.isArray(nodes) ? executors.length : null
+  const terminal24h = tasks.filter((t) => {
+    const st = String(t?.status ?? '')
+    const updated = t?.updatedAt ? Date.parse(t.updatedAt) : NaN
+    return (st === 'succeeded' || st === 'failed' || st === 'blocked') && Number.isFinite(updated) && updated >= cutoff
+  })
+  return {
+    generatedAt: new Date(now).toISOString(),
+    totals: {
+      queued: byStatus.queued ?? 0,
+      running: byStatus.running ?? 0,
+      blocked: byStatus.blocked ?? 0,
+      succeeded24h: terminal24h.filter((t) => t.status === 'succeeded').length,
+      failed24h: terminal24h.filter((t) => t.status === 'failed').length,
+      blocked24h: terminal24h.filter((t) => t.status === 'blocked').length,
+    },
+    byStatus,
+    oldestQueuedSec: oldestQueuedAt == null ? null : Math.max(0, Math.round((now - oldestQueuedAt) / 1000)),
+    nodes: { online, total },
+    recent: recent.slice(0, 8),
+    sampled: tasks.length,
+    truncated: tasks.length >= 500,
+  }
 }
 
 /**
@@ -1529,7 +1619,7 @@ function round2(n) { return Math.round(n * 100) / 100 }
 // 2026-10-08：1 → 2，新增 xproj-sessions / xproj-pain 两张内置卡。
 // ★ 必须 bump：store 一旦存在就完全取代 DEFAULT_WIDGETS，不 bump 则新卡对
 //   **已有安装静默不可见**（surge-packy / z4pro-health 踩过同一个坑）。
-const DEFAULT_WIDGETS_VERSION = 2
+const DEFAULT_WIDGETS_VERSION = 3
 
 function loadWidgetStore() {
   const env = readJsonEnvelope(WIDGETS_FILE, 'widgets')
@@ -1639,6 +1729,15 @@ function saveProbeTargets(targets, expectedRevision = null) {
   }
   if (!cleaned.length) {
     // 空列表 = 重置回默认（删除 store，回落 Config.probe.targets / DEFAULT_TARGETS）
+    // 2026-10-12：删前留时间戳副本。`PUT {targets:[]}` 是**破坏性**语义，而它长得
+    // 跟"清空/无操作"很像 —— 当天就有人（agent 探鉴权面）用它一次性删掉了整张表且
+    // 无法恢复。与 storages 里 widgets.json.bak-* 的手工惯例对齐。
+    try {
+      if (existsSync(PROBE_FILE)) {
+        const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-')
+        copyFileSync(PROBE_FILE, `${PROBE_FILE}.bak-${stamp}`)
+      }
+    } catch { /* 备份失败不阻断重置 */ }
     try { rmSync(PROBE_FILE, { force: true }) } catch { /* ignore */ }
     return { ok: true, conflict: false, reset: true, revision: 0, targets: [] }
   }
@@ -1672,9 +1771,96 @@ function readPluginVersion() {
   }
 }
 
+/** ── mirror 模式：不采集/不落盘/不告警，把 /dashboards/* 透明反代给上游 ──────
+ * 用途：第二个 DSH 宿主（Electron 桌面档）只想显示同一块看板。
+ * 为什么必须这样：两宿主共用同一个 `~/.dsh`，各自采集会（1）重复外呼 13 个数据源、
+ * （2）`diskAlertTimer` 不受 idle 门控 ⇒ 重复飞书告警、（3）`history*.jsonl` /
+ * `probe-targets.json` / `widgets.json` 是同一批文件且无跨进程锁 ⇒ 重复点与丢更新。
+ * mirror 实例因此**不建任何 poller/timer、不写任何文件**，读与写都落到 primary。
+ */
+function registerMirror(ctx, cfg) {
+  const upstream = cfg.upstreamUrl
+  const stats = { proxied: 0, failed: 0, lastError: null, lastAt: null }
+
+  const readRawBody = (req) => new Promise((resolve) => {
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => resolve(Buffer.concat(chunks)))
+    req.on('error', () => resolve(Buffer.alloc(0)))
+  })
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/plugins/dsh-dashboards/status',
+    handler: (_req, res) => {
+      sendJson(res, 200, {
+        ok: true,
+        plugin: 'dsh-dashboards',
+        version: readPluginVersion(),
+        mode: 'mirror',
+        upstream,
+        counts: { proxied: stats.proxied, failed: stats.failed },
+        lastError: stats.lastError,
+        detail: {
+          note: 'mirror 实例：不采集、不落盘、不告警；/dashboards/* 反代到 upstream',
+          lastProxyAt: stats.lastAt,
+        },
+      })
+    },
+  }), 'dsh-dashboards: mirror status')
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'prefix',
+    path: '/dashboards',
+    handler: async (req, res) => {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+      const method = req.method ?? 'GET'
+      const target = upstream + url.pathname + url.search
+      const headers = {}
+      for (const [k, v] of Object.entries(req.headers)) {
+        const key = k.toLowerCase()
+        // host/cookie 不转发：不透传本宿主身份；上游插件路由本身免鉴权（实测 3080 ok）
+        if (key === 'host' || key === 'cookie' || key === 'connection' || key === 'content-length') continue
+        if (typeof v === 'string') headers[key] = v
+      }
+      const init = { method, headers, signal: AbortSignal.timeout(cfg.upstreamTimeoutMs) }
+      if (method !== 'GET' && method !== 'HEAD') init.body = await readRawBody(req)
+      try {
+        const r = await fetch(target, init)
+        const buf = Buffer.from(await r.arrayBuffer())
+        const out = {}
+        for (const [k, v] of r.headers.entries()) {
+          // fetch 已解压正文：编码/长度类头必须丢弃，否则下游解压失败
+          if (k === 'content-encoding' || k === 'content-length' || k === 'transfer-encoding') continue
+          out[k] = v
+        }
+        stats.proxied += 1
+        stats.lastAt = new Date().toISOString()
+        res.writeHead(r.status, out)
+        res.end(buf)
+      } catch (err) {
+        stats.failed += 1
+        stats.lastError = String(err?.message ?? err)
+        stats.lastAt = new Date().toISOString()
+        ctx.logger?.warn?.(`[dsh-dashboards] mirror 反代失败 ${method} ${url.pathname} → ${upstream}: ${stats.lastError}`)
+        sendJson(res, 502, {
+          ok: false, error: 'mirror upstream 不可达', upstream, path: url.pathname, detail: stats.lastError,
+        })
+      }
+    },
+  }), 'dsh-dashboards: mirror proxy /dashboards → upstream')
+
+  ctx.logger.info(`[dsh-dashboards] mirror 模式：不采集/不落盘/不告警，/dashboards/* → ${upstream}`)
+}
+
 /** ── 插件主体 ─────────────────────────────────────────────────────── */
 export function apply(ctx, config) {
   const cfg = resolveConfig(config)
+  // mirror 实例在创建任何 poller/timer/文件写入之前就分流走（见 registerMirror 注释）
+  if (cfg.role === 'mirror') {
+    registerMirror(ctx, cfg)
+    return
+  }
   const tokens = resolveTokens(cfg)
 
   // 各后端轮询器（los 按子路径各自缓存；macos/probe/glances/kuma 各一）
@@ -1684,6 +1870,7 @@ export function apply(ctx, config) {
   const losTrends = makePoller({ id: 'los-trends', collect: () => collectLosTrends(cfg, tokens), intervalMs: Math.max(cfg.losPollMs, 120000) })
   const losMetrics = makePoller({ id: 'los-metrics', collect: () => collectLosMetrics(cfg, tokens), intervalMs: Math.max(cfg.losPollMs, 120000) })
   const losNodes = makePoller({ id: 'los-nodes', collect: () => collectLosNodes(cfg, tokens), intervalMs: Math.max(cfg.losPollMs, 90000) })
+  const losTasks = makePoller({ id: 'los-tasks', collect: () => collectLosTasks(cfg, tokens), intervalMs: Math.max(cfg.losPollMs, 30000) })
   // 跨项目事实面：变化慢（投影每小时刷新）⇒ 5 分钟足够，不必跟着 losPollMs
   const xprojSessions = makePoller({ id: 'xproj-sessions', collect: () => collectXprojSessions(cfg, tokens), intervalMs: 300000 })
   const xprojPain = makePoller({ id: 'xproj-pain', collect: () => collectXprojPain(cfg, tokens), intervalMs: 300000 })
@@ -1889,6 +2076,7 @@ export function apply(ctx, config) {
     '/dashboards/los/trends': losTrends,
     '/dashboards/los/metrics': losMetrics,
     '/dashboards/los/nodes': losNodes,
+    '/dashboards/los/tasks': losTasks,
     '/dashboards/xproj/sessions': xprojSessions,
     '/dashboards/xproj/pain': xprojPain,
     '/dashboards/macos': macos,
@@ -1911,6 +2099,7 @@ export function apply(ctx, config) {
     startPoller(losTrends, Math.max(cfg.losPollMs, 120000)),
     startPoller(losMetrics, Math.max(cfg.losPollMs, 120000)),
     startPoller(losNodes, Math.max(cfg.losPollMs, 90000)),
+    startPoller(losTasks, Math.max(cfg.losPollMs, 30000)),
     startPoller(macos, cfg.macos.pollMs),
     startPoller(probe, cfg.probe.pollMs),
     startPoller(glances, cfg.glances.pollMs),
@@ -2044,7 +2233,7 @@ export function apply(ctx, config) {
       // P0-6 观测：出网清单与开关状态（哪些外呼被关掉了）
       egress: { disabled: egressInventory(cfg).filter((f) => !f.enabled).map((f) => f.id), total: egressInventory(cfg).length },
       backends: {
-        los: { usage: s(losUsage), trends: s(losTrends), metrics: s(losMetrics), nodes: s(losNodes) },
+        los: { usage: s(losUsage), trends: s(losTrends), metrics: s(losMetrics), nodes: s(losNodes), tasks: s(losTasks) },
         macos: { ...s(macos), enabled: cfg.macos.enabled },
         probe: s(probe),
         glances: { enabled: cfg.glances.enabled, ...s(glances) },
@@ -2135,6 +2324,7 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/los/trends') { sendJson(res, 200, await losTrends.get()); return }
         if (method === 'GET' && path === '/dashboards/los/metrics') { sendJson(res, 200, await losMetrics.get()); return }
         if (method === 'GET' && path === '/dashboards/los/nodes') { sendJson(res, 200, await losNodes.get()); return }
+        if (method === 'GET' && path === '/dashboards/los/tasks') { sendJson(res, 200, await losTasks.get()); return }
         if (method === 'GET' && path === '/dashboards/xproj/sessions') { sendJson(res, 200, await xprojSessions.get()); return }
         if (method === 'GET' && path === '/dashboards/xproj/pain') { sendJson(res, 200, await xprojPain.get()); return }
         if (method === 'GET' && path === '/dashboards/macos') { const s = await macos.get(); if (cfg.macos.enabled && !s.data) await macos.refresh(); sendJson(res, 200, s); return }
