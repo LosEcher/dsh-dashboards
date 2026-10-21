@@ -47,26 +47,46 @@ const healthy = () => ({
       zspace_dd3bbnazuexndeaz: { state: 'shutoff', autostart: 'disable', vncListen: '0.0.0.0' },
     },
     frpTunnels: 0,
+    // T1 备份基线：相册正在跑、进程存活、队列已知 8 个数据集
+    t1Sync: {
+      available: true,
+      reason: null,
+      current: 'album',
+      status: 'running',
+      via: 'node34',
+      attempts: 3,
+      updated: '2026-10-21T23:57:08+08:00',
+      percent: 11.91,
+      filesDone: 897,
+      totalFiles: 6005,
+      elapsedSec: 2268,
+      etaSec: 22585,
+      alive: true,
+      queueKnown: true,
+      doneDatasets: 0,
+      totalDatasets: 8,
+      pending: ['album', 'wechat', 'photos'],
+    },
   },
   findings: [],
 })
 
-test('z4proToRows: 健康基线 → 6 行固定清单且全 ok', () => {
+test('z4proToRows: 健康基线 → 7 行固定清单（含 T1 备份）且 VNC 行失败', () => {
   const r = z4proToRows(healthy())
-  assert.equal(r.total, 6)
-  assert.equal(r.ok, 5) // VNC 行会因第二台 VM 非 loopback 而失败
+  assert.equal(r.total, 7)
+  assert.equal(r.ok, 6) // VNC 行会因第二台 VM 非 loopback 而失败
   assert.equal(r.verdict, 'ok')
   assert.deepEqual(
     r.results.map((x) => x.name),
-    ['主机 / 内存', '磁盘 SMART (6 块)', '存储池 (2 个)', '虚拟机 ubuntuVm', 'VNC 暴露面', 'frp 穿透'],
+    ['主机 / 内存', '磁盘 SMART (6 块)', '存储池 (2 个)', '虚拟机 ubuntuVm', 'T1 备份', 'VNC 暴露面', 'frp 穿透'],
   )
 })
 
-test('z4proToRows: 若所有 VM 都是 loopback，则 6/6 全绿', () => {
+test('z4proToRows: 若所有 VM 都是 loopback，则 7/7 全绿', () => {
   const p = healthy()
   p.summary.vms.zspace_dd3bbnazuexndeaz.vncListen = '127.0.0.1'
   const r = z4proToRows(p)
-  assert.equal(r.ok, 6)
+  assert.equal(r.ok, 7)
   assert.equal(r.down, 0)
   assert.equal(r.degraded, 0)
 })
@@ -159,7 +179,7 @@ test('z4proToRows: 未覆盖的 crit/warn finding 追加为补充行（不被静
     { level: 'warn', key: 'temp-extra', msg: '温度偏高' },
   ]
   const r = z4proToRows(p)
-  assert.equal(r.total, 8)
+  assert.equal(r.total, 9) // 7 行固定清单（含 T1 备份）+ 2 条未覆盖 finding
   const eo = r.results.find((x) => x.name === 'earlyoom')
   assert.equal(eo.ok, false)
   assert.equal(eo.degraded, false) // crit => down
@@ -176,8 +196,8 @@ test('z4proToRows: covered key 与 info 级 finding 不产生重复行', () => {
     { level: 'info', key: 'vm', msg: '非关键 VM 关机（按设计）' },
   ]
   const r = z4proToRows(p)
-  assert.equal(r.total, 6)
-  assert.equal(r.ok, 6)
+  assert.equal(r.total, 7)
+  assert.equal(r.ok, 7)
 })
 
 test('z4proToRows: 防御——null / 非对象 / 空对象 → 空结果而非抛错', () => {
@@ -198,4 +218,78 @@ test('z4proToRows: summary 缺字段时不抛错（脚本降级路径）', () =>
   assert.equal(typeof r.total, 'number')
   assert.equal(r.results[0].name, '主机 / 内存')
   assert.match(r.results[0].detail, /X/)
+})
+
+// ── T1 备份行（summary.t1Sync）────────────────────────────────────────────
+// 这一组钉住的是"诚实性"：读不到 ≠ 完成 0 个；state 说 running 但没进程 ≠ 健康。
+
+test('z4proToRows: 老载荷无 t1Sync → 不凭空造行（6 行）', () => {
+  const p = healthy()
+  delete p.summary.t1Sync
+  const r = z4proToRows(p)
+  assert.equal(r.total, 6)
+  assert.equal(
+    r.results.some((x) => x.name === 'T1 备份'),
+    false,
+  )
+})
+
+test('z4proToRows: t1Sync.available=false → 该行 degraded 且写明原因（不是 0 个完成）', () => {
+  const p = healthy()
+  p.summary.t1Sync = { available: false, reason: '未读到 syno-sync-state（keeper 未安装或从未运行）' }
+  const row = z4proToRows(p).results.find((x) => x.name === 'T1 备份')
+  assert.equal(row.ok, false)
+  assert.equal(row.degraded, true)
+  assert.match(row.detail, /状态未知/)
+  assert.match(row.detail, /syno-sync-state/)
+  assert.doesNotMatch(row.detail, /已完成 0\//)
+})
+
+test('z4proToRows: running + alive → ok，detail 含百分比/ETA/via', () => {
+  const row = z4proToRows(healthy()).results.find((x) => x.name === 'T1 备份')
+  assert.equal(row.ok, true)
+  assert.equal(row.degraded, false)
+  assert.match(row.detail, /album 11\.91%/)
+  assert.match(row.detail, /文件 897\/6005/)
+  assert.match(row.detail, /ETA 6\.3h/)
+  assert.match(row.detail, /via node34/)
+  assert.match(row.detail, /进程存活/)
+})
+
+test('z4proToRows: state=running 但没有 restic 进程 → degraded（keeper 未拉起/冷却中）', () => {
+  const p = healthy()
+  p.summary.t1Sync.alive = false
+  const row = z4proToRows(p).results.find((x) => x.name === 'T1 备份')
+  assert.equal(row.ok, false)
+  assert.equal(row.degraded, true)
+  assert.match(row.detail, /无 restic 进程/)
+})
+
+test('z4proToRows: blocked → degraded 且给出尝试次数与自愈预期', () => {
+  const p = healthy()
+  Object.assign(p.summary.t1Sync, { status: 'blocked', attempts: 8, alive: false })
+  const row = z4proToRows(p).results.find((x) => x.name === 'T1 备份')
+  assert.equal(row.ok, false)
+  assert.equal(row.degraded, true)
+  assert.match(row.detail, /blocked/)
+  assert.match(row.detail, /第 8 次/)
+  assert.match(row.detail, /冷却 6h/)
+})
+
+test('z4proToRows: 全部数据集完成 → ok 且写"全部 N 个已完成"', () => {
+  const p = healthy()
+  Object.assign(p.summary.t1Sync, { status: null, current: null, alive: false, doneDatasets: 8, pending: [] })
+  const row = z4proToRows(p).results.find((x) => x.name === 'T1 备份')
+  assert.equal(row.ok, true)
+  assert.equal(row.degraded, false)
+  assert.match(row.detail, /全部 8 个数据集已完成/)
+})
+
+test('z4proToRows: percent 为 null → 渲染 ? 而不是 null%（缺值不伪装成 0）', () => {
+  const p = healthy()
+  p.summary.t1Sync.percent = null
+  const row = z4proToRows(p).results.find((x) => x.name === 'T1 备份')
+  assert.equal(row.ok, true)
+  assert.match(row.detail, /album \?/)
+  assert.doesNotMatch(row.detail, /null/)
 })
