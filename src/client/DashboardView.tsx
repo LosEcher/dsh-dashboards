@@ -13,7 +13,7 @@ import css from './DashboardView.module.css'
 
 export interface WidgetConfig {
   id: string
-  type: 'stat' | 'matrix' | 'chart' | 'list' | 'feed' | 'surge' | 'packy' | 'tasks'
+  type: 'stat' | 'matrix' | 'chart' | 'list' | 'feed' | 'surge' | 'packy' | 'tasks' | 'disk'
   endpoint: string
   title: string
   refreshMs: number
@@ -437,6 +437,105 @@ interface NodeRow {
   capacity?: { cpuCores?: number; cpuLoad1m?: number; memoryTotalMb?: number; memoryAvailableMb?: number; platform?: string; arch?: string } | null
   heartbeatAgeSec?: number | null
   connectModes?: string[]
+}
+
+/** 磁盘三口径（2026-10-22）：硬可用 / 可清除 / 有效可用。
+ *  一个量只有一个用途 —— available 只回答"不回收任何东西还能写多少"、purgeable 只回答
+ *  "系统还有没有东西可回收"、effective 只用来算已用%。**刻意不并列三个"可用空间"数字**：
+ *  并列会逼读者做减法（91 − 34 = 57？），等于在界面上再造第四种口径 —— 那正是这次要消掉的东西。
+ *  `level` 由 host 用与告警同一个 judgeDiskAlert 算出，客户端不重复实现阈值。 */
+interface DiskSnapshot {
+  totalBytes?: number | null
+  availableBytes?: number | null
+  purgeableBytes?: number | null
+  effectiveBytes?: number | null
+  hardUsedPct?: number | null
+  effectiveUsedPct?: number | null
+  source?: string | null
+  degraded?: boolean
+  reasons?: string[]
+  level?: 'ok' | 'warn' | 'critical'
+  asOf?: string | null
+  snapshots?: { count?: number | null; latestAt?: string | null; error?: string | null } | null
+  crossCheck?: { ok?: boolean; deltaBytes?: number | null } | null
+}
+
+const fmtGiB = (v: number | null | undefined): string => (v == null ? '—' : `${(v / 1024 ** 3).toFixed(1)} GiB`)
+
+/** 新鲜度渲染成词（V1：不渲染裸时间戳、未来时间夹到 0）。 */
+const freshWord = (iso: string | null | undefined): string => {
+  if (!iso) return '—'
+  const t = Date.parse(iso)
+  if (!Number.isFinite(t)) return '—'
+  const sec = Math.max(0, Math.round((Date.now() - t) / 1000))
+  if (sec < 90) return '刚刚'
+  const min = Math.round(sec / 60)
+  if (min < 60) return `${min} 分钟前`
+  const h = Math.round(min / 60)
+  return `${h} 小时前`
+}
+
+function DiskCard({ data, t }: { data: unknown; t: (k: string) => string }) {
+  if (data == null || typeof data !== 'object') return <p className={css.muted}>—</p>
+  const disk = (data as { disk?: DiskSnapshot | null }).disk
+  // 缺值渲染 —（V2）：probe 不可用是"没测到"，不是"可清除 0"
+  if (!disk) return <p className={css.muted}>— <span className={css.muted}>{t('disk.unavailable')}</span></p>
+  const total = disk.totalBytes ?? null
+  const avail = disk.availableBytes ?? null
+  const purge = disk.purgeableBytes ?? null
+  // effective 只参与「真正已用」段与百分比，**不再单独显示成第二个可用空间数字**：
+  // 卡片上出现两个「可用」值正是这次要消掉的困惑源。
+  const eff = disk.effectiveBytes ?? null
+  // 三段之和 == 总容量：真正已用 / 可清除 / 空闲
+  const usedBytes = total != null && eff != null ? Math.max(0, total - eff) : null
+  const frac = (v: number | null): number =>
+    total && total > 0 && v != null ? Math.max(0, Math.min(100, (v / total) * 100)) : 0
+  const showBar = total != null && usedBytes != null && purge != null && avail != null
+  const dot: StateDotState = disk.level === 'critical' ? 'error' : disk.level === 'warn' ? 'warning' : 'done'
+  const snaps = disk.snapshots
+  const degradedNote = disk.degraded
+    ? [disk.reasons?.includes('no-probe') ? t('disk.degradedProbe') : null,
+       disk.reasons?.includes('df-mismatch') ? t('disk.degradedMismatch') : null,
+       disk.reasons?.includes('important-lt-available') ? t('disk.degradedInverted') : null,
+      ].filter(Boolean).join('；')
+    : ''
+  return (
+    <div>
+      <div className={css.diskHead}>
+        <span className={css.rowDot}><StateDot state={dot} size={8} /></span>
+        <span className={css.diskPct}>{pct(disk.effectiveUsedPct)}</span>
+        <span className={css.muted}>{t('disk.usedOf')}</span>
+        <span className={css.diskFresh}>{freshWord(disk.asOf)}</span>
+      </div>
+      {showBar ? (
+        <div className={css.diskBar} role="img" aria-label={`${t('disk.usedOf')} ${pct(disk.effectiveUsedPct)}`}>
+          <span className={`${css.diskSeg} ${css.diskSegUsed}`} style={{ width: `${frac(usedBytes)}%` }} />
+          <span className={`${css.diskSeg} ${css.diskSegPurge}`} style={{ width: `${frac(purge)}%` }} />
+          <span className={`${css.diskSeg} ${css.diskSegFree}`} style={{ width: `${frac(avail)}%` }} />
+        </div>
+      ) : (
+        <div className={css.diskBar} />
+      )}
+      <div className={css.diskLegend}>
+        <span className={`${css.pill} ${css.pillDim}`}>{t('disk.used')} {fmtGiB(usedBytes)}</span>
+        <span className={`${css.pill} ${css.pillDim}`}>{t('disk.purgeable')} {fmtGiB(purge)}</span>
+        <span className={`${css.pill} ${css.pillDim}`}>{t('disk.free')} {fmtGiB(avail)}</span>
+      </div>
+      <p className={css.diskNote}>
+        {avail != null
+          ? `${t('disk.writable')} ${fmtGiB(avail)}`
+          : t('disk.unavailable')}
+      </p>
+      <p className={css.diskNote}>
+        {purge == null
+          ? t('disk.purgeUnknown')
+          : snaps && snaps.count != null && snaps.count > 0
+            ? `${t('disk.purgeable')} ${fmtGiB(purge)} · ${snaps.count} ${t('disk.snapCount')}${snaps.latestAt ? `（${t('disk.snapLatest')} ${new Date(snaps.latestAt).toLocaleTimeString()}）` : ''}`
+            : `${t('disk.purgeable')} ${fmtGiB(purge)} · ${t('disk.snapUnknown')}`}
+      </p>
+      {degradedNote ? <p className={css.hint}>{degradedNote}</p> : null}
+    </div>
+  )
 }
 
 function NodeMatrix({ data, t }: { data: unknown; t: (k: string) => string }) {
@@ -1071,6 +1170,8 @@ function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
           <UsageCard data={d} />
         ) : widget.type === 'reconcile' ? (
           <ReconcileCard data={d} />
+        ) : widget.type === 'disk' ? (
+          <DiskCard data={d} t={t} />
         ) : (
           <p className={css.muted}>{t('noData')}</p>
         )}

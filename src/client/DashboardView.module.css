@@ -546,3 +546,62 @@
 .dayCell span:first-child {
   color: var(--dsw-alias-label-secondary);
 }
+
+/* ── 磁盘三口径（2026-10-22）：三段条 = 真正已用 / 可清除 / 空闲 ─────────── */
+.diskHead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.diskPct {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.1;
+  color: var(--dsw-alias-label-primary);
+}
+
+.diskFresh {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.diskBar {
+  display: flex;
+  height: 10px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l1);
+}
+
+.diskSeg {
+  transition: width 0.4s ease;
+}
+
+.diskSegUsed {
+  background: var(--dsw-alias-brand-primary);
+}
+
+.diskSegPurge {
+  background: var(--dsw-alias-state-warn-secondary);
+}
+
+.diskSegFree {
+  background: var(--dsw-alias-state-success-secondary);
+}
+
+.diskLegend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 2px;
+}
+
+.diskNote {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+}

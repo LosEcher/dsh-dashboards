@@ -127,6 +127,8 @@ test('aggregate skips unpriced routes but still counts tokens', () => {
     assert.equal(t.costUnknownCount, 1)
     assert.equal(t.estimatedCostUsd, 0)
     assert.equal(t.cacheHitRate, 0)
+    // 未计价必须能点名（防「新模型名静默归零」复发）
+    assert.deepEqual(d.unpricedModels, ['openrouter/nvidia/nemotron-3.5-lightning:free'])
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -265,6 +267,57 @@ test('增量拍不推进全量校准计时（否则 24h 校准永不触发）', 
     assert.ok(after > 0, '首次运行必须记录一次全量校准完成')
     runWithCache(root, cache)
     assert.equal(readCache(cache).lastFullScanMs, after, '普通增量拍不得改写 lastFullScanMs')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ── 2026-10-09 计费审计回归 ────────────────────────────────────────────────
+// 背景：docs/audits/2026-10-09-billing-cost-audit.md。站点 2026-09-10 12:00 起
+// 把 flash 改名为 deepseek-flash 并同步降价，原实现定价 key 只有旧名
+// deepseek-v4-flash ⇒ 2026-09-12 起全部落进未计价分支，卡片成本恒为 $0。
+// 夹具 token 组合固定（净 miss 输入 100k / 缓存读 800k / 输出 50k）：
+//   8/17 版单价 (1.5, 4.5, 0.05) 空闲 = 0.415 CNY，高峰 = 0.830
+//   9/10 版单价 (1.0, 4.0, 0.02) 空闲 = 0.316 CNY，高峰 = 0.632
+const TOK = { inputTokens: 100_000, cacheReadTokens: 800_000, outputTokens: 50_000 }
+const ev = (ts, model) => [
+  { type: 'request/header', time: ts, data: { header: { config: { provider: 'deepseek-official', model } } } },
+  { type: 'assistant/message', time: ts, data: { usage: TOK } },
+]
+const near = (actual, expected, label) =>
+  assert.ok(Math.abs(actual - expected) < 0.001, `${label}: ${actual} != ${expected}`)
+
+test('定价纪元：9/10 12:00 起新名与旧名同价（新价），之前用旧价', () => {
+  const root = makeFixture({
+    newName: ev(1789905600000, 'deepseek-flash'),        // 09-20 Sun 20:00 空闲
+    legacyName: ev(1789905600000, 'deepseek-v4-flash'),  // 同刻旧名 ⇒ 兼容路由，必须同价
+    oldEra: ev(1788264000000, 'deepseek-v4-flash'),      // 09-01 Tue 20:00 空闲（改价前）
+  })
+  try {
+    const d = run(root)
+    assert.equal(d.pricingAsOf, '2026-09-10')
+    assert.equal(d.totals.modelResponseCount, 3)
+    assert.equal(d.totals.costUnknownCount, 0, '新模型名不得再落进未计价分支')
+    assert.deepEqual(d.unpricedModels, [])
+    // 新纪元两条 0.316 + 旧纪元一条 0.415 = 1.047（若误用单一价表会得 0.948 或 1.245）
+    near(d.totals.estimatedCostCny, 0.316 * 2 + 0.415, 'era-aware CNY')
+    near(d.totals.estimatedCostUsd, (0.316 * 2 + 0.415) / 6.8, 'era-aware USD')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('峰谷：法定节假日全天空闲、非节假日工作日高峰、8/17 前不启用峰谷', () => {
+  const root = makeFixture({
+    nationalDay: ev(1790820000000, 'deepseek-flash'),   // 10-01 Thu 10:00 国庆 ⇒ 空闲
+    midAutumn: ev(1790301600000, 'deepseek-flash'),     // 09-25 Fri 10:00 中秋 ⇒ 空闲
+    normalThu: ev(1791424800000, 'deepseek-flash'),     // 10-08 Thu 10:00 非节假日 ⇒ 高峰 ×2
+    prePeakEra: ev(1786672800000, 'deepseek-v4-flash'), // 08-14 Fri 10:00 峰谷生效前 ⇒ ×1
+  })
+  try {
+    const d = run(root)
+    assert.equal(d.totals.costUnknownCount, 0)
+    near(d.totals.estimatedCostCny, 0.316 + 0.316 + 0.632 + 0.415, 'holiday-aware CNY')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

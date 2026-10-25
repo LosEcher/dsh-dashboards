@@ -25,15 +25,17 @@
 
 import Schema from '@deepseek-ai/schemastery'
 import { execFile } from 'node:child_process'
-import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync, appendFileSync, renameSync, copyFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { readFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync, appendFileSync, renameSync, copyFileSync, accessSync, constants as fsConstants } from 'node:fs'
+import { join, dirname } from 'node:path'
 import { homedir, hostname } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { createConnection } from 'node:net'
+import { createHash } from 'node:crypto'
 import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, parsePrometheus, parseKumaMetrics, fillGapPoints, historyPointChanged, shouldRefreshSlow, bucketKey, accumulateBucket, finalizeBucket, bucketFromRow, downsampleAnchored, HISTORY_METRICS, detectSustainedGrowth, detectStepChange, detectTrendDrift, z4proToRows } from './lib/parsers.mjs'
 import { makePoller, startPoller, touchActivity, isIdle, sleep } from './lib/poller.mjs'
 import { plausibleTimestamp, publishNetSample, readJsonEnvelope, saveEnvelopeReplace, capList, capText, egressEnabled, egressInventory } from './lib/safety.mjs'
 import { degradeAuthChannels } from './lib/quota-degrade.mjs'
+import { GIB_BYTES, formatGiB, dfHumanToBytes, parseDiskProbe, deriveDisk, crossCheck, judgeDiskAlert, decideAlert, diskTrendFromFree, formatDiskAlert, parseLocalSnapshots } from './lib/disk.mjs'
 
 export const name = 'dsh-dashboards'
 export const inject = ['webServer']
@@ -65,8 +67,16 @@ export const Config = Schema.object({
     pollMs: Schema.number(),
     /** 滚动历史点数（短趋势）。 */
     historyPoints: Schema.number(),
-    /** 磁盘水位告警阈值 %（0=关闭；仅 /System/Volumes/Data 数据卷）。 */
+    /** 磁盘水位告警阈值 %（**已废弃**：0=关闭=缺省；>0 时只按「硬占用」判，不按含可清除的 capacity）。
+     *  2026-10-22 起主判据是下面三个 GiB 地板——APFS 的百分比会随 Time Machine 快照保留策略漂移
+     *  （同一时刻 93% 与 81.4% 都真），用百分比当主判据就是历史上「10 天发 54 次同句」的来源。 */
     diskAlertPct: Schema.number(),
+    /** 硬可用地板 GiB：低于此值 ⇒ critical（真的必须动手清；缺省 15）。 */
+    diskAlertHardFreeGb: Schema.number(),
+    /** 可清除地板上限 GiB：可清除低于此值且硬可用不到 guard ⇒ warn（系统已无缓冲；缺省 2）。 */
+    diskAlertPurgeableFloorGb: Schema.number(),
+    /** 硬可用 guard GiB：可清除见底时，硬可用仍高于此值就不算危险（缺省 30）。 */
+    diskAlertHardFreeGuardGb: Schema.number(),
     /** 同一水位区间内的告警冷却 ms（防止每拍重复推送）。 */
     diskAlertCooldownMs: Schema.number(),
     /** 磁盘水位独立检查间隔 ms（不受看板 idle 门控，看板未打开也告警）。 */
@@ -262,6 +272,9 @@ const DEFAULT_WIDGETS = [
   { id: 'los-latency', type: 'chart', endpoint: '/dashboards/los/trends', title: 'provider 延迟', refreshMs: 300000 },
   { id: 'mbp-load', type: 'chart', endpoint: '/dashboards/macos/history', title: '本机负载', refreshMs: 30000 },
   { id: 'mbp-mem', type: 'stat', endpoint: '/dashboards/macos', title: '本机内存', refreshMs: 30000 },
+  // 磁盘（2026-10-22）：三口径卡片——硬可用 / 可清除 / 有效可用，数据来自 readDiskSnapshot()
+  // （与告警同一份快照）。60s 节奏：磁盘是慢变量，且 probe 每次约 45ms。
+  { id: 'mbp-disk', type: 'disk', endpoint: '/dashboards/macos', title: '本机磁盘', refreshMs: 60000 },
   { id: 'svc-probe', type: 'list', endpoint: '/dashboards/probe', title: '关键服务', refreshMs: 30000 },
   { id: 'kuma-status', type: 'list', endpoint: '/dashboards/kuma', title: '服务状态', refreshMs: 30000 },
   { id: 'feed-digests', type: 'feed', endpoint: '/dashboards/feed/digests', title: 'feed 采集摘要', refreshMs: 60000 },
@@ -299,8 +312,12 @@ function resolveConfig(config) {
       // 30s：与 los 节点心跳（30-45s）同频，图表粒度足够；los 已含同源 load/内存快照
       pollMs: c.macos?.pollMs ?? 30000,
       historyPoints: c.macos?.historyPoints ?? 120,
-      // 磁盘水位告警：>85% 触发，冷却 6h（同区间不重复推），检查间隔 5min
-      diskAlertPct: c.macos?.diskAlertPct ?? 85,
+      // 磁盘口径（2026-10-22 方案 A）：主判据 = 「两个缓冲是否见底」的绝对 GiB 地板，不是百分比。
+      // diskAlertPct 保留但默认 0（=关闭）：显式配了才当"硬占用天花板"，且只看 hardUsedPct。
+      diskAlertPct: c.macos?.diskAlertPct ?? 0,
+      diskAlertHardFreeGb: c.macos?.diskAlertHardFreeGb ?? 15,
+      diskAlertPurgeableFloorGb: c.macos?.diskAlertPurgeableFloorGb ?? 2,
+      diskAlertHardFreeGuardGb: c.macos?.diskAlertHardFreeGuardGb ?? 30,
       diskAlertCooldownMs: c.macos?.diskAlertCooldownMs ?? 6 * 3600_000,
       diskAlertCheckMs: c.macos?.diskAlertCheckMs ?? 300_000,
       // 慢变量降频（B2）：df/ps 分钟级，默认 5×pollMs（150s）复用缓存
@@ -704,6 +721,169 @@ function runExec(cmd, args, timeoutMs = PROBE_CMD_TIMEOUT_MS) {
   })
 }
 
+/** ── 磁盘口径（2026-10-22 方案 A：一源、一模型、一消费者）────────────────
+ * 此前磁盘有两个求值器：collectMacos 每 slowCmdMs 跑一次 `df -h`（只看得到硬可用），
+ * checkDiskAlert 又独立跑一次 `df -h` 按 capacity% 判阈值。于是同一台机器上
+ * 「看板说 93% 已满」与「iStat 说还有 91 GB 可用」并存，而 85% 阈值在含可清除口径下
+ * 10 天误报 54 次（FEISHU-MESSAGE-AUDIT）。
+ *
+ * 现在：readDiskSnapshot() 是**唯一**读盘入口（probe 优先、df 降级、30s 复用同一份），
+ * collectMacos 与 checkDiskAlert 都读它 ⇒ 两者不可能给出不同的事实。
+ *
+ * 数据源为什么是 Swift probe 而不是 df：
+ *   - df/statfs 只能给硬可用，没有 purgeable（Pulse 与 df 同源，所以它也和 iStat 差 50 GB）；
+ *   - 「用户还能写多少」的权威口径是 NSURL 的 availableCapacityForImportantUsage
+ *     （Finder / iStat Menus 用它，important − available == iStat 的 Purgeable）；
+ *   - osascript/JXA 这条路实测不可用：resourceValuesForKeys 对本组键返回空字典。
+ * 编译一次（实测 1.78s / 63KB），之后每次 40–50ms；源码在 tools/diskprobe.swift 里可 review，
+ * 缓存键 = 源码 sha256 ⇒ 改源码自动重编，不需要手工清缓存。
+ * 拿不到 probe 时**降级到 df 并让 purgeable=null**（渲染 `—`），绝不填 0（V2）。
+ */
+const DISK_PROBE_SRC = fileURLToPath(new URL('./tools/diskprobe.swift', import.meta.url))
+const DISK_PROBE_BIN = join(DEFAULTS_DIR, 'bin/diskprobe')
+const DISK_PROBE_TRUST = join(DEFAULTS_DIR, 'bin/diskprobe.src.sha256')
+const DISK_PROBE_RETRY_MS = 10 * 60_000
+const DISK_PROBE_TTL_MS = 30_000
+// 模块级 logger 挂钩：collectMacos/readDiskSnapshot 在 apply() 之外，ctx 拿不到（见 apply 顶部赋值）
+let moduleLogger = null
+
+let diskProbeState = { bin: null, reason: null, checkedAt: 0 }
+let diskCacheAt = 0
+let diskCacheSnap = null
+let diskInflight = null
+
+function sha256File(path) {
+  try {
+    return createHash('sha256').update(readFileSync(path)).digest('hex')
+  } catch {
+    return null
+  }
+}
+
+/** 保证 probe 二进制存在且与源码 sha256 一致；失败返回 null 并把原因留在 diskProbeState。 */
+async function ensureDiskProbeBinary() {
+  const now = Date.now()
+  if (diskProbeState.bin) return diskProbeState.bin
+  // 编译失败要节流重试：swiftc 缺失时每 30s 试一次的代价是每拍白起一个进程
+  if (diskProbeState.reason && now - diskProbeState.checkedAt < DISK_PROBE_RETRY_MS) return null
+  diskProbeState.checkedAt = now
+  const srcHash = sha256File(DISK_PROBE_SRC)
+  if (!srcHash) {
+    diskProbeState.reason = 'probe-source-missing'
+    moduleLogger?.warn?.(`[dsh-dashboards] 磁盘 probe 源码缺失: ${DISK_PROBE_SRC}`)
+    return null
+  }
+  let cachedHash = null
+  try {
+    cachedHash = readFileSync(DISK_PROBE_TRUST, 'utf8').trim()
+  } catch { /* 首次运行没有 trust 文件，走编译 */ }
+  if (cachedHash === srcHash) {
+    try {
+      accessSync(DISK_PROBE_BIN, fsConstants.X_OK)
+      diskProbeState = { bin: DISK_PROBE_BIN, reason: null, checkedAt: now }
+      return DISK_PROBE_BIN
+    } catch { /* 二进制被删了：重新编译 */ }
+  }
+  try {
+    mkdirSync(dirname(DISK_PROBE_BIN), { recursive: true })
+    const tmp = `${DISK_PROBE_BIN}.tmp-${process.pid}`
+    const r = await runExec('swiftc', ['-O', DISK_PROBE_SRC, '-o', tmp], 120_000)
+    if (r.error) throw new Error(r.error)
+    renameSync(tmp, DISK_PROBE_BIN)
+    writeFileSync(DISK_PROBE_TRUST, `${srcHash}\n`, 'utf8')
+    diskProbeState = { bin: DISK_PROBE_BIN, reason: null, checkedAt: now }
+    moduleLogger?.info?.(`[dsh-dashboards] 磁盘 probe 已编译: ${DISK_PROBE_BIN}`)
+    return DISK_PROBE_BIN
+  } catch (e) {
+    diskProbeState = { bin: null, reason: `probe-compile-failed: ${e.message}`.slice(0, 200), checkedAt: now }
+    moduleLogger?.warn?.(`[dsh-dashboards] 磁盘 probe 不可用（降级到 df，purgeable 记 null）: ${e.message}`)
+    return null
+  }
+}
+
+/** df -h 行（parseDf 的字符串形态）→ deriveDisk 需要的字节数；解析不出就返回 null（不猜）。 */
+function dfRowToBytes(row) {
+  if (!row) return null
+  const sizeBytes = dfHumanToBytes(row.size)
+  const availBytes = dfHumanToBytes(row.avail)
+  if (sizeBytes == null || availBytes == null) return null
+  return { sizeBytes, availBytes }
+}
+
+/** 本机 TM 本地快照清单（purgeable 的来源归因，纯展示，300s 缓存）。
+ *  `tmutil listlocalsnapshots /` 无需 root（实测用户态可读），输出形如
+ *  `com.apple.TimeMachine.2026-10-22-064618.local`（本地时间、秒精度）。
+ *  解析不出就用 null —— 卡片显示"来源未知"，绝不猜 0。 */
+const DISK_SNAP_TTL_MS = 300_000
+const diskSnapshotCache = { at: 0, value: null }
+async function readLocalTimeMachineSnapshots() {
+  const now = Date.now()
+  if (diskSnapshotCache.value && now - diskSnapshotCache.at < DISK_SNAP_TTL_MS) return diskSnapshotCache.value
+  const out = { count: null, latestAt: null, latestName: null, error: null }
+  const r = await runExec('tmutil', ['listlocalsnapshots', '/'], 8000)
+  if (r.error || !r.out) {
+    out.error = (r.error ?? 'empty-output').slice(0, 120)
+  } else {
+    // 解析在 lib/disk.mjs（纯函数 + 单测）；这里只管执行与缓存。
+    Object.assign(out, parseLocalSnapshots(r.out))
+  }
+  diskSnapshotCache.value = out
+  diskSnapshotCache.at = now
+  return out
+}
+
+/**
+ * 唯一读盘入口。返回 deriveDisk 结果 + asOf/crossCheck/degraded/reasons。
+ * @param {object|null} dfRow 调用方（collectMacos）已有的 df 行，用于降级与交叉校验；不传则只靠 probe。
+ */
+async function readDiskSnapshot(dfRow = null) {
+  const now = Date.now()
+  if (diskCacheSnap && now - diskCacheAt < DISK_PROBE_TTL_MS) return diskCacheSnap
+  if (diskInflight) return diskInflight
+  diskInflight = (async () => {
+    const reasons = []
+    let probe = null
+    const bin = await ensureDiskProbeBinary()
+    if (bin) {
+      const r = await runExec(bin, [], 5000)
+      if (!r.error && r.out) {
+        const parsed = parseDiskProbe(r.out)
+        if (parsed.probe) probe = parsed.probe
+        else reasons.push(`probe-${parsed.error}`)
+      } else {
+        reasons.push('probe-exec-failed')
+      }
+    } else {
+      reasons.push(diskProbeState.reason ?? 'probe-unavailable')
+    }
+    const snap = deriveDisk({ probe, dfRow: probe ? null : dfRow, reasons })
+    snap.asOf = new Date(now).toISOString()
+    snap.asOfMs = now
+    // 可清除空间的**来源归因**（纯展示）：purgeable 主体是本机 TM 快照链。它不是判据的
+    // 一部分（判据只看字节地板），只回答"这 51 GiB 是哪来的"——否则用户看到"可清除
+    // 51 GiB"无法判断该不该动。取不到就记 error，卡片渲染"来源未知"而不是编一个数。
+    snap.snapshots = await readLocalTimeMachineSnapshots().catch((e) => ({ count: null, latestAt: null, error: String(e?.message ?? e) }))
+    // 交叉校验：probe 与 df 的硬可用不该差太多（df -h 只有 1 Gi 粒度，容差取 max(3%, 1GiB)）
+    const dfBytes = dfRowToBytes(dfRow)
+    if (probe && dfBytes) {
+      const cc = crossCheck(snap, dfBytes)
+      snap.crossCheck = { ok: cc.ok, deltaBytes: cc.deltaBytes ?? null, toleranceBytes: cc.toleranceBytes ?? null }
+      if (!cc.ok) {
+        snap.degraded = true
+        snap.reasons.push('df-mismatch')
+      }
+    }
+    diskCacheAt = now
+    diskCacheSnap = snap
+    return snap
+  })()
+  try {
+    return await diskInflight
+  } finally {
+    diskInflight = null
+  }
+}
+
 let prevNet = null
 let prevNetAt = 0
 
@@ -750,6 +930,31 @@ async function collectMacos(cfg) {
   const memUsedPct = memTotalMb && availMb != null ? Math.round(((memTotalMb - availMb) / memTotalMb) * 1000) / 10 : null
   const cpu = iostat.out ? parseIostatCpu(iostat.out) : null
   const disks = df.out ? parseDf(df.out) : []
+  // 磁盘口径（2026-10-22）：disks 是 df 的原始行（保留给既有消费者/兼容），
+  // disk 是唯一判据对象（硬可用 / 可清除 / 有效可用 + 降级原因）。两者同一次采集得出，
+  // 不再让告警自己去跑第二个 df。
+  // ⚠️ 磁盘失败绝不能拖垮整个 macOS 载荷（load/mem/cpu 与它是同一个 collect）：
+  //    probe 编译/执行异常一律降级成 disk=null，由上层按「缺值」处理，不抛。
+  let disk = null
+  try {
+    const snap = await readDiskSnapshot(disks.find((d) => d.mount === '/System/Volumes/Data') ?? null)
+    // 卡片上的状态点必须由**与告警同一个** judgeDiskAlert 算出 —— 否则会出现"卡片绿灯、
+    // 告警照样推出去"这种最坏的自我矛盾。这里只把等级附上去，不另写一套阈值。
+    disk = snap == null ? null : {
+      ...snap,
+      level: judgeDiskAlert({
+        snap,
+        cfg: {
+          hardFreeGb: cfg.macos.diskAlertHardFreeGb,
+          purgeableFloorGb: cfg.macos.diskAlertPurgeableFloorGb,
+          hardFreeGuardGb: cfg.macos.diskAlertHardFreeGuardGb,
+          pctCeiling: cfg.macos.diskAlertPct > 0 ? cfg.macos.diskAlertPct : null,
+        },
+      }).level,
+    }
+  } catch (e) {
+    moduleLogger?.warn?.(`[dsh-dashboards] 磁盘快照失败（其余指标照常）: ${e?.message ?? e}`)
+  }
   const ifaces = netstat.out ? parseNetstatIb(netstat.out) : {}
   const processCount = ps.out ? ps.out.trim().split('\n').filter(Boolean).length : null
 
@@ -776,6 +981,7 @@ async function collectMacos(cfg) {
     cpu,
     memory: { totalMb: memTotalMb, freeMb, availMb, usedPct: memUsedPct },
     disks,
+    disk,
     net: { inBps: netInBps, outBps: netOutBps, ifaces: Object.fromEntries(Object.entries(ifaces).slice(0, 8)), rateReason: netRateReason },
     processCount,
   }
@@ -1619,7 +1825,7 @@ function round2(n) { return Math.round(n * 100) / 100 }
 // 2026-10-08：1 → 2，新增 xproj-sessions / xproj-pain 两张内置卡。
 // ★ 必须 bump：store 一旦存在就完全取代 DEFAULT_WIDGETS，不 bump 则新卡对
 //   **已有安装静默不可见**（surge-packy / z4pro-health 踩过同一个坑）。
-const DEFAULT_WIDGETS_VERSION = 3
+const DEFAULT_WIDGETS_VERSION = 4
 
 function loadWidgetStore() {
   const env = readJsonEnvelope(WIDGETS_FILE, 'widgets')
@@ -1856,6 +2062,9 @@ function registerMirror(ctx, cfg) {
 /** ── 插件主体 ─────────────────────────────────────────────────────── */
 export function apply(ctx, config) {
   const cfg = resolveConfig(config)
+  // 磁盘 probe 与 collectMacos 是模块级函数（apply 之外），编译失败时需要 logger 出口；
+  // 不注入的话「为什么 purgeable 是 —」在运维面完全看不到。
+  moduleLogger = ctx.logger
   // mirror 实例在创建任何 poller/timer/文件写入之前就分流走（见 registerMirror 注释）
   if (cfg.role === 'mirror') {
     registerMirror(ctx, cfg)
@@ -2113,28 +2322,36 @@ export function apply(ctx, config) {
     startPoller(z4pro, cfg.z4pro.pollMs),
   ]
 
-  // ── 磁盘水位告警（独立于看板 idle 门控：看板未打开也持续检查，主动推飞书） ──
-  // 状态：{ lastAlertAt, lastAlertPct } —— 冷却期内同水位区间不重复推；水位再升
-  // 3pp 跨档也触发（避免高水位下完全静默）；显著回落（< 阈值-3）复位冷却。
-  const diskAlertState = { lastAlertAt: 0, lastAlertPct: 0 }
+  // ── 磁盘告警（独立于看板 idle 门控：看板未打开也持续检查，主动推飞书） ──
+  // 2026-10-22 方案 A：判据从「capacity% ≥ 阈值」换成「两个缓冲是否见底」，并且与看板读
+  // **同一个** readDiskSnapshot()（30s 内同一份）——告警与卡片不可能再给出不同的事实。
+  // 为什么不用百分比：APFS 上 df 的 capacity 分母含 TM 快照钉住的块，会随保留策略漂移
+  // （同一时刻 93% 与 81.4% 都真），拿它当阈值就会周期性误报（同句 10 天发 54 次）。
+  // 状态：{ lastAlertAt, lastLevelRank, lastAvailBytes }；冷却期内同级不重推，
+  // 等级升高或硬可用又少 5 GiB 时跨档推送（decideAlert 纯函数，带单测）。
+  const diskAlertState = { lastAlertAt: 0, lastLevelRank: 0, lastAvailBytes: null }
+  let diskWasAlerting = false
 
-  // ── 磁盘趋势采样（2026-10-07 加；只为告警文案的「涨了还是降了」）──────────
-  // ⚠️ 只服务文案，**不**参与冷却判定：把告警冷却状态落盘是「投递频率」问题，
-  //    与本轮「文案可读性」是两件事（前者见 FEISHU-MESSAGE-AUDIT §3.1 的 P1-2）。
+  // ── 磁盘趋势采样 ────────────────────────────────────────────────────────
+  // 2026-10-22：样本从 {t, pct} 扩成 {t, pct, availBytes} —— 百分比会漂，真正可外推的是
+  // 「硬可用还剩多少字节」；旧样本没有 availBytes 时退回 pp 口径（不丢已有历史）。
+  // ⚠️ 只服务文案与 daysToFloor，**不**参与冷却判定（冷却属投递频率问题）。
   const DISK_SAMPLE_MAX_AGE_MS = 7 * 24 * 3600_000
   const DISK_SAMPLE_MIN_GAP_MS = 3600_000
   function readDiskSamples() {
     try {
       const arr = JSON.parse(readFileSync(DISK_SAMPLE_FILE, 'utf8'))
       return Array.isArray(arr)
-        ? arr.filter((x) => x && Number.isFinite(x.t) && Number.isFinite(x.pct))
+        ? arr.filter((x) => x && Number.isFinite(x.t) && (Number.isFinite(x.pct) || Number.isFinite(x.availBytes)))
         : []
     } catch { return [] }
   }
-  function recordDiskSample(pct, now) {
+  function recordDiskSample(snap, now) {
     const kept = readDiskSamples().filter((x) => x.t >= now - DISK_SAMPLE_MAX_AGE_MS)
     const last = kept[kept.length - 1]
-    if (!last || now - last.t >= DISK_SAMPLE_MIN_GAP_MS) kept.push({ t: now, pct })
+    if (!last || now - last.t >= DISK_SAMPLE_MIN_GAP_MS) {
+      kept.push({ t: now, pct: snap.effectiveUsedPct ?? null, availBytes: snap.availableBytes ?? null })
+    }
     try {
       mkdirSync(DEFAULTS_DIR, { recursive: true })
       const tmp = `${DISK_SAMPLE_FILE}.tmp`
@@ -2143,10 +2360,12 @@ export function apply(ctx, config) {
     } catch { /* 采样尽力而为：写不进去就不写趋势行，绝不影响告警本身 */ }
     return kept
   }
-  /** 找 ~24 小时前的采样点（容忍 18–30h），返回 {hours, refPct, delta}；没有则 null。 */
-  function diskTrendFrom(samples, pct, now) {
+  /** ~24 小时前的百分比采样点（容忍 18–30h）——probe 不可用、拿不到字节时的降级趋势。 */
+  function diskTrendFromPct(samples, pct, now) {
+    if (!Number.isFinite(pct)) return null
     let best = null
     for (const s of samples) {
+      if (!s || !Number.isFinite(s.t) || !Number.isFinite(s.pct)) continue
       const h = (now - s.t) / 3600_000
       if (h < 18 || h > 30) continue
       if (!best || Math.abs(h - 24) < Math.abs(best.h - 24)) best = { h, pct: s.pct }
@@ -2155,55 +2374,46 @@ export function apply(ctx, config) {
     return { hours: Math.round(best.h), refPct: best.pct, delta: pct - best.pct }
   }
   async function checkDiskAlert() {
-    const threshold = cfg.macos.diskAlertPct
-    if (!cfg.macos.enabled || !threshold || threshold <= 0) return
-    const df = await runExec('df', ['-h', '/System/Volumes/Data'])
-    if (df.error || !df.out) return
-    const disk = parseDf(df.out).find((d) => d.mount === '/System/Volumes/Data')
-    if (!disk) return
-    const pct = parseInt(String(disk.capacity).replace('%', ''), 10)
-    if (!Number.isFinite(pct)) return
-    const now = Date.now()
-    // 每次检查都采样（函数内保证每小时最多一个）——否则「24 小时前的采样」只在告警
-    // 频繁时才存在，趋势行会长期退化成「采样不足 24 小时」，等于没加。
-    const samples = recordDiskSample(pct, now)
-    if (pct >= threshold) {
-      const inCooldown = now - diskAlertState.lastAlertAt < cfg.macos.diskAlertCooldownMs
-      const escalated = pct >= diskAlertState.lastAlertPct + 3
-      if (!inCooldown || escalated) {
-        diskAlertState.lastAlertAt = now
-        diskAlertState.lastAlertPct = pct
-        // 文案契约（FEISHU-MESSAGE-COPY-REVIEW-2026-10-07.md §2.6）
-        //   旧版：「[磁盘告警] /System/Volumes/Data 已用 85%（355Gi/460Gi，剩余 63Gi）。建议运行 mole clean 或 CleanMyMac 清理。」
-        //   三个问题：① 同一事实写两遍（used/size 与 剩余）；② **没有趋势** ⇒ 读者判断不了
-        //   在变好还是变坏，于是同一句 10 天发了 54 次、零新增信息；③ 建议是固定咒语，
-        //   且已被现实否证（85% 一路涨到 94%）。增量信息只有「趋势」和「下一步」。
-        const trend = diskTrendFrom(samples, pct, now)
-        const lines = [`🟡 磁盘数据卷 ${disk.capacity}（剩 ${disk.avail}）`]
-        if (trend) {
-          const sign = trend.delta > 0 ? '+' : ''
-          const verb = trend.delta > 0 ? '，还在涨' : (trend.delta < 0 ? '，在回落' : '，持平')
-          lines.push(`· ${trend.hours} 小时 ${sign}${trend.delta}pp（${trend.refPct}% → ${pct}%）${verb}`)
-        } else {
-          lines.push('· 采样不足 24 小时，本次只报水位')
-        }
-        lines.push('→ 按目录归因：缓存 / 镜像 / 构建产物')
-        const text = lines.join('\n')
-        // P0-6：推送走飞书 webhook（本插件唯一的「往外部发内容」路径），单独可关。
-        // 关闭时仍记 lastAlertAt（冷却照走），只跳过推送本身。
-        if (egressEnabled(cfg, 'diskAlert')) {
-          execFile('bash', [join(HOME, 'scripts/feishu-push.sh'), text], { timeout: 20000 }, (err) => {
-            if (err) ctx.logger.warn?.(`[dsh-dashboards] 磁盘告警推送失败: ${err.message}`)
-          })
-        } else {
-          ctx.logger.info?.(`[dsh-dashboards] 磁盘告警推送已关闭（Config.egress.diskAlert=false），跳过: ${disk.capacity}`)
-        }
-        ctx.logger.info?.(`[dsh-dashboards] 磁盘水位告警: ${disk.mount} ${disk.capacity}（阈值 ${threshold}%）`)
-      }
-    } else if (pct < threshold - 3) {
-      diskAlertState.lastAlertAt = 0
-      diskAlertState.lastAlertPct = 0
+    if (!cfg.macos.enabled) return
+    const floors = {
+      hardFreeGb: cfg.macos.diskAlertHardFreeGb,
+      purgeableFloorGb: cfg.macos.diskAlertPurgeableFloorGb,
+      hardFreeGuardGb: cfg.macos.diskAlertHardFreeGuardGb,
+      // 废弃项：只在被显式配置（>0）时生效，且以 hardUsedPct 判，不看含可清除的 capacity
+      pctCeiling: cfg.macos.diskAlertPct > 0 ? cfg.macos.diskAlertPct : null,
+      cooldownMs: cfg.macos.diskAlertCooldownMs,
     }
+    const snap = await readDiskSnapshot()
+    if (!snap || snap.availableBytes == null) return
+    const now = Date.now()
+    // 每次都采样（函数内保证每小时最多一个）——否则「24 小时前的采样」只在告警频繁时
+    // 才存在，趋势行会长期退化成「采样不足 24 小时」，等于没加。
+    const samples = recordDiskSample(snap, now)
+    const hardFloorBytes = floors.hardFreeGb * GIB_BYTES
+    const trend = diskTrendFromFree(samples, snap.availableBytes, now, hardFloorBytes)
+    const judgement = judgeDiskAlert({ snap, cfg: floors, trend, now })
+    const decision = decideAlert(diskAlertState, judgement, snap, floors, now)
+    Object.assign(diskAlertState, decision.next)
+
+    if (!decision.emit) {
+      // 恢复时留一行日志（否则"从没响过"与"响过又好了"在日志里长得一样）
+      if (judgement.level === 'ok' && diskWasAlerting) ctx.logger.info?.(`[dsh-dashboards] 磁盘告警恢复: 硬可用 ${formatGiB(snap.availableBytes)}`)
+      diskWasAlerting = judgement.level === 'warn' || judgement.level === 'critical'
+      return
+    }
+    diskWasAlerting = true
+    const pctTrend = trend ? null : diskTrendFromPct(samples, snap.effectiveUsedPct, now)
+    const text = formatDiskAlert({ snap, judgement, trend, pctTrend }).join('\n')
+    // P0-6：推送走飞书 webhook（本插件唯一的「往外部发内容」路径），单独可关。
+    // 关闭时仍记状态（冷却照走），只跳过推送本身。
+    if (egressEnabled(cfg, 'diskAlert')) {
+      execFile('bash', [join(HOME, 'scripts/feishu-push.sh'), text], { timeout: 20000 }, (err) => {
+        if (err) ctx.logger.warn?.(`[dsh-dashboards] 磁盘告警推送失败: ${err.message}`)
+      })
+    } else {
+      ctx.logger.info?.(`[dsh-dashboards] 磁盘告警推送已关闭（Config.egress.diskAlert=false），跳过: ${judgement.reasons.join(',')}`)
+    }
+    ctx.logger.info?.(`[dsh-dashboards] 磁盘告警: level=${judgement.level} reasons=${judgement.reasons.join(',')} hard=${formatGiB(snap.availableBytes)} purge=${formatGiB(snap.purgeableBytes)} source=${snap.source}${snap.degraded ? ` degraded=${snap.reasons.join('|')}` : ''}`)
   }
   const diskAlertTimer = setInterval(() => { void checkDiskAlert() }, cfg.macos.diskAlertCheckMs)
   diskAlertTimer.unref?.()

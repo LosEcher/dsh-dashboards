@@ -32,6 +32,7 @@ inputTokens 含 cache-read，付费 prompt = inputTokens - cacheReadTokens。
 便于 P6 统一对账视图直接合并。
 """
 import argparse
+import datetime
 import glob
 import json
 import os
@@ -44,27 +45,80 @@ except ImportError:
     print(json.dumps({"error": "python zstandard 未安装：pip install zstandard"}, ensure_ascii=False), file=sys.stderr)
     sys.exit(2)
 
-# (provider, model) -> (promptPer1M, completionPer1M, cacheHitPer1M)
-# 数值复用 los packages/agent/src/model-profiles.ts（2026-08-22 核对）
-# (provider, model) -> 定价（CNY 每百万 tokens，低谷价）
-# 数值对齐 los packages/agent/src/model-profiles.ts（2026-08-23 同步）：
-# DeepSeek 8/17 起峰谷定价（高峰=低谷×2，北京 9-12/14-18 工作日），
-# 8/23 起周末全天低谷；cost 字段 USD = CNY ÷ cnyPerUsd（PBOC 中间价≈6.8）。
-PRICING = {
-    ("deepseek-official", "deepseek-v4-flash"): (1.5, 4.5, 0.05),
-    ("deepseek", "deepseek-v4-flash"): (1.5, 4.5, 0.05),
-    ("deepseek-official", "deepseek-v4-pro"): (4.5, 13.5, 0.15),
-    ("deepseek", "deepseek-v4-pro"): (4.5, 13.5, 0.15),
-    # 未知/未定价模型：cost 不计算（costUnknown 计数），tokens 仍计入
-}
+# ── 定价（CNY 每百万 tokens，**空闲价**；高峰 = 空闲 × PEAK_MULTIPLIER）──────
+# 真源：https://api-docs.deepseek.com/zh-cn/quick_start/pricing/
+# cost 字段 USD = CNY ÷ CNY_PER_USD（PBOC 中间价≈6.8；站点中英双页隐含汇率
+# 6.667(flash 列)/6.818(pro 列) 并不自洽，严格对账请用 estimatedCostCny）。
+#
+# 2026-10-09 审计修正两处漂移（docs/audits/2026-10-09-billing-cost-audit.md）：
+#   1) 站点 2026-09-10 12:00 起把 flash 模型名改为 `deepseek-flash` 并同步降价
+#      （1.5/4.5/0.05 → 1.0/4.0/0.02）。旧名 `deepseek-v4-flash` 仍可调用，但被
+#      路由到 V4.1-Flash 并按 Flash 单价计费 ⇒ 旧名视为同一 Flash 家族。
+#      原实现 key 只有旧名 ⇒ 9/12 起全部落进「未知模型」分支，成本恒为 0。
+#   2) 峰谷定价自 2026-08-17 00:00 才生效；高峰判定不含中国法定节假日。
+#
+# 价目按生效时间分代，用**事件时间**选表 —— 直接换表会让改价前的历史整段失真。
+BJ_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def _bj_ms(year, month, day, hour=0, minute=0):
+    """北京时间的某时刻 → epoch ms（价格纪元与节日判定统一走这里）。"""
+    return int(datetime.datetime(year, month, day, hour, minute, tzinfo=BJ_TZ).timestamp() * 1000)
+
 
 PEAK_MULTIPLIER = 2
 CNY_PER_USD = 6.8
-# 周末全天低谷规则自 2026-08-23 00:00（北京时间）起生效
-WEEKEND_FLAT_SINCE_MS = int(__import__("datetime").datetime(2026, 8, 23, 0, 0,
-    tzinfo=__import__("datetime").timezone(__import__("datetime").timedelta(hours=8))).timestamp() * 1000)
 
-CACHE_VERSION = 3
+# 峰谷定价生效（8/17 00:00 北京）；此前无峰谷概念，一律 ×1
+PEAK_PRICING_SINCE_MS = _bj_ms(2026, 8, 17)
+# 周末全天低谷规则自 8/23 00:00（北京时间）起生效（此前周末仍按高峰时段计）
+WEEKEND_FLAT_SINCE_MS = _bj_ms(2026, 8, 23)
+# V4.1-Flash 新价与改名同步生效：2026-09-10 12:00（北京时间）
+NEW_PRICE_FROM_MS = _bj_ms(2026, 9, 10, 12, 0)
+
+# 定价表版本标记：随输出发布（pricingAsOf），改价时必须同步更新
+PRICING_AS_OF = "2026-09-10"
+
+# (生效起点 ms, (promptPer1M, completionPer1M, cacheHitPer1M))，按起点降序匹配
+_FLASH_RATES = [
+    (NEW_PRICE_FROM_MS, (1.0, 4.0, 0.02)),  # V4.1-Flash / deepseek-flash
+    (0, (1.5, 4.5, 0.05)),                  # V4-Flash（8/17 版；8/17 前无独立真源，沿用近似）
+]
+_PRO_RATES = [
+    (0, (4.5, 13.5, 0.15)),                 # 两代一致（9/10 更新日志：计费方式保持不变）
+]
+# provider 与模型家族登记表：新增模型名必须在此登记，否则成本静默归零
+_DEEPSEEK_PROVIDERS = ("deepseek", "deepseek-official")
+_FLASH_MODELS = ("deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp")
+_PRO_MODELS = ("deepseek-v4-pro",)
+
+
+def _holiday_dates():
+    """2026 年中国法定节假日（国办发明电〔2025〕7号）。
+
+    真源：https://www.gov.cn/gongbao/2025/issue_12406/202511/content_7048922.html
+    高峰时段在这些日期全天空闲（站点价格页脚注 2）。
+    """
+    out = set()
+    for start, end in (
+        ((2026, 1, 1), (2026, 1, 3)),    # 元旦
+        ((2026, 2, 15), (2026, 2, 23)),  # 春节
+        ((2026, 4, 4), (2026, 4, 6)),    # 清明节
+        ((2026, 5, 1), (2026, 5, 5)),    # 劳动节
+        ((2026, 6, 19), (2026, 6, 21)),  # 端午节
+        ((2026, 9, 25), (2026, 9, 27)),  # 中秋节
+        ((2026, 10, 1), (2026, 10, 7)),  # 国庆节
+    ):
+        cur, last = datetime.date(*start), datetime.date(*end)
+        while cur <= last:
+            out.add(cur.isoformat())
+            cur += datetime.timedelta(days=1)
+    return frozenset(out)
+
+
+CHINA_HOLIDAYS = _holiday_dates()
+
+CACHE_VERSION = 4  # v4：定价表分代 + 节假日平谷（v3 缓存里存的是旧口径的已算好成本，必须丢弃）
 HOUR_MS = 3_600_000
 DAY_MS = 86_400_000
 # 缓存保留 90 天小时桶（窗口最远 7d，余量充足）
@@ -78,19 +132,45 @@ CACHE_FLUSH_EVERY_FILES = 64
 
 
 def peak_multiplier_at(ts_ms):
-    """DeepSeek 计费时段：工作日北京 09-12/14-18 高峰（×2）；8/23 起周末全天低谷。"""
-    import datetime as _dt
-    bj = _dt.datetime.fromtimestamp((ts_ms + 8 * 3600 * 1000) / 1000, _dt.timezone.utc)
-    dow = bj.weekday()
-    if dow >= 5:  # 周六(5)/周日(6)
-        return 1 if ts_ms >= WEEKEND_FLAT_SINCE_MS else PEAK_MULTIPLIER if (9 <= bj.hour < 12 or 14 <= bj.hour < 18) else 1
-    if 9 <= bj.hour < 12 or 14 <= bj.hour < 18:
-        return PEAK_MULTIPLIER
-    return 1
+    """DeepSeek 峰谷判定（北京时间）。
+
+    高峰 = 周一至周五、**非法定节假日**、09-12/14-18；其余（含周末与节假日
+    全天）空闲。峰谷定价自 2026-08-17 00:00 生效；周末全天空闲自 2026-08-23
+    00:00 生效（该日之前周末仍按高峰时段计）。
+    """
+    if ts_ms < PEAK_PRICING_SINCE_MS:
+        return 1
+    bj = datetime.datetime.fromtimestamp(ts_ms / 1000, BJ_TZ)
+    if bj.strftime("%Y-%m-%d") in CHINA_HOLIDAYS:
+        return 1
+    in_peak_hours = 9 <= bj.hour < 12 or 14 <= bj.hour < 18
+    if bj.weekday() >= 5 and ts_ms >= WEEKEND_FLAT_SINCE_MS:  # 周六/周日
+        return 1
+    return PEAK_MULTIPLIER if in_peak_hours else 1
+
+
+def rates_for(provider, model, ts_ms):
+    """按 (provider, model) 与**事件时间**取单价；未定价返回 None。
+
+    未定价 ⇒ cost_for 返回 None ⇒ 只累加 costUnknownCount。调用方据此把
+    模型名汇总进 unpricedModels，让「下一个未登记的新模型名」可见而非静默归零。
+    """
+    if provider not in _DEEPSEEK_PROVIDERS:
+        return None
+    if model in _PRO_MODELS:
+        table = _PRO_RATES
+    elif model in _FLASH_MODELS:
+        table = _FLASH_RATES
+    else:
+        return None
+    for from_ms, rates in table:
+        if ts_ms >= from_ms:
+            return rates
+    return table[-1][1]
 
 
 def cost_for(provider, model, prompt, completion, cache_read, ts_ms):
-    rates = PRICING.get((provider, model))
+    rates = rates_for(provider, model, ts_ms)
     if not rates:
         return None, None, None
     prompt_rate, completion_rate, cache_rate = rates
@@ -256,6 +336,7 @@ def main():
     by_model = {}
     by_day = {}
     totals = new_bucket()
+    unpriced_models = set()
     scanned_sessions = 0
     cache_reused = 0
     pruned_files = 0
@@ -342,6 +423,10 @@ def main():
             for model_key, mb in hour_entry["models"].items():
                 provider, _, model = model_key.partition("\u0000")
                 merge_bucket(by_model.setdefault((provider, model), new_bucket()), mb)
+                # 未计价路由的模型名单独汇总（防「新模型名静默归零」复发：
+                # 成本归零时界面必须能直接说出是哪个 provider/model 没登记）
+                if mb["costUnknownCount"]:
+                    unpriced_models.add(provider + "/" + model)
 
     if files_cache is not None:
         # 校准周期完成判定：保留条目全部在本周期内重扫过 ⇒ 记一次全量校准完成，
@@ -373,6 +458,10 @@ def main():
         "evidenceClass": "dsh_sessions",
         "from": args.from_ms,
         "to": args.to_ms,
+        # 定价表版本：改价后此处必须变化（漂移审计用；与 costUnknownCount 一起看）
+        "pricingAsOf": PRICING_AS_OF,
+        # 未计价路由的模型名（空数组 = 全部定价命中）
+        "unpricedModels": sorted(unpriced_models),
         "scannedSessions": scanned_sessions + cache_reused,
         "cacheReusedSessions": cache_reused,
         # 可观测性：窗口预剪枝规模与校准状态（排查「数字为何变小/是否在重扫」用）

@@ -27,6 +27,37 @@ GET/PUT /dashboards/widgets   widget 配置（PUT 带 {widgets:[…], revision?}
 GET/PUT /dashboards/probe-targets  服务探活目标（PUT 带 {targets:[…], revision?}；空数组=重置回默认；revision 不匹配回 409）
 ```
 
+> ⚠️ `PUT /dashboards/probe-targets {targets:[]}` 是**破坏性**语义（删 store）。2026-10-12
+> 该端点被当成"探鉴权面"的空请求打过一次，整张探针表当场消失且无副本可恢复。现在删除前
+> 会先落 `probe-targets.json.bak-<yyyymmdd-HHMMSS>`（与 `widgets.json.bak-*` 同惯例）。
+> 判"某个插件路由是否免鉴权"请用 GET/OPTIONS，**不要**用有副作用的 PUT。
+
+### 角色：`primary`（默认）与 `mirror`（2026-10-12）
+
+第二个 DSH 宿主（例如 Electron 桌面档）想显示同一块看板时，把这一行配成 `mirror`：
+
+```yaml
+- id: dashboards
+  config:
+    role: mirror
+    upstreamUrl: http://127.0.0.1:3080   # 常驻的 primary 宿主
+```
+
+mirror 实例**不建任何 poller/timer、不写任何文件、不发出任何外呼**，只把 `/dashboards/*`
+（含 PUT 编辑）透明反代给 `upstreamUrl`，并额外提供
+`GET /plugins/dsh-dashboards/status` 报告 `mode/upstream/counts.proxied/counts.failed`。
+
+为什么需要这个开关：两个宿主共用同一个 `~/.dsh`，各自采集会
+
+| 面 | 双 primary 的后果 |
+|---|---|
+| 13 路 poller | 重复外呼（idle 门控只挡"没开看板"的情形，两个 tab 同时开就双份） |
+| `diskAlertTimer` | **不受 idle 门控** ⇒ 重复飞书告警（各自 6h 冷却，不共享） |
+| `storages/dsh-dashboards/*` | `history*.jsonl` / `probe-targets.json` / `widgets.json` 是同一批文件且无跨进程锁 ⇒ 重复点 + "读全量→截断→原子重写"丢更新 |
+
+判据（`test/mirror.test.mjs` 机械咬住）：mirror 期间 `setInterval` 调用数 **= 0**、
+`DSH_HOME` 下**不产生 `storages/`**、注册路由恰好 2 条。
+
 ### 诚实性契约（2026-09-19，借鉴 Infomarchy 第一批加固）
 
 报告：`dsfolder/INFOMARCHY-ANALYSIS-2026-09-19.md`。六项约定，改动此处代码时必须保持：
@@ -53,6 +84,55 @@ GET/PUT /dashboards/probe-targets  服务探活目标（PUT 带 {targets:[…], 
       quotaApis: false   # zenmux/packy/deepseek/openrouter 余额 API
       diskAlert: false   # 飞书 webhook 推送
 ```
+
+### 磁盘口径（2026-10-22，方案 A：一源 / 一模型 / 一消费者）
+
+macOS 上「可用空间」有三个都真、含义不同的数（本机实测：硬可用 34.1 GiB、可清除 51.6 GiB、
+有效可用 85.7 GiB）。三者相差 50 GiB，于是同一台机器上「iStat 说还有 91 GB」与「看板说 93% 已满」
+长期并存，85% 水位阈值在含可清除口径下 10 天误报 54 次。现在的约定：
+
+1. **一个量只有一个用途**：`availableBytes`（硬可用）只判「余量是否见底」；`purgeableBytes`
+   只判「系统还有没有东西可回收」；`effectiveBytes`（= available + purgeable = NSURL important）
+   只用于展示「已用 %」。**不并列展示三个「可用空间」数字**——并列会逼人做减法，等于再造
+   一个第四种口径。卡片给的是**一条容量条的三段分解**（已用 / 可清除 / 空闲，和为总容量），
+   再加**一个**可写数字，不是三个互相竞争的「剩余」。
+2. **唯一读盘入口 `readDiskSnapshot()`**（`index.mjs`，30s 内复用同一份）：`collectMacos` 与
+   `checkDiskAlert` 都读它，两者不可能给出不同的事实（此前它们各自跑一次 `df`）。
+3. **数据源是 `tools/diskprobe.swift`**（NSURL 的 `volumeAvailableCapacityForImportantUsage`
+   一对值，与 Finder / iStat 同源），首次运行编译到 `~/.dsh/storages/dsh-dashboards/bin/`
+   （sha256 为缓存键，改源码自动重编）。**不用 `df` 当主源**（它没有 purgeable）；也**不用
+   osascript**（JXA 的 `resourceValuesForKeys` 实测返回空字典）。
+4. **降级只降不编**：拿不到 probe 时用 `df` 的硬可用，`purgeable`/`effective` 记 `null` 并渲染
+   `—`，**绝不填 0**（0 会被读成"没有可清除空间"，把一个测量缺口伪装成坏消息）；
+   probe 与 df 的硬可用相差超过 `max(3%, 1 GiB)` 时记 `degraded: ['df-mismatch']`。
+5. **告警按「两个缓冲」判，不按百分比**：`diskAlertHardFreeGb`（缺省 15 GiB，低于即 critical）/
+   `diskAlertPurgeableFloorGb`（2 GiB）配 `diskAlertHardFreeGuardGb`（30 GiB），外加 24h 趋势外推
+   `daysToFloor ≤ 3`。`diskAlertPct` 保留但**默认 0=关闭**，显式配置时也只按 `hardUsedPct` 判。
+6. 口径计算全在 `lib/disk.mjs`（纯函数、零依赖），单测 `test/disk.test.mjs` 锁住上述六条。
+7. **看板卡片 `mbp-disk`（type=`disk`，2026-10-22 第二步）**：一条三段容量条 = 真正已用 /
+   可清除 / 空闲（三段之和 == 总容量），左上角是「已用 %（含可清除）」，下面只给
+   **一个**可写数字（不回收任何东西时能写多少），外加「可清除 N GiB · M 个本机 TM 快照
+   （最近 HH:MM）」的来源归因。**刻意不把 `effectiveBytes` 也显示成一个"可用"值** ——
+   卡片上出现两个「可用」正是这次要消掉的困惑源（读者会开始做减法）。
+   状态点由 host 用**与告警同一个** `judgeDiskAlert` 算出（`disk.level`），客户端不另写阈值；
+   所以「卡片绿灯、告警却发出去」这种自我矛盾在结构上不可能发生。
+   快照计数来自 `tmutil listlocalsnapshots /`（用户态可读、300s 缓存、解析在
+   `lib/disk.mjs::parseLocalSnapshots`），**只做归因、不参与判据**；取不到就渲染
+   「快照来源未知」，不编数字。
+   ⚠️ 新增内置卡片的完整契约 = `ALLOWED_ENDPOINTS` + `DEFAULT_WIDGETS` + `pollerByEndpoint`
+   + 客户端 `type` 分派 + **`DEFAULT_WIDGETS_VERSION` 必须 +1**（store 一旦存在就完全取代
+   内置列表，不 bump ⇒ 对已有安装静默不可见）。
+
+```yaml
+- id: dashboards
+  config:
+    macos:
+      diskAlertHardFreeGb: 15      # 硬可用地板
+      diskAlertPurgeableFloorGb: 2 # 可清除地板
+      diskAlertHardFreeGuardGb: 30 # 可清除见底时的硬可用 guard
+```
+
+
 
 ### AI 额度渠道（`/dashboards/ai-quota`，widget type=quota）
 
