@@ -355,13 +355,15 @@ test('host 冒烟：新增内置 widget 迁移进既有 store + 用户删除不�
     assert.ok(ids.includes('xproj-pain'), 'v2 新增的 xproj-pain 必须补齐进既有 store')
     assert.ok(ids.includes('los-tasks'), 'v3 新增的 los-tasks 必须补齐进既有 store')
     assert.ok(ids.includes('mbp-disk'), 'v4 新增的 mbp-disk 必须补齐进既有 store')
+    assert.ok(ids.includes('net-summary'), 'v5 新增的 net-summary 必须补齐进既有 store')
+    assert.ok(ids.includes('net-trend'), 'v5 新增的 net-trend 必须补齐进既有 store')
     // 既有顺序与用户内容不得被迁移改动
     assert.equal(ids[0], 'los-usage')
     assert.equal(ids[1], 'surge-ai-rep')
     assert.equal(w1.json.widgets[1].title, 'Surge 节点信誉')
 
     const disk1 = JSON.parse(readFileSync(storePath, 'utf8'))
-    assert.equal(disk1.widgetsVersion, 4, '迁移必须把版本写进信封（否则每次读都重迁）')
+    assert.equal(disk1.widgetsVersion, 5, '迁移必须把版本写进信封（否则每次读都重迁）')
     assert.equal(disk1.revision, 8, '迁移应走同一个 revision 守卫写，递增而非重置')
 
     // 幂等：版本已最新 ⇒ 第二次读不得再写盘
@@ -417,5 +419,108 @@ test('host 冒烟：config 重放安全 —— apply → dispose → apply 不�
     assert.equal(webServer.size, 0)
   } finally {
     rmSync(dshHome, { recursive: true, force: true })
+  }
+})
+
+/**
+ * 网络观测两卡（A 批，2026-10-25）。
+ *
+ * 判据不是"路由 200"，而是三件：
+ *   ① 真数据能正确映射到 list 行（信号级 + 台账健康行 + 计数行）；
+ *   ② **helper 缺失时必须是 degraded.reasons，不能是 500，也不能是"全 0 看着正常"**；
+ *   ③ helper 说"判不了"（state=unknown）时，卡片行必须写明判不了，不得画成 pass。
+ * 两条负向控制（②③）是这组测试存在的理由 —— 少了它们，"读不到数据"会被静默渲染成"一切正常"。
+ */
+test('host 冒烟：网络两卡（真数据映射 / helper 缺失降级 / 判不了不冒充正常）', { skip: HOST_ROOT ? false : '未找到宿主 node_modules，跳过而非假装通过' }, async () => {
+  const root = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'dsh-dash-net-'))
+  const dshHome = join(root, 'dsh'); mkdirSync(dshHome, { recursive: true })
+  const helper = join(root, 'helpers'); mkdirSync(helper, { recursive: true })
+  const prevEnv = process.env.DSH_DASHBOARDS_NET_DIR
+
+  // 夹具 helper：只吐固定 JSON（模拟真实读入口的 --json 形状）
+  writeFileSync(join(helper, 'net-history.mjs'), `process.stdout.write(JSON.stringify({
+    schemaVersion: 1, state: 'degraded', freshness: 'ok', asOf: '2026-10-25T14:19:37.000Z', ageMs: 60000,
+    rows: 30, parseErrors: 0, gaps: [], byProfile: { light: 28, full: 2 },
+    latest: { ts: '2026-10-25T14:19:37.000Z', signals: { surge: 'pass', dns: 'pass', quota_jms: 'warn', lan: 'unknown' },
+              counts: { pass: 2, warn: 1, fail: 0, unknown: 1 } },
+  }))
+  // ★ 关键夹具性质：读入口的退出码是语义（1=有问题），不是「跑挂了」。
+  process.exitCode = 1\n`)
+  writeFileSync(join(helper, 'net-rollup.mjs'), `process.stdout.write(JSON.stringify({
+    schemaVersion: 1, dir: '/x', hours: 168, bucketMs: 86400000,
+    buckets: [
+      { schemaVersion: 1, bucket: '2026-10-24T00:00:00.000Z', bucketMs: 86400000, rows: 15, lastTs: '2026-10-24T23:19:23.000Z',
+        signalCounts: { pass: 69, warn: 11, fail: 0, unknown: 0 },
+        traffic: { valid: true, inBytesDelta: 1342177280, outBytesDelta: 1084479244 } },
+      { schemaVersion: 1, bucket: '2026-10-25T00:00:00.000Z', bucketMs: 86400000, rows: 15, lastTs: '2026-10-25T14:19:37.000Z',
+        signalCounts: { pass: 70, warn: 10, fail: 1, unknown: 0 },
+        traffic: { valid: false, inBytesDelta: null, outBytesDelta: null, note: '相邻桶缺流量面' } },
+    ],
+  }))\n`)
+
+  try {
+    // 这一条同时是回归：读入口在 degraded 时退出码是 1，若把它当失败就会把
+    // 真实数据整块丢掉（首版就是那样，摘要卡直接空）。
+    process.env.DSH_DASHBOARDS_NET_DIR = helper
+    const mod = await loadPlugin(dshHome)
+    const ctx = makeCtx()
+    mod.apply(ctx, {})
+    const dash = findRoute(ctx.routes, '/dashboards')
+
+    // ① 真数据 → 行映射
+    const s1 = await callRoute(dash, '/dashboards/net/summary')
+    assert.equal(s1.status, 200)
+    assert.equal(s1.json.data.degraded, null, '有真数据时不得报 degraded')
+    const names = s1.json.data.results.map((r) => r.name)
+    assert.equal(names[0], '台账', '第一行必须是"台账是否可信"，读者不该先看信号再猜数据新不新鲜')
+    assert.ok(names.includes('quota_jms') && names.includes('lan'), '每个信号都要有自己一行')
+    const warnRow = s1.json.data.results.find((r) => r.name === 'quota_jms')
+    assert.equal(warnRow.degraded, true, 'warn 必须渲染成 degraded')
+    const unknownRow = s1.json.data.results.find((r) => r.name === 'lan')
+    assert.equal(unknownRow.ok, false, '未知信号不得渲染成 up')
+    assert.match(unknownRow.detail, /判不了/, '未知信号必须在 detail 里明说判不了（负向控制）')
+
+    const t1 = await callRoute(dash, '/dashboards/net/trend')
+    assert.equal(t1.status, 200)
+    assert.equal(t1.json.data.results.length, 2)
+    assert.match(t1.json.data.results[0].detail, /↑1\.25 GB ↓1\.01 GB/, '日桶流量必须按字节换算显示')
+    assert.match(t1.json.data.results[1].detail, /流量面不可得/, '无效流量面必须明说不可得，不得显示 0')
+    assert.equal(t1.json.data.results[1].ok, false, '有 fail 信号的桶不得判 up')
+
+    ctx.dispose()
+
+    // ② 负向控制：helper 目录不存在 ⇒ degraded + 空 results（不是 500、不是全 0）
+    process.env.DSH_DASHBOARDS_NET_DIR = join(root, 'no-such-dir')
+    const mod2 = await import(`../index.mjs?netmissing=${Date.now()}`)
+    const ctx2 = makeCtx()
+    mod2.apply(ctx2, {})
+    const dash2 = findRoute(ctx2.routes, '/dashboards')
+    const s2 = await callRoute(dash2, '/dashboards/net/summary')
+    assert.equal(s2.status, 200, '缺 helper 也要 200（让卡片说话，而不是把整块看板打 500）')
+    assert.equal(s2.json.data.degraded?.reasons?.length, 1, '必须给出可读原因')
+    assert.equal(s2.json.data.results.length, 0, '不得伪造行')
+    assert.notEqual(s2.json.data.total, 1, '不得把"读不到"画成一行正常数据（负向控制）')
+    ctx2.dispose()
+
+    // ③ 负向控制：helper 说判不了（state=unknown，无任何信号）⇒ 不得渲染成正常
+    const unk = join(root, 'helpers-unknown'); mkdirSync(unk, { recursive: true })
+    writeFileSync(join(unk, 'net-history.mjs'), `process.stdout.write(JSON.stringify({ state: 'unknown', freshness: 'expired', rows: 0, gaps: [], parseErrors: 0, latest: null }))\n`)
+    writeFileSync(join(unk, 'net-rollup.mjs'), `process.stdout.write(JSON.stringify({ buckets: [] }))\n`)
+    process.env.DSH_DASHBOARDS_NET_DIR = unk
+    const mod3 = await import(`../index.mjs?netunknown=${Date.now()}`)
+    const ctx3 = makeCtx()
+    mod3.apply(ctx3, {})
+    const dash3 = findRoute(ctx3.routes, '/dashboards')
+    const s3 = await callRoute(dash3, '/dashboards/net/summary')
+    assert.equal(s3.status, 200)
+    assert.equal(s3.json.data.state, 'unknown', 'state 必须原样透传（不许在呈现层"修正"成 ok）')
+    const ledgerRow = s3.json.data.results[0]
+    assert.equal(ledgerRow.ok, false, '判不了时台账行不得是 up（负向控制）')
+    assert.match(ledgerRow.detail, /新鲜度 expired/, '必须把判不了的原因写出来')
+    ctx3.dispose()
+  } finally {
+    if (prevEnv === undefined) delete process.env.DSH_DASHBOARDS_NET_DIR
+    else process.env.DSH_DASHBOARDS_NET_DIR = prevEnv
+    rmSync(root, { recursive: true, force: true })
   }
 })

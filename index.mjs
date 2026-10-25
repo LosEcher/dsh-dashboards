@@ -232,6 +232,7 @@ const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/dsh/usage',
   '/dashboards/usage/reconcile',
   '/dashboards/xproj/sessions', '/dashboards/xproj/pain',
+  '/dashboards/net/summary', '/dashboards/net/trend',
   '/dashboards/z4pro',
 ])
 
@@ -285,6 +286,12 @@ const DEFAULT_WIDGETS = [
   { id: 'usage-reconcile', type: 'reconcile', endpoint: '/dashboards/usage/reconcile', title: '消耗对账', refreshMs: 120000 },
   { id: 'xproj-sessions', type: 'chart', endpoint: '/dashboards/xproj/sessions', title: '跨项目会话（三态）', refreshMs: 300000 },
   { id: 'xproj-pain', type: 'list', endpoint: '/dashboards/xproj/pain', title: '跨项目重复痛点', refreshMs: 300000 },
+  // 网络观测（2026-10-25 A 批）：数据面唯一写者是 launchd net-observe（按日 jsonl），
+  // 唯一读入口是 dsfolder 的 net-history.mjs / net-rollup.mjs —— 本插件**只呈现**，
+  // 用 `list` 复用既有渲染器（客户端无需新类型）。300s 节奏：light 每小时 1 条，
+  // 跟 losPollMs 没意义（会比数据源本身快 5 倍地读同一份台账）。
+  { id: 'net-summary', type: 'list', endpoint: '/dashboards/net/summary', title: '网络观测（信号）', refreshMs: 300000 },
+  { id: 'net-trend', type: 'list', endpoint: '/dashboards/net/trend', title: '网络趋势（日桶）', refreshMs: 300000 },
   // 极空间 Z4Pro 设备健康（复用 list widget 渲染，客户端无需新增 widget 类型）
   // 120s 节奏：SSH + smartctl 全量采集约 3-6s，且盘/池是慢变量
   { id: 'z4pro-health', type: 'list', endpoint: '/dashboards/z4pro', title: '极空间 Z4Pro', refreshMs: 120000 },
@@ -676,6 +683,122 @@ async function collectXprojPain(cfg, tokens) {
       runtimeContextInjections: d.injection.runtimeContextInjections,
       skillCatalogInjections: d.injection.skillCatalogInjections,
     },
+  }
+}
+
+/** ── 网络观测（A 批，2026-10-25）────────────────────────────────────────
+ *
+ * 数据面契约（B2/B3 定稿，别在这里重复实现）：
+ *   · 唯一**写者** = launchd `com.echerlos.net-observe`（+ full/report），落
+ *     `~/.local/state/net-observe/YYYY-MM-DD.jsonl`；
+ *   · 唯一**读入口** = `dsfolder/scripts/net/net-history.mjs`（单轮汇总，三态 state）
+ *     与 `net-rollup.mjs`（时间桶）。二者都有三态退出码：0 ok / 1 有问题 / 2 判不了。
+ *   ⇒ 本插件只**呈现**：spawn 那个读入口拿 JSON。**绝不**在这里解析台账——否则立刻
+ *     出现第二份"什么算新鲜/什么算缺天"的口径（本仓最贵的缺陷类别）。
+ *
+ * 判据纪律（照抄 B6 monitor-doctor 踩过的两条）：
+ *   ① helper 缺失/超时/输出非 JSON ⇒ 返 `degraded.reasons`，**不是 500、也不是 0**；
+ *   ② helper 报 state=unknown（判不了）时，卡片必须显式说"判不了"，不得画成"正常"。
+ */
+const NET_HELPER_TIMEOUT_MS = 15000
+/** 每次都读 env（而不是模块加载时读一次）：测试要在 import 之后改指向夹具目录，
+ *  而"import 顺序决定行为"正是本仓登记过的脆弱形态（见 test 里两次假失败）。 */
+function netHelperDir() {
+  return process.env.DSH_DASHBOARDS_NET_DIR || join(homedir(), 'syncfolder/project/dsfolder/scripts/net')
+}
+
+/** 跑一次读入口脚本；**永不抛**（失败以 {ok:false,reason} 表达，让卡片说真话）。 */
+function runNetHelper(script, args) {
+  return new Promise((resolve) => {
+    execFile(process.execPath, [join(netHelperDir(), script), ...args], {
+      timeout: NET_HELPER_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      // ⚠️ 读入口的退出码是**语义**（0 ok / 1 有问题 / 2 判不了），不是"跑挂了"。
+      // 所以判据是 **stdout 能不能解析成 JSON**，绝不能把非零退出当失败 ——
+      // 否则 state=degraded（最常见的真实状态）会被渲染成"采集失败"，把数据丢掉。
+      // 真实翻车记录：首版按 err 判失败，于是 net-history 一报 degraded 摘要卡就空了。
+      const text = String(stdout ?? '').trim()
+      if (text) {
+        try { return resolve({ ok: true, data: JSON.parse(text), helperExit: err?.code ?? 0 }) } catch { /* 落到下面 */ }
+      }
+      const tail = String(stderr ?? '').trim().split('\n').filter(Boolean).pop()
+      const code = err?.code ?? 'error'
+      resolve({ ok: false, reason: `${script} 没有可解析的 JSON（退出码 ${code}）${tail ? ` · ${tail}` : ''}` })
+    })
+  })
+}
+
+const NET_BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB']
+/** 字节 → 人类可读。**null 保持 null**（缺值不许折成 0）。 */
+function fmtNetBytes(v) {
+  if (v == null || !Number.isFinite(v)) return null
+  let n = Math.abs(v); let i = 0
+  while (n >= 1024 && i < NET_BYTE_UNITS.length - 1) { n /= 1024; i += 1 }
+  return `${v < 0 ? '-' : ''}${n < 10 ? n.toFixed(2) : n.toFixed(1)} ${NET_BYTE_UNITS[i]}`
+}
+
+/** 信号四态 → list 行的三态（pass=ok / warn=degraded / fail=down / unknown=degraded+明说判不了）。
+ *  为什么 unknown 不单列一种颜色：现渲染器只有 up/degraded/down 三个词，
+ *  与其偷偷画成 down（夸大）或 up（掩盖），不如画成 degraded 并在 detail 里写明"判不了"。 */
+function netSignalRow(name, level, detail) {
+  const lv = String(level ?? 'unknown')
+  return {
+    name,
+    ok: lv === 'pass' || lv === 'ok',
+    degraded: lv === 'warn' || lv === 'degraded' || lv === 'unknown',
+    detail: lv === 'unknown' ? `判不了 · ${detail ?? '—'}` : `${lv} · ${detail ?? '—'}`,
+  }
+}
+
+async function collectNetSummary() {
+  const r = await runNetHelper('net-history.mjs', ['--json', '--days', '2'])
+  if (!r.ok) return { asOf: null, degraded: { reasons: [r.reason] }, results: [], total: 0, source: netHelperDir() }
+  const d = r.data ?? {}
+  const counts = d.latest?.counts ?? {}
+  const rows = []
+  // 第一行永远是"台账本身可不可信"，不让读者先看信号再猜数据是否新鲜
+  rows.push(netSignalRow('台账', d.freshness === 'ok' ? 'pass' : (d.state === 'unknown' ? 'unknown' : 'warn'),
+    `${d.rows ?? 0} 行 · 新鲜度 ${d.freshness ?? '—'} · ${d.gaps?.length ? `缺 ${d.gaps.join(',')}` : '无缺天'} · 解析失败 ${d.parseErrors ?? 0}`))
+  for (const [k, v] of Object.entries(d.latest?.signals ?? {})) rows.push(netSignalRow(k, v, null))
+  rows.push(netSignalRow('信号计数', counts.fail ? 'fail' : counts.unknown ? 'unknown' : counts.warn ? 'warn' : 'pass',
+    `pass ${counts.pass ?? 0} / warn ${counts.warn ?? 0} / fail ${counts.fail ?? 0} / unknown ${counts.unknown ?? 0}`))
+  return {
+    asOf: d.asOf ?? null,
+    state: d.state ?? 'unknown',
+    freshness: d.freshness ?? null,
+    ageMs: d.ageMs ?? null,
+    degraded: null,
+    results: rows,
+    total: rows.length,
+    source: netHelperDir(),
+  }
+}
+
+async function collectNetTrend() {
+  // 日桶不是偏好而是实测结论（B3）：light 每小时 1 条 ⇒ 小时桶 rows=1，
+  // 桶内增量结构性不可得；跨桶增量才是流量面，所以趋势卡只看日桶。
+  const r = await runNetHelper('net-rollup.mjs', ['--json', '--hours', String(24 * 7), '--bucket-minutes', '1440'])
+  if (!r.ok) return { asOf: null, degraded: { reasons: [r.reason] }, results: [], total: 0, source: netHelperDir() }
+  const d = r.data ?? {}
+  const buckets = [...(d.buckets ?? [])].sort((a, b) => String(a.bucket).localeCompare(String(b.bucket)))
+  const rows = buckets.map((b) => {
+    const c = b.signalCounts ?? {}
+    const up = fmtNetBytes(b.traffic?.inBytesDelta)
+    const down = fmtNetBytes(b.traffic?.outBytesDelta)
+    const traffic = b.traffic?.valid
+      ? `↑${up ?? '—'} ↓${down ?? '—'}`
+      : `流量面不可得 · ${b.traffic?.note ?? '—'}`
+    const level = c.fail ? 'fail' : c.unknown ? 'unknown' : c.warn ? 'warn' : 'pass'
+    return netSignalRow(String(b.bucket ?? '').slice(5, 10), level,
+      `${traffic} · 信号 p${c.pass ?? 0}/w${c.warn ?? 0}/f${c.fail ?? 0}/u${c.unknown ?? 0} · ${b.rows ?? 0} 行`)
+  })
+  return {
+    asOf: buckets.length ? buckets[buckets.length - 1].lastTs ?? null : null,
+    bucketMs: d.bucketMs ?? null,
+    degraded: null,
+    results: rows,
+    total: rows.length,
+    source: netHelperDir(),
   }
 }
 
@@ -1825,7 +1948,9 @@ function round2(n) { return Math.round(n * 100) / 100 }
 // 2026-10-08：1 → 2，新增 xproj-sessions / xproj-pain 两张内置卡。
 // ★ 必须 bump：store 一旦存在就完全取代 DEFAULT_WIDGETS，不 bump 则新卡对
 //   **已有安装静默不可见**（surge-packy / z4pro-health 踩过同一个坑）。
-const DEFAULT_WIDGETS_VERSION = 4
+// 2026-10-25：4 → 5，新增 net-summary / net-trend 两张内置卡（A 批）。
+// 同一个坑第三次提醒：store 存在即完全取代 DEFAULT_WIDGETS，不 bump ⇒ 对已有安装静默不可见。
+const DEFAULT_WIDGETS_VERSION = 5
 
 function loadWidgetStore() {
   const env = readJsonEnvelope(WIDGETS_FILE, 'widgets')
@@ -2083,6 +2208,9 @@ export function apply(ctx, config) {
   // 跨项目事实面：变化慢（投影每小时刷新）⇒ 5 分钟足够，不必跟着 losPollMs
   const xprojSessions = makePoller({ id: 'xproj-sessions', collect: () => collectXprojSessions(cfg, tokens), intervalMs: 300000 })
   const xprojPain = makePoller({ id: 'xproj-pain', collect: () => collectXprojPain(cfg, tokens), intervalMs: 300000 })
+  // 网络观测（A 批）：读入口是外部脚本（spawn），给足 15s 超时；数据源每小时 1 条 ⇒ 5 分钟足够
+  const netSummary = makePoller({ id: 'net-summary', collect: () => collectNetSummary(), intervalMs: 300000, timeoutMs: 20000 })
+  const netTrend = makePoller({ id: 'net-trend', collect: () => collectNetTrend(), intervalMs: 300000, timeoutMs: 20000 })
   // 看门狗：单次采集整体 12s 硬上限（基座 timeoutMs 兜底），df/iostat 卡挂载也只降级该拍
   const macos = makePoller({ id: 'macos', collect: () => collectMacos(cfg), intervalMs: cfg.macos.pollMs, timeoutMs: PROBE_TOTAL_TIMEOUT_MS })
   const probe = makePoller({ id: 'probe', collect: () => collectProbe(cfg), intervalMs: cfg.probe.pollMs })
@@ -2288,6 +2416,8 @@ export function apply(ctx, config) {
     '/dashboards/los/tasks': losTasks,
     '/dashboards/xproj/sessions': xprojSessions,
     '/dashboards/xproj/pain': xprojPain,
+    '/dashboards/net/summary': netSummary,
+    '/dashboards/net/trend': netTrend,
     '/dashboards/macos': macos,
     '/dashboards/macos/history': historyPoller,
     '/dashboards/macos/insights': insightsPoller,
@@ -2537,6 +2667,8 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/los/tasks') { sendJson(res, 200, await losTasks.get()); return }
         if (method === 'GET' && path === '/dashboards/xproj/sessions') { sendJson(res, 200, await xprojSessions.get()); return }
         if (method === 'GET' && path === '/dashboards/xproj/pain') { sendJson(res, 200, await xprojPain.get()); return }
+        if (method === 'GET' && path === '/dashboards/net/summary') { sendJson(res, 200, await netSummary.get()); return }
+        if (method === 'GET' && path === '/dashboards/net/trend') { sendJson(res, 200, await netTrend.get()); return }
         if (method === 'GET' && path === '/dashboards/macos') { const s = await macos.get(); if (cfg.macos.enabled && !s.data) await macos.refresh(); sendJson(res, 200, s); return }
         if (method === 'GET' && path === '/dashboards/macos/history') {
           // 统一走 historyPoller（含 gap 填充 + sampleMs/window 元信息，与 snapshot 聚合同构）
