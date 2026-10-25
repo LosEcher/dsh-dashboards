@@ -21,7 +21,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { zstdCompressSync } from 'node:zlib'
+import { zstdCompressSync, zstdDecompressSync } from 'node:zlib'
 import { fileURLToPath } from 'node:url'
 
 import {
@@ -242,16 +242,35 @@ test('多帧 zstd：必须解出全部帧（只解第一帧的解压器不许静
   }
 })
 
+/**
+ * 只解**第一帧**的解压器（确定性注入，用来给"多帧守卫"做负向控制）。
+ *
+ * ⚠️ 为什么不用 `node:zlib` 的 `zstdDecompressSync` 当"单帧坏解压器"：
+ *   它曾经只解第一帧（那正是当年发现 bug 的路径），但 **Node v26.12.1 实测已会解全部帧**
+ *   （3 帧拼起来的 buffer ⇒ 返回 `"a\nb\nc\n"`）。于是原写法在换版本后**前提失效**——
+ *   测试便红在"这条对照不再有鉴别力"上。那是测试在诚实地指真因，但控制项不该依赖运行环境：
+ *   **要注入的是"bug 的形状"，不是某个库在某个版本的行为**。
+ */
+const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd]
+function firstFrameOnly(buf) {
+  const at = []
+  for (let i = 0; i + 4 <= buf.length; i++) {
+    if (buf[i] === ZSTD_MAGIC[0] && buf[i + 1] === ZSTD_MAGIC[1] && buf[i + 2] === ZSTD_MAGIC[2] && buf[i + 3] === ZSTD_MAGIC[3]) at.push(i)
+  }
+  if (at.length === 0) throw new Error('fixture 不是 zstd')
+  const end = at.length > 1 ? at[1] : buf.length
+  return zstdDecompressSync(buf.subarray(at[0], end))
+}
+
 test('多帧 + 单帧解压器的对照：若不设守卫会得到明显偏小的数（证明守卫有鉴别力）', async () => {
   const lines = [header(1, T(15, 1), 'deepseek-flash'), msg(2, T(15, 1), 'deepseek-flash', 10, 1, 0), msg(3, T(15, 2), 'deepseek-flash', 20, 2, 0), msg(4, T(15, 3), 'deepseek-flash', 30, 3, 0)]
   const root = makeRoot({ s1: lines }, { frames: 3 })
   try {
-    const { zstdDecompressSync } = await import('node:zlib')
     // 不设 singleFrameOnly ⇒ 守卫不生效，就会拿到少算的数（这正是 bug 的形状）
-    const naive = await readSourceUsage(root, { io: { decompress: async (buf) => zstdDecompressSync(buf) } })
+    const naive = await readSourceUsage(root, { io: { decompress: async (buf) => firstFrameOnly(buf) } })
     assert.ok(
       naive.responses < 3,
-      `前提失效：单帧解压在这份多帧 fixture 上没有得到偏小的数（${naive.responses}）⇒ 这条对照不再有鉴别力`,
+      `前提失效：确定性单帧解压器在这份多帧 fixture 上没有得到偏小的数（${naive.responses}）⇒ 对照失去鉴别力`,
     )
     const good = await readSourceUsage(root)
     assert.equal(good.responses, 3, '正常路径应为 3')
