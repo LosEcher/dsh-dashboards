@@ -659,6 +659,11 @@
   gap: 8px;
 }
 
+.hostConfirmActions {
+  flex-direction: column;
+  align-items: stretch;
+}
+
 .hostConfirm {
   display: flex;
   flex-direction: column;

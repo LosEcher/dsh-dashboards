@@ -1211,7 +1211,9 @@ function HostRestartCard({ data, t }: { data: unknown; t: (k: string) => string 
               ? `确认重启？会中断在跑的 ${running} 个会话（这一线没有自动续跑）。`
               : '确认重启？当前没有会话在跑。'}
           </p>
-          <div className={css.hostActions}>
+          {/* 三个按钮竖排：卡片只有 ~400px，"取消/确认重启/仍然重启"横排会挤出卡外，
+              实测 Playwright 的点击被侧栏宽度手柄拦下 —— 那是命中区被压出可视范围。 */}
+          <div className={`${css.hostActions} ${css.hostConfirmActions}`}>
             <button type="button" className={css.btn} onClick={() => setConfirming(false)} disabled={busy}>取消</button>
             <button type="button" className={`${css.btn} ${css.btnPrimary}`} onClick={() => void send(false)} disabled={busy}>确认重启</button>
             {typeof running === 'number' && running > 0 ? (
