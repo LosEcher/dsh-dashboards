@@ -1126,7 +1126,7 @@ function FeedCard({ data, t }: { data: unknown; t: (k: string) => string }) {
  * 二次确认做成卡内两步而不是弹窗：看板是一屏多卡，"点按钮弹一个全屏遮罩"比一行
  * 确认更打断。确认文案必须说清会中断几个回合，`force` 是**另一个**按钮。
  */
-function HostRestartCard({ data }: { data: unknown }) {
+function HostRestartCard({ data, t }: { data: unknown; t: (k: string) => string }) {
   const d = (data ?? {}) as {
     available?: boolean
     reason?: string
@@ -1139,10 +1139,11 @@ function HostRestartCard({ data }: { data: unknown }) {
   const [confirming, setConfirming] = useState(false)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+  const [rawReason, setRawReason] = useState<string | null>(null)
   const [bad, setBad] = useState(false)
 
   if (d.available === false) {
-    return <p className={css.muted}>{`宿主重启能力不可用：${d.reason ?? '未知原因'}`}</p>
+    return <p className={css.muted}>{`${t('host.unavailable')} ${d.reason ?? '—'}`}</p>
   }
 
   const phase = d.daemon?.phase ?? 'unknown'
@@ -1163,11 +1164,16 @@ function HostRestartCard({ data }: { data: unknown }) {
       const body = await res.json().catch(() => ({})) as { ok?: boolean; code?: string; reason?: string }
       if (res.status === 202 && body.ok === true) {
         setConfirming(false)
-        setNotice('已受理：守护进程 3 秒内 TERM，约 20–45s 后新宿主可用，本卡会自动刷新。')
+        setNotice(t('host.accepted'))
         return
       }
       setBad(true)
-      setNotice(body.reason ?? body.code ?? `HTTP ${res.status}`)
+      // 服务端 code 有稳定词表（turns-running / turns-unknown / debounce /
+      // daemon-unhealthy），翻成中文照原意说；认不出的 code 才退回服务端原句——
+      // 反过来（一律显示英文原文）会让中文界面上出现一段谁都读不懂的英文。
+      setRawReason(body.reason ?? null)
+      setNotice(translateCode(body.code, { running, phase, retryAfterMs: (body as { retryAfterMs?: number }).retryAfterMs }, t)
+        ?? body.reason ?? body.code ?? `HTTP ${res.status}`)
     } catch (error) {
       setBad(true)
       setNotice(error instanceof Error ? error.message : String(error))
@@ -1196,7 +1202,7 @@ function HostRestartCard({ data }: { data: unknown }) {
         <p className={css.hostFiles}>{d.pending.items.slice(0, 3).map((item) => item.path.split('/').pop()).join(' · ')}</p>
       ) : null}
 
-      {notice !== null ? <p className={bad ? css.error : css.muted}>{notice}</p> : null}
+      {notice !== null ? <p className={bad ? css.error : css.muted} title={rawReason ?? undefined}>{notice}</p> : null}
 
       {confirming ? (
         <div className={css.hostConfirm}>
@@ -1228,6 +1234,35 @@ function HostRestartCard({ data }: { data: unknown }) {
       )}
     </div>
   )
+}
+
+/**
+ * 服务端拒绝码 → 本地文案；认不出的返回 null（调用方退回服务端原句）。
+ *
+ * 占位符替换在本函数里做，不指望 `t()`：本视图的 `t` 是 `(k) => t(k)`，
+ * **不做变量插值**（其余卡片也不用），传 vars 进去只会原样打印 `{count}`。
+ */
+function translateCode(
+  code: string | undefined,
+  context: { running?: number | null; phase?: string; retryAfterMs?: number },
+  t: (k: string) => string,
+): string | null {
+  const fill = (key: string, vars: Record<string, string>): string => {
+    let text = t(key)
+    for (const [name, value] of Object.entries(vars)) text = text.replaceAll(`{${name}}`, value)
+    return text
+  }
+  switch (code) {
+    case 'turns-running':
+      return fill('host.turnsRunning', { count: String(context.running ?? '?') })
+    case 'turns-unknown': return t('host.turnsUnknown')
+    case 'debounce':
+      return fill('host.debounce', { seconds: String(Math.ceil((context.retryAfterMs ?? 60_000) / 1000)) })
+    case 'daemon-unhealthy': return fill('host.daemonUnhealthy', { phase: context.phase ?? '?' })
+    case 'not-loopback': return t('host.notLoopback')
+    case 'missing-marker': return t('host.missingMarker')
+    default: return null
+  }
 }
 
 /** 时长 → "3m" / "2.1h"。 */
@@ -1296,7 +1331,7 @@ function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
         ) : widget.type === 'disk' ? (
           <DiskCard data={d} t={t} />
         ) : widget.type === 'host' ? (
-          <HostRestartCard data={d} />
+          <HostRestartCard data={d} t={t} />
         ) : (
           <p className={css.muted}>{t('noData')}</p>
         )}
