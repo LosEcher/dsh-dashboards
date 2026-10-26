@@ -605,3 +605,66 @@
   font-size: 11px;
   color: var(--dsw-alias-label-tertiary);
 }
+
+/* ── 宿主重启卡（2026-10-26）─────────────────────────────────────────────
+   一屏多卡里的一张操作卡：头部一行状态、一行事实、底部一个按钮；
+   确认态在卡内展开（卡内两步），不要弹全屏遮罩。 */
+.hostCard {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hostHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.hostPhase {
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.hostRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 11px;
+}
+
+.hostWarn {
+  margin: 0;
+  color: var(--dsw-alias-state-warn-label);
+  font-size: 11px;
+}
+
+.hostFiles {
+  overflow: hidden;
+  margin: 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hostActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.hostConfirm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1);
+}

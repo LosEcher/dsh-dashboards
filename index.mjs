@@ -234,6 +234,7 @@ const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/xproj/sessions', '/dashboards/xproj/pain',
   '/dashboards/net/summary', '/dashboards/net/trend',
   '/dashboards/z4pro',
+  '/dashboards/host-restart',
 ])
 
 /** Surge 节点信誉数据源（surge-auto ai-node-reputation 输出）。 */
@@ -267,6 +268,10 @@ const DEFAULT_TARGETS = [
 ]
 
 const DEFAULT_WIDGETS = [
+  // 宿主自身（2026-10-26）：这是「重启宿主」按钮的落地席位。放在**第一位**是因为它回答
+  // "这个宿主还好吗、要不要重载"——比用量/节点更靠前。数据来自 dsh-web-host-restart 的
+  // /host-restart/status（同源回环），本插件只呈现不持有重启逻辑。
+  { id: 'host-restart', type: 'host', endpoint: '/dashboards/host-restart', title: '宿主（重启）', refreshMs: 15000 },
   { id: 'los-usage', type: 'stat', endpoint: '/dashboards/los/usage', title: 'LLM 用量 24h', refreshMs: 60000 },
   { id: 'los-nodes', type: 'matrix', endpoint: '/dashboards/los/nodes', title: '执行节点', refreshMs: 30000 },
   { id: 'los-tasks', type: 'tasks', endpoint: '/dashboards/los/tasks', title: '任务队列', refreshMs: 30000 },
@@ -313,6 +318,9 @@ function resolveConfig(config) {
     upstreamTimeoutMs: c.upstreamTimeoutMs ?? 30_000,
     losUrl,
     losEnvFile,
+    // 本机 web 宿主地址：宿主重启卡片回环读 `/host-restart/status`（该事实的唯一实现
+    // 属于 dsh-web-host-restart；本插件只呈现）。
+    hostUrl: String(c.hostUrl ?? process.env.DSH_WEB_URL ?? 'http://127.0.0.1:3080').replace(/\/+$/, ''),
     losPollMs: c.losPollMs ?? 60000,
     macos: {
       enabled: c.macos?.enabled ?? true,
@@ -476,6 +484,31 @@ async function losFetch(cfg, tokens, path, { operator = false } = {}) {
     try { return await attempt('operator', { 'x-los-operator-token': tokens.operatorToken }) } catch { /* fallthrough */ }
   }
   throw tried.length ? failed() : missing('token（Config.losToken / credentials / losEnvFile）')
+}
+
+/**
+ * 宿主自身状态：同源回环读 `dsh-web-host-restart` 的 status 路由。
+ *
+ * 为什么不在这里重算 turns/pending/daemon：那三个事实的唯一实现属于重启插件
+ * （它还持有审计台账与四道闸门）。重复实现会立刻分叉——用户看到的"在跑 1 个"
+ * 与按钮真实的判断依据可能不同，而这正是最不该不一致的地方。
+ * @param {object} cfg - resolved plugin config.
+ * @returns {Promise<object>} `{ available, ...status }` or `{ available: false, reason }`.
+ */
+async function collectHostRestart(cfg) {
+  const url = `${String(cfg.hostUrl ?? 'http://127.0.0.1:3080').replace(/\/$/, '')}/host-restart/status`
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(4000) })
+    if (res.status === 404) {
+      // 能力缺失与"状态良好"必须分开：404 意味着 dsh-web-host-restart 没装/被禁用。
+      return { available: false, reason: 'dsh-web-host-restart 未启用（/host-restart 不存在）' }
+    }
+    if (!res.ok) return { available: false, reason: `HTTP ${res.status}` }
+    const body = await res.json()
+    return { available: true, ...body }
+  } catch (error) {
+    return { available: false, reason: error instanceof Error ? error.message : String(error) }
+  }
 }
 
 async function collectLosUsage(cfg, tokens) {
@@ -1949,8 +1982,47 @@ function round2(n) { return Math.round(n * 100) / 100 }
 // ★ 必须 bump：store 一旦存在就完全取代 DEFAULT_WIDGETS，不 bump 则新卡对
 //   **已有安装静默不可见**（surge-packy / z4pro-health 踩过同一个坑）。
 // 2026-10-25：4 → 5，新增 net-summary / net-trend 两张内置卡（A 批）。
+// 2026-10-26：5 → 6，新增 host-restart（宿主重启卡）。
 // 同一个坑第三次提醒：store 存在即完全取代 DEFAULT_WIDGETS，不 bump ⇒ 对已有安装静默不可见。
-const DEFAULT_WIDGETS_VERSION = 5
+const DEFAULT_WIDGETS_VERSION = 6
+
+/**
+ * Merge newly added built-in widgets into an existing store **at their declared
+ * position** instead of appending them.
+ *
+ * Appending was the original rule (2026-10-08) and it is wrong for a card whose
+ * whole purpose is "look here first": `host-restart` declares position 0, and the
+ * user asked for the button right after it shipped and could not find it. The anchor
+ * for a missing default is the nearest *previous* default already in the store —
+ * falling back to "before the nearest later one" when there is none. Existing items
+ * keep their relative order and their user-edited fields; `removedDefaults` are still
+ * never resurrected.
+ *
+ * @param items existing store rows.
+ * @param defaults declared built-in widgets (authoritative order).
+ * @param removed built-in ids the user deleted on purpose.
+ * @returns rows with the missing defaults inserted.
+ */
+function insertDefaultsAtPosition(items, defaults, removed) {
+  const result = [...items]
+  defaults.forEach((defaultWidget, index) => {
+    if (removed.has(defaultWidget.id)) return
+    if (result.some((w) => w?.id === defaultWidget.id)) return
+    let at = 0
+    for (let i = index - 1; i >= 0; i -= 1) {
+      const position = result.findIndex((w) => w?.id === defaults[i].id)
+      if (position >= 0) { at = position + 1; break }
+    }
+    if (at === 0) {
+      for (let i = index + 1; i < defaults.length; i += 1) {
+        const position = result.findIndex((w) => w?.id === defaults[i].id)
+        if (position >= 0) { at = position; break }
+      }
+    }
+    result.splice(at, 0, { ...defaultWidget })
+  })
+  return result
+}
 
 function loadWidgetStore() {
   const env = readJsonEnvelope(WIDGETS_FILE, 'widgets')
@@ -1970,10 +2042,11 @@ function loadWidgetStore() {
       exists: true, removedDefaults: [...removed], migrated: false,
     }
   }
-  const present = new Set(env.items.map((w) => w?.id))
-  const added = DEFAULT_WIDGETS.filter((d) => !present.has(d.id) && !removed.has(d.id)).map((w) => ({ ...w }))
+  const added = DEFAULT_WIDGETS
+    .filter((d) => !env.items.some((w) => w?.id === d.id) && !removed.has(d.id))
+    .map((w) => ({ ...w }))
   const migrated = added.length > 0
-  const widgets = migrated ? [...env.items, ...added] : env.items
+  const widgets = migrated ? insertDefaultsAtPosition(env.items, DEFAULT_WIDGETS, removed) : env.items
   const res = saveEnvelopeReplace(WIDGETS_FILE, 'widgets', widgets, env.revision, {
     widgetsVersion: DEFAULT_WIDGETS_VERSION, removedDefaults: [...removed],
   })
@@ -2248,6 +2321,18 @@ export function apply(ctx, config) {
   const feedDigests = makePoller({ id: 'feed', collect: collectFeedDigests, intervalMs: 60000 })
   // 极空间 Z4Pro 设备健康（SSH 采集：负载/内存/6 盘 SMART/池/VM/VNC/frp；120s 节奏）
   // 采集全程只读；脚本缺失或 SSH 不通时降级为 error 展示，不影响其它 widget
+  /**
+   * 宿主自身（2026-10-26）：重启按钮的落地席位。数据**不在本插件重算**——
+   * turns/pending/daemon 的唯一实现是 dsh-web-host-restart 的 `/host-restart/status`，
+   * 这里只做同源回环读取。两处各算一份，会让卡片上的"在跑 N 个"与按钮真正的判断
+   * 依据分叉，而这正是最不该不一致的地方。
+   */
+  const hostRestart = makePoller({
+    id: 'host-restart',
+    collect: () => collectHostRestart(cfg),
+    intervalMs: 15_000,
+    timeoutMs: 6_000,
+  })
   const z4pro = makePoller({
     id: 'z4pro',
     collect: () => collectZ4Pro(cfg),
@@ -2431,6 +2516,7 @@ export function apply(ctx, config) {
     '/dashboards/dsh/usage': dshUsage,
     '/dashboards/usage/reconcile': usageReconcile,
     '/dashboards/z4pro': z4pro,
+    '/dashboards/host-restart': hostRestart,
   }
 
   const timers = [
@@ -2450,6 +2536,9 @@ export function apply(ctx, config) {
     startPoller(dshUsage, 15 * 60_000),
     startPoller(usageReconcile, 5 * 60_000),
     startPoller(z4pro, cfg.z4pro.pollMs),
+    // 15s：重启期间 child-exited → starting → healthy 变得很快，慢了卡片会显示旧
+    // child pid，读起来像"按钮没生效"。
+    startPoller(hostRestart, 15_000),
   ]
 
   // ── 磁盘告警（独立于看板 idle 门控：看板未打开也持续检查，主动推飞书） ──
@@ -2715,6 +2804,7 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/dsh/usage') { sendJson(res, 200, await dshUsage.get()); return }
         if (method === 'GET' && path === '/dashboards/usage/reconcile') { sendJson(res, 200, await usageReconcile.get()); return }
         if (method === 'GET' && path === '/dashboards/z4pro') { sendJson(res, 200, await z4pro.get()); return }
+        if (method === 'GET' && path === '/dashboards/host-restart') { sendJson(res, 200, await hostRestart.get()); return }
         if (method === 'GET' && path === '/dashboards/widgets') {
           const store = loadWidgetStore()
           sendJson(res, 200, { ts: new Date().toISOString(), widgets: store.widgets, revision: store.revision, source: store.exists ? 'store' : 'default' })

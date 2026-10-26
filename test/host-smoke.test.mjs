@@ -357,13 +357,17 @@ test('host 冒烟：新增内置 widget 迁移进既有 store + 用户删除不�
     assert.ok(ids.includes('mbp-disk'), 'v4 新增的 mbp-disk 必须补齐进既有 store')
     assert.ok(ids.includes('net-summary'), 'v5 新增的 net-summary 必须补齐进既有 store')
     assert.ok(ids.includes('net-trend'), 'v5 新增的 net-trend 必须补齐进既有 store')
-    // 既有顺序与用户内容不得被迁移改动
-    assert.equal(ids[0], 'los-usage')
-    assert.equal(ids[1], 'surge-ai-rep')
-    assert.equal(w1.json.widgets[1].title, 'Surge 节点信誉')
+    // v6：内置项插在**声明位置**，不再一律追加（追加会让"放最前面"的卡片跑到末尾，
+    // 用户当场找不到按钮）。host-restart 声明在 0，所以它在最前；既有项相对顺序不变。
+    assert.equal(ids[0], 'host-restart', 'v6 的 host-restart 必须落在声明位置 0')
+    // 规则断言而非逐位断言：新内置项插在**声明位置**（los-nodes 在 los-usage 之后，
+    // 于是它落在两者之间），而既有项之间的**相对顺序**必须保持。
+    assert.ok(ids.indexOf('los-usage') < ids.indexOf('surge-ai-rep'), '既有项相对顺序不得被迁移改动')
+    assert.ok(ids.indexOf('los-usage') < ids.indexOf('los-nodes'), '新内置项按声明顺序插入，不是追加到末尾')
+    assert.equal(w1.json.widgets.find((x) => x.id === 'surge-ai-rep').title, 'Surge 节点信誉')
 
     const disk1 = JSON.parse(readFileSync(storePath, 'utf8'))
-    assert.equal(disk1.widgetsVersion, 5, '迁移必须把版本写进信封（否则每次读都重迁）')
+    assert.equal(disk1.widgetsVersion, 6, '迁移必须把版本写进信封（否则每次读都重迁）')
     assert.equal(disk1.revision, 8, '迁移应走同一个 revision 守卫写，递增而非重置')
 
     // 幂等：版本已最新 ⇒ 第二次读不得再写盘
@@ -397,6 +401,38 @@ test('host 冒烟：新增内置 widget 迁移进既有 store + 用户删除不�
  * 整次 reapply 被放弃（dsh-scheduler 已因此假活过一次：状态接口 200、任务不再触发）。
  * 本用例在同一个 webServer 上跑 apply → dispose → apply，断言全程不抛、无残留。
  */
+test('host 冒烟：内置卡插在声明位置，但不动用户自己的卡', { skip: HOST_ROOT ? false : '未找到宿主 node_modules，跳过而非假装通过' }, async () => {
+  const dshHome = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'dsh-dash-insert-'))
+  const storeDir = join(dshHome, 'storages', 'dsh-dashboards')
+  mkdirSync(storeDir, { recursive: true })
+  // 用户自己加的卡在最前，且 store 里一条内置卡都没有。
+  const legacy = [
+    { id: 'mine-uptime', type: 'list', endpoint: '/dashboards/probe', title: '我的探活', refreshMs: 30000 },
+    { id: 'los-usage', type: 'stat', endpoint: '/dashboards/los/usage', title: 'LLM 用量 24h', refreshMs: 60000 },
+  ]
+  writeFileSync(join(storeDir, 'widgets.json'), JSON.stringify({ revision: 3, widgets: legacy }, null, 2))
+  const ctx = makeCtx()
+  try {
+    const mod = await loadPlugin(dshHome)
+    mod.apply(ctx, {})
+    const dash = findRoute(ctx.routes, '/dashboards')
+    const res = await callRoute(dash, '/dashboards/widgets')
+    const ids = res.json.widgets.map((x) => x.id)
+    // 新内置项落在"下一个已存在的内置项"之前（这里是 los-usage），所以用户自己摆在前面的
+    // 自定义卡**不会被顶下去**——这是刻意的：默认卡的"合理位置"不该覆盖用户的手工排序。
+    assert.equal(ids[0], 'mine-uptime', '用户自己加的卡保持在最前')
+    assert.equal(ids[1], 'host-restart', '新内置项插在下一个已存在的内置项之前')
+    assert.equal(ids[2], 'los-usage')
+    assert.ok(ids.indexOf('mine-uptime') < ids.indexOf('los-usage'), '用户卡的相对顺序必须保留')
+    assert.equal(res.json.widgets.find((x) => x.id === 'mine-uptime').title, '我的探活')
+    const onDisk = JSON.parse(readFileSync(join(storeDir, 'widgets.json'), 'utf8'))
+    assert.equal(onDisk.widgetsVersion, 6)
+  } finally {
+    try { ctx.dispose() } catch { /* ignore */ }
+    rmSync(dshHome, { recursive: true, force: true })
+  }
+})
+
 test('host 冒烟：config 重放安全 —— apply → dispose → apply 不得留下残留路由', { skip: HOST_ROOT ? false : '未找到宿主 node_modules（profile 未安装 @deepseek-ai/schemastery），跳过而非假装通过' }, async () => {
   const dshHome = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'dsh-dash-route-'))
   try {

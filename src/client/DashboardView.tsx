@@ -13,7 +13,7 @@ import css from './DashboardView.module.css'
 
 export interface WidgetConfig {
   id: string
-  type: 'stat' | 'matrix' | 'chart' | 'list' | 'feed' | 'surge' | 'packy' | 'tasks' | 'disk'
+  type: 'stat' | 'matrix' | 'chart' | 'list' | 'feed' | 'surge' | 'packy' | 'tasks' | 'disk' | 'host'
   endpoint: string
   title: string
   refreshMs: number
@@ -1116,6 +1116,129 @@ function FeedCard({ data, t }: { data: unknown; t: (k: string) => string }) {
   )
 }
 
+/**
+ * 宿主重启卡（2026-10-26）。
+ *
+ * 数据来自 host 侧 `/dashboards/host-restart`，而它的来源是 dsh-web-host-restart 的
+ * `/host-restart/status`——turns/pending/daemon 三个事实**只有一份实现**，本卡只读、
+ * 只发起请求，不自己判断能不能重启（判断在 host，四道闸门各带理由）。
+ *
+ * 二次确认做成卡内两步而不是弹窗：看板是一屏多卡，"点按钮弹一个全屏遮罩"比一行
+ * 确认更打断。确认文案必须说清会中断几个回合，`force` 是**另一个**按钮。
+ */
+function HostRestartCard({ data }: { data: unknown }) {
+  const d = (data ?? {}) as {
+    available?: boolean
+    reason?: string
+    plugin?: { halves?: Record<string, string> }
+    host?: { pid?: number; uptimeMs?: number }
+    daemon?: { phase?: string; childPid?: number | null; restarts?: number | null; lastRestartReason?: string | null }
+    turns?: { running?: number | null }
+    pending?: { count?: number; items?: { path: string; newerByMs: number }[] }
+  }
+  const [confirming, setConfirming] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [bad, setBad] = useState(false)
+
+  if (d.available === false) {
+    return <p className={css.muted}>{`宿主重启能力不可用：${d.reason ?? '未知原因'}`}</p>
+  }
+
+  const phase = d.daemon?.phase ?? 'unknown'
+  const dot: StateDotState = phase === 'healthy' ? 'done'
+    : phase === 'starting' || phase === 'child-exited' || phase === 'auto-reload' ? 'working'
+      : phase === 'unknown' ? 'idle' : 'error'
+  const running = d.turns?.running
+  const pending = d.pending?.count ?? 0
+
+  const send = async (force: boolean) => {
+    setBusy(true); setBad(false); setNotice(null)
+    try {
+      const res = await fetch('/host-restart/request', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-dsh-host-restart': '1' },
+        body: JSON.stringify({ confirm: true, ...(force ? { force: true } : {}), reason: 'dashboards card' }),
+      })
+      const body = await res.json().catch(() => ({})) as { ok?: boolean; code?: string; reason?: string }
+      if (res.status === 202 && body.ok === true) {
+        setConfirming(false)
+        setNotice('已受理：守护进程 3 秒内 TERM，约 20–45s 后新宿主可用，本卡会自动刷新。')
+        return
+      }
+      setBad(true)
+      setNotice(body.reason ?? body.code ?? `HTTP ${res.status}`)
+    } catch (error) {
+      setBad(true)
+      setNotice(error instanceof Error ? error.message : String(error))
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div className={css.hostCard}>
+      <p className={css.hostHead}>
+        <span className={css.rowDot}><StateDot state={dot} size={8} /></span>
+        <span className={css.hostPhase}>{phase}</span>
+        {typeof d.host?.pid === 'number' ? <span className={css.muted}>{`pid ${d.host.pid}`}</span> : null}
+        {typeof d.host?.uptimeMs === 'number' ? <span className={css.muted}>{`up ${fmtDuration(d.host.uptimeMs)}`}</span> : null}
+        {typeof d.daemon?.childPid === 'number' ? <span className={css.muted}>{`child ${d.daemon.childPid}`}</span> : null}
+        {typeof d.daemon?.restarts === 'number' ? <span className={css.muted}>{`重启 ${d.daemon.restarts}`}</span> : null}
+      </p>
+      <p className={css.hostRow}>
+        {typeof running === 'number' && running > 0
+          ? <span className={css.hostWarn}>{`在跑 ${running} 个会话`}</span>
+          : typeof running === 'number' ? <span className={css.muted}>没有会话在跑</span> : <span className={css.muted}>读不到会话数</span>}
+        {pending > 0
+          ? <span className={css.muted}>{`${pending} 个文件比宿主新（重启后生效）`}</span>
+          : <span className={css.muted}>没有文件比宿主新</span>}
+      </p>
+      {pending > 0 && d.pending?.items?.length ? (
+        <p className={css.hostFiles}>{d.pending.items.slice(0, 3).map((item) => item.path.split('/').pop()).join(' · ')}</p>
+      ) : null}
+
+      {notice !== null ? <p className={bad ? css.error : css.muted}>{notice}</p> : null}
+
+      {confirming ? (
+        <div className={css.hostConfirm}>
+          <p className={css.hostWarn}>
+            {typeof running === 'number' && running > 0
+              ? `确认重启？会中断在跑的 ${running} 个会话（这一线没有自动续跑）。`
+              : '确认重启？当前没有会话在跑。'}
+          </p>
+          <div className={css.hostActions}>
+            <button type="button" className={css.btn} onClick={() => setConfirming(false)} disabled={busy}>取消</button>
+            <button type="button" className={`${css.btn} ${css.btnPrimary}`} onClick={() => void send(false)} disabled={busy}>确认重启</button>
+            {typeof running === 'number' && running > 0 ? (
+              <button type="button" className={css.btn} onClick={() => void send(true)} disabled={busy}>仍然重启</button>
+            ) : null}
+          </div>
+        </div>
+      ) : (
+        <div className={css.hostActions}>
+          <button
+            type="button"
+            className={css.btn}
+            onClick={() => { setNotice(null); setBad(false); setConfirming(true) }}
+            disabled={phase === 'unhealthy' || phase === 'preflight-failed'}
+            title={phase === 'unhealthy' || phase === 'preflight-failed' ? '守护进程不健康，先修它再重启' : '重启这个 web 宿主'}
+          >
+            重启宿主
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 时长 → "3m" / "2.1h"。 */
+function fmtDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '—'
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`
+  if (ms < 86_400_000) return `${(ms / 3_600_000).toFixed(1)}h`
+  return `${Math.round(ms / 86_400_000)}d`
+}
+
 function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
   widget: WidgetConfig
   snap?: Snapshot
@@ -1172,6 +1295,8 @@ function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
           <ReconcileCard data={d} />
         ) : widget.type === 'disk' ? (
           <DiskCard data={d} t={t} />
+        ) : widget.type === 'host' ? (
+          <HostRestartCard data={d} />
         ) : (
           <p className={css.muted}>{t('noData')}</p>
         )}
