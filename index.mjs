@@ -233,6 +233,7 @@ const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/usage/reconcile',
   '/dashboards/xproj/sessions', '/dashboards/xproj/pain',
   '/dashboards/net/summary', '/dashboards/net/trend',
+  '/dashboards/gate/reasons',
   '/dashboards/z4pro',
   '/dashboards/host-restart',
 ])
@@ -297,6 +298,11 @@ const DEFAULT_WIDGETS = [
   // 跟 losPollMs 没意义（会比数据源本身快 5 倍地读同一份台账）。
   { id: 'net-summary', type: 'list', endpoint: '/dashboards/net/summary', title: '网络观测（信号）', refreshMs: 300000 },
   { id: 'net-trend', type: 'list', endpoint: '/dashboards/net/trend', title: '网络趋势（日桶）', refreshMs: 300000 },
+  // Rust 门禁原因直方图（2026-10-27）：数据面唯一写者是 dsfolder 的 rust-repo-gate-run.mjs
+  // （.rust-los-gov/gate-runs.jsonl，append-only）；本插件只读最后一行、只呈现。
+  // 为什么值得一张卡：`timeout: 3` 这种压平计数看不出「缺命令/权限/真超时」，三者处置完全不同
+  // （2026-10-08 那次假红就是这么被读错的）。60s 节奏：门禁每天 1 次，卡是给人随时看最近一次。
+  { id: 'gate-reasons', type: 'list', endpoint: '/dashboards/gate/reasons', title: 'Rust 门禁原因', refreshMs: 60000 },
   // 极空间 Z4Pro 设备健康（复用 list widget 渲染，客户端无需新增 widget 类型）
   // 120s 节奏：SSH + smartctl 全量采集约 3-6s，且盘/池是慢变量
   { id: 'z4pro-health', type: 'list', endpoint: '/dashboards/z4pro', title: '极空间 Z4Pro', refreshMs: 120000 },
@@ -781,6 +787,51 @@ function netSignalRow(name, level, detail) {
     degraded: lv === 'warn' || lv === 'degraded' || lv === 'unknown',
     detail: lv === 'unknown' ? `判不了 · ${detail ?? '—'}` : `${lv} · ${detail ?? '—'}`,
   }
+}
+
+/**
+ * Rust 门禁台账（dsfolder）末行的**原因直方图**。
+ *
+ * 数据面唯一写者：`dsfolder/scripts/rust-repo-gate-run.mjs`（append-only jsonl）。
+ * 本插件只读最后一行、只呈现 —— 不复算判定，也不把缺失补成 0：
+ *   · 台账缺失/读失败/末行坏 JSON ⇒ `degraded` 并点名原因（**不是 0 行**）
+ *   · 末行没有 `reasons`（旧版 runner 写的）或桶和 != checks ⇒ 第 0 行直接报违约
+ * 这三条对应本项目反复踩过的「空即通过」：没有数据 ≠ 全部通过。
+ */
+async function collectGateReasons() {
+  const file = join(homedir(), 'syncfolder/project/dsfolder/.rust-los-gov/gate-runs.jsonl')
+  const src = dirname(file)
+  const degradedOut = (why) => ({ asOf: null, degraded: { reasons: [why] }, results: [], total: 0, source: src })
+  if (!existsSync(file)) return degradedOut(`未找到门禁台账：${file}`)
+  let last
+  try {
+    const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean)
+    last = lines[lines.length - 1]
+  } catch (e) {
+    return degradedOut(`读台账失败：${e.message}`)
+  }
+  let row
+  try { row = JSON.parse(last) } catch (e) {
+    return degradedOut(`台账末行不是合法 JSON：${e.message}`)
+  }
+  const reasons = row.reasons ?? {}
+  const checks = Number(row.checks ?? 0)
+  const sum = Object.values(reasons).reduce((a, b) => a + b, 0)
+  const violations = []
+  if (!Object.prototype.hasOwnProperty.call(row, 'reasons')) violations.push('该行没有 reasons 字段（旧版 runner 写的，升版前的原因不可见）')
+  if (sum !== checks) violations.push(`桶和 ${sum} != checks ${checks}`)
+  const bucketState = (k) => (k === 'pass' ? 'pass'
+    : (k.startsWith('env:') || k.startsWith('timeout:')) ? 'unknown'
+    : k.startsWith('skip:') ? 'warn'
+    : (k.startsWith('fail:') || k.startsWith('error:')) ? 'fail' : 'unknown')
+  const rows = [netSignalRow('台账', violations.length ? 'fail' : 'pass',
+    `${row.ts ?? '—'} · checks ${checks} · 桶和 ${sum}${violations.length ? ` · ${violations.join('；')}` : ''}`)]
+  const ordered = Object.entries(reasons).sort((a, b) => b[1] - a[1])
+  for (const [k, v] of ordered) rows.push(netSignalRow(k, bucketState(k), `${v} 条`))
+  if (!ordered.length) rows.push(netSignalRow('原因', 'unknown', '该行没有任何桶 —— 不是"全绿"，是没记录'))
+  const asOf = row.ts ?? null
+  const ageMs = asOf ? Math.max(0, Date.now() - Date.parse(asOf)) : null
+  return { asOf, ageMs, degraded: violations.length ? { reasons: violations } : null, results: rows, total: rows.length, source: src }
 }
 
 async function collectNetSummary() {
@@ -1984,7 +2035,7 @@ function round2(n) { return Math.round(n * 100) / 100 }
 // 2026-10-25：4 → 5，新增 net-summary / net-trend 两张内置卡（A 批）。
 // 2026-10-26：5 → 6，新增 host-restart（宿主重启卡）。
 // 同一个坑第三次提醒：store 存在即完全取代 DEFAULT_WIDGETS，不 bump ⇒ 对已有安装静默不可见。
-const DEFAULT_WIDGETS_VERSION = 6
+const DEFAULT_WIDGETS_VERSION = 7
 
 /**
  * Merge newly added built-in widgets into an existing store **at their declared
@@ -2284,6 +2335,7 @@ export function apply(ctx, config) {
   // 网络观测（A 批）：读入口是外部脚本（spawn），给足 15s 超时；数据源每小时 1 条 ⇒ 5 分钟足够
   const netSummary = makePoller({ id: 'net-summary', collect: () => collectNetSummary(), intervalMs: 300000, timeoutMs: 20000 })
   const netTrend = makePoller({ id: 'net-trend', collect: () => collectNetTrend(), intervalMs: 300000, timeoutMs: 20000 })
+  const gateReasons = makePoller({ id: 'gate-reasons', collect: () => collectGateReasons(), intervalMs: 60000, timeoutMs: 10000 })
   // 看门狗：单次采集整体 12s 硬上限（基座 timeoutMs 兜底），df/iostat 卡挂载也只降级该拍
   const macos = makePoller({ id: 'macos', collect: () => collectMacos(cfg), intervalMs: cfg.macos.pollMs, timeoutMs: PROBE_TOTAL_TIMEOUT_MS })
   const probe = makePoller({ id: 'probe', collect: () => collectProbe(cfg), intervalMs: cfg.probe.pollMs })
@@ -2502,6 +2554,7 @@ export function apply(ctx, config) {
     '/dashboards/xproj/sessions': xprojSessions,
     '/dashboards/xproj/pain': xprojPain,
     '/dashboards/net/summary': netSummary,
+    '/dashboards/gate/reasons': gateReasons,
     '/dashboards/net/trend': netTrend,
     '/dashboards/macos': macos,
     '/dashboards/macos/history': historyPoller,
@@ -2757,6 +2810,7 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/xproj/sessions') { sendJson(res, 200, await xprojSessions.get()); return }
         if (method === 'GET' && path === '/dashboards/xproj/pain') { sendJson(res, 200, await xprojPain.get()); return }
         if (method === 'GET' && path === '/dashboards/net/summary') { sendJson(res, 200, await netSummary.get()); return }
+        if (method === 'GET' && path === '/dashboards/gate/reasons') { sendJson(res, 200, await gateReasons.get()); return }
         if (method === 'GET' && path === '/dashboards/net/trend') { sendJson(res, 200, await netTrend.get()); return }
         if (method === 'GET' && path === '/dashboards/macos') { const s = await macos.get(); if (cfg.macos.enabled && !s.data) await macos.refresh(); sendJson(res, 200, s); return }
         if (method === 'GET' && path === '/dashboards/macos/history') {

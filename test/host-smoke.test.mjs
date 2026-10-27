@@ -365,9 +365,10 @@ test('host 冒烟：新增内置 widget 迁移进既有 store + 用户删除不�
     assert.ok(ids.indexOf('los-usage') < ids.indexOf('surge-ai-rep'), '既有项相对顺序不得被迁移改动')
     assert.ok(ids.indexOf('los-usage') < ids.indexOf('los-nodes'), '新内置项按声明顺序插入，不是追加到末尾')
     assert.equal(w1.json.widgets.find((x) => x.id === 'surge-ai-rep').title, 'Surge 节点信誉')
+    assert.ok(ids.includes('gate-reasons'), 'v7 新增的 gate-reasons 必须出现在迁移后的清单里')
 
     const disk1 = JSON.parse(readFileSync(storePath, 'utf8'))
-    assert.equal(disk1.widgetsVersion, 6, '迁移必须把版本写进信封（否则每次读都重迁）')
+    assert.equal(disk1.widgetsVersion, 7, '迁移必须把版本写进信封（否则每次读都重迁）')
     assert.equal(disk1.revision, 8, '迁移应走同一个 revision 守卫写，递增而非重置')
 
     // 幂等：版本已最新 ⇒ 第二次读不得再写盘
@@ -426,7 +427,7 @@ test('host 冒烟：内置卡插在声明位置，但不动用户自己的卡', 
     assert.ok(ids.indexOf('mine-uptime') < ids.indexOf('los-usage'), '用户卡的相对顺序必须保留')
     assert.equal(res.json.widgets.find((x) => x.id === 'mine-uptime').title, '我的探活')
     const onDisk = JSON.parse(readFileSync(join(storeDir, 'widgets.json'), 'utf8'))
-    assert.equal(onDisk.widgetsVersion, 6)
+    assert.equal(onDisk.widgetsVersion, 7)
   } finally {
     try { ctx.dispose() } catch { /* ignore */ }
     rmSync(dshHome, { recursive: true, force: true })
