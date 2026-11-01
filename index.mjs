@@ -236,8 +236,12 @@ const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/gate/reasons',
   '/dashboards/z4pro',
   '/dashboards/host-restart',
+  '/dashboards/health',
+  '/dashboards/superagent',
 ])
 
+/** superagent 调度快照（dsfolder 的 superagent-status --snapshot 每轮原子写入）。 */
+const SUPERAGENT_STATUS_FILE = join(homedir(), '.dsh/superagent-reports/status.json')
 /** Surge 节点信誉数据源（surge-auto ai-node-reputation 输出）。 */
 const SURGE_STATE_FILE = join(homedir(), '.local/state/surge-auto/ai-reputation-state.json')
 const SURGE_EVENTS_FILE = join(homedir(), '.local/state/surge-auto/health-watch-events.jsonl')
@@ -306,6 +310,16 @@ const DEFAULT_WIDGETS = [
   // 极空间 Z4Pro 设备健康（复用 list widget 渲染，客户端无需新增 widget 类型）
   // 120s 节奏：SSH + smartctl 全量采集约 3-6s，且盘/池是慢变量
   { id: 'z4pro-health', type: 'list', endpoint: '/dashboards/z4pro', title: '极空间 Z4Pro', refreshMs: 120000 },
+  // 健康摘要（2026-10-28）：dsh-health-panel 原本注册第 9 个 conversation.view，
+  // 被 tab 条溢出菜单吞掉（实测 scrollWidth==clientWidth 只容 8 个）⇒ 用户从来看不见。
+  // 裁决：诊断层不占导航，降级为这张摘要卡；详情仍在它自己的 /health-panel/report。
+  // 追加在末尾而非插到中间：store 优先的迁移按"缺失项追加"，插到中间会打乱既有顺序。
+  { id: 'health-panel', type: 'list', endpoint: '/dashboards/health', title: '健康（诊断）', refreshMs: 60000 },
+  // superagent 调度闭环（2026-11-01）：读 dsfolder 的 tick 快照
+  // （~/.dsh/superagent-reports/status.json）。为什么值得一张卡：这块能力有 5 条判据
+  // 各自可跑，但"现在要不要我出手"原先散在四条命令里 —— 没人问就等于没有观测面。
+  // 快照由 tick 每 30 分钟原子写入，本插件只读、只呈现，不做任何判定。
+  { id: 'superagent', type: 'list', endpoint: '/dashboards/superagent', title: 'superagent 调度', refreshMs: 60000 },
 ]
 
 /** /dashboards/snapshot 单 widget 最坏等待（2026-09-01 per-widget deadline；
@@ -832,6 +846,56 @@ async function collectGateReasons() {
   const asOf = row.ts ?? null
   const ageMs = asOf ? Math.max(0, Date.now() - Date.parse(asOf)) : null
   return { asOf, ageMs, degraded: violations.length ? { reasons: violations } : null, results: rows, total: rows.length, source: src }
+}
+
+/**
+ * superagent 调度快照（只读、只呈现）。
+ *
+ * 数据面：`~/.dsh/superagent-reports/status.json`，由 dsfolder 的
+ * `scripts/superagent-status.mjs --snapshot` 每轮原子写入（tmp + rename）。
+ * 判定权在 dsfolder（card-state / maintenance / session-signal / escalation），
+ * 本函数**不做任何判定**，只把三个桶与维护期翻译成几行。
+ *
+ * 三态必须分开（V3：空态与故障态是两句话）：
+ *   · 文件不存在 ⇒ "还没生成过快照"（degraded，含下一步：跑一次 tick）
+ *   · JSON 不可解析 ⇒ "快照坏了"（degraded，点名原因）
+ *   · 正常但计数为 0 ⇒ 如实呈现 0，而不是说"无异常"
+ */
+export async function collectSuperagentStatus(file = SUPERAGENT_STATUS_FILE) {
+  const src = dirname(file)
+  const degradedOut = (why) => ({
+    asOf: null, degraded: { reasons: [why] }, results: [], total: 0, source: src,
+    resultsFallback: [netSignalRow('快照', 'unknown', why)],
+  })
+  if (!existsSync(file)) return degradedOut(`还没有快照（${file}）——跑一次 superagent-tick 就会生成`)
+  let doc
+  try { doc = JSON.parse(readFileSync(file, 'utf8')) } catch (e) { return degradedOut(`快照不可解析：${e.message}`) }
+  const counts = doc.counts ?? {}
+  const maint = doc.maintenance ?? {}
+  const rows = []
+  rows.push(netSignalRow('快照新鲜度', 'pass', `${doc.at ?? '—'}`))
+  rows.push(netSignalRow('维护期', maint.blocksDispatch ? 'warn' : 'pass',
+    `${maint.state ?? 'unknown'}${maint.blocksDispatch ? '（拦截派发）' : ''} · ${maint.reason ?? '—'}`))
+  rows.push(netSignalRow('可派', (counts.ready ?? 0) > 0 ? 'pass' : 'unknown', `${counts.ready ?? 0} 张`))
+  rows.push(netSignalRow('在跑', (counts.running ?? 0) > 0 ? 'pass' : 'unknown', `${counts.running ?? 0} 张`))
+  // 需你处理 > 0 是**真信号**（不是故障）：停在 warn 而不是 fail —— 它要人出手，但系统没坏
+  rows.push(netSignalRow('需你处理', (counts.actionable ?? 0) > 0 ? 'warn' : 'pass', `${counts.actionable ?? 0} 张`))
+  rows.push(netSignalRow('历史遗留', (counts.stale ?? 0) > 0 ? 'warn' : 'pass', `${counts.stale ?? 0} 张（结束但无可核回报）`))
+  for (const item of (doc.actionable ?? []).slice(0, 5)) {
+    rows.push(netSignalRow(`✋ ${item.id ?? '?'}`, 'warn', String(item.why ?? '—')))
+  }
+  for (const item of (doc.running ?? []).slice(0, 5)) {
+    rows.push(netSignalRow(`⏳ ${item.id ?? '?'}`, item.verdict === 'progress' ? 'pass' : (item.verdict === 'unknown' ? 'unknown' : 'warn'),
+      `${item.verdict ?? '?'}${item.quietMin == null ? '' : ` · 静默 ${item.quietMin}m`} · ${item.reason ?? '—'}`))
+  }
+  return {
+    asOf: doc.at ?? null,
+    state: (counts.actionable ?? 0) > 0 ? 'needs-you' : (doc.stale?.length ? 'stale' : 'ok'),
+    degraded: doc.ledgerIssue ? { reasons: [doc.ledgerIssue] } : null,
+    results: rows,
+    total: rows.length,
+    source: src,
+  }
 }
 
 async function collectNetSummary() {
@@ -2035,7 +2099,7 @@ function round2(n) { return Math.round(n * 100) / 100 }
 // 2026-10-25：4 → 5，新增 net-summary / net-trend 两张内置卡（A 批）。
 // 2026-10-26：5 → 6，新增 host-restart（宿主重启卡）。
 // 同一个坑第三次提醒：store 存在即完全取代 DEFAULT_WIDGETS，不 bump ⇒ 对已有安装静默不可见。
-const DEFAULT_WIDGETS_VERSION = 7
+const DEFAULT_WIDGETS_VERSION = 9
 
 /**
  * Merge newly added built-in widgets into an existing store **at their declared
@@ -2336,6 +2400,7 @@ export function apply(ctx, config) {
   const netSummary = makePoller({ id: 'net-summary', collect: () => collectNetSummary(), intervalMs: 300000, timeoutMs: 20000 })
   const netTrend = makePoller({ id: 'net-trend', collect: () => collectNetTrend(), intervalMs: 300000, timeoutMs: 20000 })
   const gateReasons = makePoller({ id: 'gate-reasons', collect: () => collectGateReasons(), intervalMs: 60000, timeoutMs: 10000 })
+  const superagent = makePoller({ id: 'superagent', collect: () => collectSuperagentStatus(), intervalMs: 60000, timeoutMs: 10000 })
   // 看门狗：单次采集整体 12s 硬上限（基座 timeoutMs 兜底），df/iostat 卡挂载也只降级该拍
   const macos = makePoller({ id: 'macos', collect: () => collectMacos(cfg), intervalMs: cfg.macos.pollMs, timeoutMs: PROBE_TOTAL_TIMEOUT_MS })
   const probe = makePoller({ id: 'probe', collect: () => collectProbe(cfg), intervalMs: cfg.probe.pollMs })
@@ -2384,6 +2449,87 @@ export function apply(ctx, config) {
     collect: () => collectHostRestart(cfg),
     intervalMs: 15_000,
     timeoutMs: 6_000,
+  })
+
+  // 健康摘要（2026-10-28）：只做形态适配，采集仍归 dsh-health-panel 的 /health-panel/status
+  // （同源回环）。失败必须返回一行「读不到」而不是空 results —— 空数组会被渲染成「无异常」，
+  // 正是本项目反复登记的反模式。
+  // 健康摘要（2026-10-28，第二版）。
+  //
+  // 第一版走跨插件 HTTP（fetch /health-panel/status），实测**三行全红**：
+  //   · health-panel 内部调 `/api/pluginInventory/list` 是 RPC 网关、需要鉴权，裸 fetch
+  //     拿到纯文本 "unauthorized"，`res.json()` 抛 SyntaxError ⇒「读不到插件树」永久红；
+  //   · `/health-panel/status` 不带 `?session=` ⇒ 无 cwd ⇒ 无 project ⇒「未匹配到项目」永久红；
+  //   · 日志行判据是「有 error 行就红」，DSH 每天都在写 error ⇒ 永久红。
+  // 三行全红的健康卡比没有卡更糟（违反「空态与故障态两句」与「卡片状态点与告警同一判定」）。
+  //
+  // 第二版改为**全部读同进程快照**，零跨插件 HTTP、零鉴权依赖：
+  //   ①宿主进程 ②回合/待写盘（都来自 host-restart 快照）③本插件数据源失败数。
+  // 这三件是「DSH 现在好不好」的最小充分集，每行都有可复算判据。
+  const healthPanel = makePoller({
+    id: 'health-panel',
+    collect: async () => {
+      const rows = []
+      try {
+        const snap = await hostRestart.get()
+        const d = snap?.data ?? {}
+        const phase = d.daemon?.phase ?? 'unknown'
+        const busy = phase === 'starting' || phase === 'child-exited' || phase === 'auto-reload'
+        const upMin = Number.isFinite(d.host?.uptimeMs) ? Math.round(d.host.uptimeMs / 60000) : null
+        rows.push({
+          name: '宿主进程',
+          ok: phase === 'healthy',
+          degraded: busy,
+          detail:
+            `${phase === 'healthy' ? '运行正常' : phase}` +
+            `${upMin !== null ? ` · 已运行 ${upMin} 分钟` : ''}` +
+            ` · 累计重启 ${d.daemon?.restarts ?? '—'} 次` +
+            `${d.daemon?.alert ? ` · ⚠️ ${d.daemon.alert}` : ''}`,
+        })
+        const pending = d.pending?.count
+        rows.push({
+          name: '回合 / 待写盘',
+          ok: (pending ?? 0) === 0,
+          degraded: false,
+          detail: `运行中回合 ${d.turns?.running ?? '—'} · 待写盘 ${pending ?? '—'} 条`,
+        })
+      } catch (e) {
+        rows.push({ name: '宿主进程', ok: false, detail: `读不到宿主状态：${String(e).slice(0, 100)}` })
+      }
+      try {
+        const st = dashStatus()
+        const flat = []
+        const walk = (v) => {
+          if (Array.isArray(v)) { v.forEach(walk); return }
+          if (!v || typeof v !== 'object') return
+          if (v.stats && typeof v.stats === 'object') { flat.push(v); return }
+          for (const [k, x] of Object.entries(v)) { if (k !== 'stats') walk(x) }
+        }
+        walk(st.backends ?? {})
+        // 判据只看「真的失败过」（consecutiveFails > 0）。
+        // `hasData === false` 单独不能算异常：本插件是**懒轮询**（没人打开看板就不采），
+        // 而且宿主刚重启时所有后端都是 refreshCount=0 ⇒ 拿 hasData 当判据会让这一行
+        // **常年红灯**（2026-10-28 实测：重启后立刻报「14 个后端 14 个异常」，而每个
+        // 后端都是 fails=0 / refresh=0 = 从未采样）。「尚未采样」是事实，不是故障。
+        const failed = flat.filter((b) => (b.stats?.consecutiveFails ?? 0) > 0)
+        const cold = flat.filter((b) => b.hasData === false && (b.stats?.consecutiveFails ?? 0) === 0)
+        rows.push({
+          name: '数据源',
+          ok: failed.length === 0,
+          // 1-2 个后端失败 = 降级（部分卡片没数据），3 个以上才算故障
+          degraded: failed.length > 0 && failed.length <= 2,
+          detail:
+            `${flat.length} 个后端 · ${failed.length} 个失败` +
+            (failed.length ? `：${failed.slice(0, 3).map((b) => b.stats?.id ?? '?').join(', ')}` : '') +
+            (cold.length ? ` · ${cold.length} 个尚未采样（看板懒轮询，打开后才采）` : ''),
+        })
+      } catch (e) {
+        rows.push({ name: '数据源', ok: false, detail: `读不到后端状态：${String(e).slice(0, 100)}` })
+      }
+      return { results: rows }
+    },
+    intervalMs: 60_000,
+    timeoutMs: 8_000,
   })
   const z4pro = makePoller({
     id: 'z4pro',
@@ -2555,6 +2701,7 @@ export function apply(ctx, config) {
     '/dashboards/xproj/pain': xprojPain,
     '/dashboards/net/summary': netSummary,
     '/dashboards/gate/reasons': gateReasons,
+    '/dashboards/superagent': superagent,
     '/dashboards/net/trend': netTrend,
     '/dashboards/macos': macos,
     '/dashboards/macos/history': historyPoller,
@@ -2570,6 +2717,7 @@ export function apply(ctx, config) {
     '/dashboards/usage/reconcile': usageReconcile,
     '/dashboards/z4pro': z4pro,
     '/dashboards/host-restart': hostRestart,
+    '/dashboards/health': healthPanel,
   }
 
   const timers = [
@@ -2592,6 +2740,7 @@ export function apply(ctx, config) {
     // 15s：重启期间 child-exited → starting → healthy 变得很快，慢了卡片会显示旧
     // child pid，读起来像"按钮没生效"。
     startPoller(hostRestart, 15_000),
+    startPoller(healthPanel, 60_000),
   ]
 
   // ── 磁盘告警（独立于看板 idle 门控：看板未打开也持续检查，主动推飞书） ──
@@ -2811,6 +2960,7 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/xproj/pain') { sendJson(res, 200, await xprojPain.get()); return }
         if (method === 'GET' && path === '/dashboards/net/summary') { sendJson(res, 200, await netSummary.get()); return }
         if (method === 'GET' && path === '/dashboards/gate/reasons') { sendJson(res, 200, await gateReasons.get()); return }
+        if (method === 'GET' && path === '/dashboards/superagent') { sendJson(res, 200, await superagent.get()); return }
         if (method === 'GET' && path === '/dashboards/net/trend') { sendJson(res, 200, await netTrend.get()); return }
         if (method === 'GET' && path === '/dashboards/macos') { const s = await macos.get(); if (cfg.macos.enabled && !s.data) await macos.refresh(); sendJson(res, 200, s); return }
         if (method === 'GET' && path === '/dashboards/macos/history') {
@@ -2859,6 +3009,7 @@ export function apply(ctx, config) {
         if (method === 'GET' && path === '/dashboards/usage/reconcile') { sendJson(res, 200, await usageReconcile.get()); return }
         if (method === 'GET' && path === '/dashboards/z4pro') { sendJson(res, 200, await z4pro.get()); return }
         if (method === 'GET' && path === '/dashboards/host-restart') { sendJson(res, 200, await hostRestart.get()); return }
+        if (method === 'GET' && path === '/dashboards/health') { sendJson(res, 200, await healthPanel.get()); return }
         if (method === 'GET' && path === '/dashboards/widgets') {
           const store = loadWidgetStore()
           sendJson(res, 200, { ts: new Date().toISOString(), widgets: store.widgets, revision: store.revision, source: store.exists ? 'store' : 'default' })

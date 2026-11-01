@@ -9,6 +9,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ConvViewProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { MarkdownText, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
+// 词表唯一实现在 host 侧 lib/format.mjs（V1：新鲜度渲染成词、未来时间夹到 0）。
+// 渲染层不再自建一份 —— 2026-10-28 实测两套实现已给出不同说法（`3m` vs `3 分钟前`）。
+import { ago as formatAgo } from '../../lib/format.mjs'
 import css from './DashboardView.module.css'
 
 export interface WidgetConfig {
@@ -47,7 +50,7 @@ const fmtTokens = (v: number | null | undefined): string => {
   return String(v)
 }
 const fmtDur = (ms: number | null | undefined): string => {
-  if (ms == null) return '—'
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return '—'
   if (ms < 1000) return `${ms.toFixed(0)}ms`
   const s = ms / 1000
   if (s < 60) return `${s.toFixed(1)}s`
@@ -157,7 +160,7 @@ const fmtReset = (ts?: number | string | null): string => {
   const t = new Date(ts).getTime()
   if (!Number.isFinite(t)) return ''
   const diff = t - Date.now()
-  const clock = new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  const clock = new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })
   if (diff <= 0) return `${clock} 重置`
   const min = Math.ceil(diff / 60000)
   const rel = min >= 60 ? `${Math.floor(min / 60)}h${min % 60 >= 10 ? `${min % 60}m` : ''}` : `${min}m`
@@ -540,8 +543,17 @@ function DiskCard({ data, t }: { data: unknown; t: (k: string) => string }) {
 
 function NodeMatrix({ data, t }: { data: unknown; t: (k: string) => string }) {
   const rows = (data as NodeRow[] | null) ?? []
+  const [showOffline, setShowOffline] = useState(false)
   if (!rows.length) return <p className={css.muted}>{t('noData')}</p>
   const dot = (s: string): StateDotState => (s === 'online' ? 'done' : s === 'offline' ? 'error' : 'warning')
+  // 2026-10-28：默认只列在线节点。
+  // 实测 30 行里 22 行 offline（心跳 6013124s ≈ 69 天）占了 60% 卡片高度，把 8 台
+  // 活着的挤在顶上，且它们只有一堆「—」。离线不是"没有数据"，是老账：收成一行汇总，
+  // 想看得点开。心跳也改成人话（`69 天前` 而不是 `6013124s`）。
+  const online = rows.filter((n) => n.status !== 'offline')
+  const offline = rows.filter((n) => n.status === 'offline')
+  const oldest = offline.reduce((m, n) => Math.max(m, Number(n.heartbeatAgeSec) || 0), 0)
+  const visible = showOffline ? online.concat(offline) : online
   return (
     <table className={css.table}>
       <thead>
@@ -551,7 +563,7 @@ function NodeMatrix({ data, t }: { data: unknown; t: (k: string) => string }) {
         </tr>
       </thead>
       <tbody>
-        {rows.map((n) => (
+        {visible.map((n) => (
           <tr key={n.nodeId}>
             <td className={css.wrap}>
               <span className={css.mono}>{n.nodeId}</span>
@@ -571,9 +583,20 @@ function NodeMatrix({ data, t }: { data: unknown; t: (k: string) => string }) {
               {n.capacity?.memoryTotalMb != null ? `/${(n.capacity.memoryTotalMb / 1024).toFixed(0)}G` : ''}
             </td>
             <td>{n.capacity?.platform ?? '—'}{n.capacity?.arch ? ` ${n.capacity.arch}` : ''}</td>
-            <td className={css.num}>{n.heartbeatAgeSec != null ? `${n.heartbeatAgeSec}s` : '—'}</td>
+            <td className={css.num}>{fmtAgeSec(n.heartbeatAgeSec)}</td>
           </tr>
         ))}
+        {offline.length > 0 ? (
+          <tr>
+            <td colSpan={6}>
+              <button type="button" className={css.nodeMore} onClick={() => { setShowOffline(!showOffline) }}>
+                {showOffline
+                  ? `收起 ${offline.length} 个离线节点`
+                  : `${online.length} 台在线 · 另有 ${offline.length} 个离线目标（最久 ${fmtAgeSec(oldest)}未探测）· 展开`}
+              </button>
+            </td>
+          </tr>
+        ) : null}
       </tbody>
     </table>
   )
@@ -659,24 +682,17 @@ interface SurgeRepData {
   error?: string | null
 }
 
+/** 年龄秒数 → 与 fmtAgo 同一套词（`—` / 刚刚 / N 分钟前 …），不再自造 `3m`。 */
 const fmtAgeSec = (sec: number | null | undefined): string => {
-  if (sec == null) return '—'
-  if (sec < 60) return `${sec}s`
-  if (sec < 3600) return `${Math.floor(sec / 60)}m`
-  return `${(sec / 3600).toFixed(1)}h`
+  if (sec == null || !Number.isFinite(sec)) return '—'
+  return formatAgo(Date.now() - Math.max(0, sec) * 1000)
 }
 
+/** ISO 时间 → 「刚刚 / N 分钟前 / N 小时前 / N 天前」；解析不了给 `—`。 */
 const fmtAgo = (iso: string | null | undefined): string => {
   if (!iso) return '—'
-  const diff = Date.now() - new Date(iso).getTime()
-  if (!Number.isFinite(diff)) return '—'
-  const s = Math.floor(diff / 1000)
-  if (s < 60) return `${s}s 前`
-  const m = Math.floor(s / 60)
-  if (m < 60) return `${m}min`
-  const h = Math.floor(m / 60)
-  if (h < 48) return `${h}h`
-  return `${Math.floor(h / 24)}d`
+  const at = new Date(iso).getTime()
+  return Number.isFinite(at) ? formatAgo(at) : '—'
 }
 
 function SurgeNodeTable({ data, t }: { data: unknown; t: (k: string) => string }) {
@@ -1053,7 +1069,7 @@ function ListCard({ data }: { data: unknown }) {
                 <span className={css.rowDot}><StateDot state={rowDot(r)} size={8} /></span>
                 <span className={rowCls(r)}>{rowText(r)}</span>
               </td>
-              <td className={css.num}>{r.latencyMs != null ? `${r.latencyMs}ms` : '—'}</td>
+              <td className={css.num}>{typeof r.latencyMs === 'number' && r.latencyMs >= 0 ? `${r.latencyMs}ms` : '—'}</td>
               <td className={css.muted}>{r.detail ?? '—'}</td>
             </tr>
           ))}
@@ -1184,11 +1200,11 @@ function HostRestartCard({ data, t }: { data: unknown; t: (k: string) => string 
     <div className={css.hostCard}>
       <p className={css.hostHead}>
         <span className={css.rowDot}><StateDot state={dot} size={8} /></span>
-        <span className={css.hostPhase}>{phase}</span>
+        <span className={css.hostPhase} title={`phase: ${phase}`}>{phaseLabel(phase)}</span>
         {typeof d.host?.pid === 'number' ? <span className={css.muted}>{`pid ${d.host.pid}`}</span> : null}
-        {typeof d.host?.uptimeMs === 'number' ? <span className={css.muted}>{`up ${fmtDuration(d.host.uptimeMs)}`}</span> : null}
+        {typeof d.host?.uptimeMs === 'number' ? <span className={css.muted}>{`已运行 ${fmtDuration(d.host.uptimeMs)}`}</span> : null}
         {typeof d.daemon?.childPid === 'number' ? <span className={css.muted}>{`child ${d.daemon.childPid}`}</span> : null}
-        {typeof d.daemon?.restarts === 'number' ? <span className={css.muted}>{`重启 ${d.daemon.restarts}`}</span> : null}
+        {typeof d.daemon?.restarts === 'number' ? <span className={css.muted}>{`累计重启 ${d.daemon.restarts} 次`}</span> : null}
       </p>
       <p className={css.hostRow}>
         {typeof running === 'number' && running > 0
@@ -1199,7 +1215,7 @@ function HostRestartCard({ data, t }: { data: unknown; t: (k: string) => string 
           : <span className={css.muted}>没有文件比宿主新</span>}
       </p>
       {pending > 0 && d.pending?.items?.length ? (
-        <p className={css.hostFiles}>{d.pending.items.slice(0, 3).map((item) => item.path.split('/').pop()).join(' · ')}</p>
+        <p className={css.hostFiles}>{d.pending.items.slice(0, 3).map((item) => item.path.split('/').slice(-3).join('/')).join(' · ')}</p>
       ) : null}
 
       {notice !== null ? <p className={bad ? css.error : css.muted} title={rawReason ?? undefined}>{notice}</p> : null}
@@ -1270,10 +1286,24 @@ function translateCode(
 /** 时长 → "3m" / "2.1h"。 */
 function fmtDuration(ms: number): string {
   if (!Number.isFinite(ms) || ms < 0) return '—'
-  if (ms < 60_000) return `${Math.round(ms / 1000)}s`
-  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`
-  if (ms < 86_400_000) return `${(ms / 3_600_000).toFixed(1)}h`
-  return `${Math.round(ms / 86_400_000)}d`
+  if (ms < 60_000) return `${Math.round(ms / 1000)} 秒`
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)} 分钟`
+  if (ms < 86_400_000) return `${(ms / 3_600_000).toFixed(1)} 小时`
+  return `${Math.round(ms / 86_400_000)} 天`
+}
+
+/** 宿主守护进程 phase → 中文；技术名保留在 title 里。 */
+function phaseLabel(phase: string): string {
+  switch (phase) {
+    case 'healthy': return '运行正常'
+    case 'starting': return '启动中'
+    case 'child-exited': return '子进程已退出'
+    case 'auto-reload': return '热重载中'
+    case 'unhealthy': return '不健康'
+    case 'preflight-failed': return '预检失败'
+    case 'unknown': return '未知'
+    default: return phase
+  }
 }
 
 function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
@@ -1291,7 +1321,7 @@ function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
       <header className={css.cardHeader}>
         <p className={css.cardTitle}>{widget.title}</p>
         <span className={css.cardMeta}>
-          {snap?.ts ? <span className={css.muted}>{t('updated')} {new Date(snap.ts).toLocaleTimeString()}</span> : null}
+          {snap?.ts ? <span className={css.muted} title={snap.ts}>{t('updated')} {fmtAgo(snap.ts)}</span> : null}
           {editing ? (
             <button
               type="button"

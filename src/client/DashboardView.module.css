@@ -673,3 +673,21 @@
   border-radius: 8px;
   background: var(--dsw-alias-bg-layer-1);
 }
+
+/* 离线节点汇总行（2026-10-28）：一行可点文本，替代 22 行「—」表格行。
+   用 label-secondary 而非 muted：它可点，必须看起来像个入口。 */
+.nodeMore {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, #5c6a60);
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nodeMore:hover {
+  color: var(--dsw-alias-label-primary, #141a15);
+  text-decoration: underline;
+}
