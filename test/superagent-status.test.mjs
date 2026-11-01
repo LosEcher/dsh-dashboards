@@ -53,6 +53,20 @@ test('③ 正常快照 ⇒ 六行基础行 + actionable 条目被点名', async 
   assert.match(s.results.find((r) => r.name === '✋ T9').detail, /连续失败 2 次/)
 })
 
+test('⑥ 字段缺失（老快照/形状变了）⇒ 该行 unknown 并点名，不冒充 0', async () => {
+  const d = dir()
+  const p = write(d, 'status.json', JSON.stringify({
+    at: '2026-11-01T11:21:38.033Z',
+    maintenance: { state: 'idle', blocksDispatch: false, reason: 'no-request' },
+    counts: { cards: 3 },
+    actionable: [], running: [], stale: [], ledgerIssue: null,
+  }))
+  const s = await collectSuperagentStatus(p)
+  const row = s.results.find((r) => r.name === '可派')
+  assert.equal(row.degraded, true)
+  assert.match(row.detail, /没有这个字段/)
+})
+
 test('④ 维护期拦截派发 ⇒ warn；台账坏 ⇒ degraded（两条独立判据）', async () => {
   const d = dir()
   const p = write(d, 'status.json', JSON.stringify({
@@ -70,7 +84,7 @@ test('④ 维护期拦截派发 ⇒ warn；台账坏 ⇒ degraded（两条独立
   assert.equal(s.state, 'ok', '台账坏是另一条判据（degraded），不改变分桶结论')
 })
 
-test('⑤ 计数全 0 ⇒ 如实 0，且"需你处理"是 pass 不是 fail', async () => {
+test('⑤ 计数全 0 ⇒ 如实 0（不是"判不了"），且"需你处理"是 pass 不是 fail', async () => {
   const d = dir()
   const p = write(d, 'status.json', JSON.stringify({
     at: '2026-11-01T11:21:38.033Z',
@@ -82,4 +96,10 @@ test('⑤ 计数全 0 ⇒ 如实 0，且"需你处理"是 pass 不是 fail', asy
   const act = s.results.find((r) => r.name === '需你处理')
   assert.equal(act.ok, true, '0 张需处理不是坏消息')
   assert.match(act.detail, /0 张/)
+  // V2/V3：真实的 0 不得渲染成"判不了"
+  for (const name of ['可派', '在跑']) {
+    const row = s.results.find((r) => r.name === name)
+    assert.equal(row.degraded, false, `${name} 为 0 不是判不了`)
+    assert.match(row.detail, /^pass · 0 张/)
+  }
 })

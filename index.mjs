@@ -876,8 +876,14 @@ export async function collectSuperagentStatus(file = SUPERAGENT_STATUS_FILE) {
   rows.push(netSignalRow('快照新鲜度', 'pass', `${doc.at ?? '—'}`))
   rows.push(netSignalRow('维护期', maint.blocksDispatch ? 'warn' : 'pass',
     `${maint.state ?? 'unknown'}${maint.blocksDispatch ? '（拦截派发）' : ''} · ${maint.reason ?? '—'}`))
-  rows.push(netSignalRow('可派', (counts.ready ?? 0) > 0 ? 'pass' : 'unknown', `${counts.ready ?? 0} 张`))
-  rows.push(netSignalRow('在跑', (counts.running ?? 0) > 0 ? 'pass' : 'unknown', `${counts.running ?? 0} 张`))
+  // 0 是**真实的零**，不是"判不了"：把空态写成 unknown 会让读者以为数据坏了（V2/V3）。
+  // 只有字段缺失（老快照/形状变了）才降级为 unknown 并点名。
+  const countRow = (label, value, emptyNote) => {
+    if (value == null) return netSignalRow(label, 'unknown', '快照里没有这个字段（形状可能变了）')
+    return netSignalRow(label, 'pass', value === 0 ? `0 张${emptyNote ? `（${emptyNote}）` : ''}` : `${value} 张`)
+  }
+  rows.push(countRow('可派', counts.ready, '没有待派卡'))
+  rows.push(countRow('在跑', counts.running, '没有在跑的会话'))
   // 需你处理 > 0 是**真信号**（不是故障）：停在 warn 而不是 fail —— 它要人出手，但系统没坏
   rows.push(netSignalRow('需你处理', (counts.actionable ?? 0) > 0 ? 'warn' : 'pass', `${counts.actionable ?? 0} 张`))
   rows.push(netSignalRow('历史遗留', (counts.stale ?? 0) > 0 ? 'warn' : 'pass', `${counts.stale ?? 0} 张（结束但无可核回报）`))
