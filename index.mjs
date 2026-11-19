@@ -3031,6 +3031,7 @@ function collectSchedulerSurfaces() {
         if (method === 'GET' && path === '/dashboards/net/summary') { sendJson(res, 200, await netSummary.get()); return }
         if (method === 'GET' && path === '/dashboards/gate/reasons') { sendJson(res, 200, await gateReasons.get()); return }
         if (method === 'GET' && path === '/dashboards/superagent') { sendJson(res, 200, await superagent.get()); return }
+        if (method === 'GET' && path === '/dashboards/scheduler') { sendJson(res, 200, await schedulerSurfaces.get()); return }
         if (method === 'GET' && path === '/dashboards/net/trend') { sendJson(res, 200, await netTrend.get()); return }
         if (method === 'GET' && path === '/dashboards/macos') { const s = await macos.get(); if (cfg.macos.enabled && !s.data) await macos.refresh(); sendJson(res, 200, s); return }
         if (method === 'GET' && path === '/dashboards/macos/history') {

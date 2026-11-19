@@ -5,6 +5,8 @@ export const NS = 'dashboard'
 
 export const zh = {
   'view.dashboard': '看板',
+  'nav.dashboard': '看板',
+  'seat.openDashboard': '看板（再点一次回到会话）',
   'refresh': '刷新',
   'updated': '更新于',
   'noData': '无数据',
@@ -104,6 +106,8 @@ export const zh = {
 
 export const en = {
   'view.dashboard': 'Dashboards',
+  'nav.dashboard': 'Dashboards',
+  'seat.openDashboard': 'Dashboard (click again to return to the conversation)',
   'refresh': 'Refresh',
   'updated': 'Updated',
   'noData': 'No data',

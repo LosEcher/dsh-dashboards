@@ -1,0 +1,34 @@
+/* The frame's seat lays out its controls, not this button: on the web the dock
+   stacks them in a 36px column, on macOS desktop they sit in the titleband row.
+   Metrics mirror ui-sidebar's own dock controls (28x28, 8px row rhythm) so the
+   added button does not read as a different control set. */
+.button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+
+.button:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
+}
+
+/* Pressed = 看板 is the selected main panel. A tinted fill reads as state
+   at 28px where an outline would fight the dock's own 1px border. */
+.button[aria-pressed='true'] {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
