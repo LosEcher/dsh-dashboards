@@ -10,7 +10,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildSchedulerSurfaces, ACTIVE_OVERDUE_MS, GOVERNANCE_STALE_MS } from '../lib/scheduler-surfaces.mjs'
+import { buildSchedulerSurfaces, fmtLocal, ACTIVE_OVERDUE_MS, GOVERNANCE_STALE_MS } from '../lib/scheduler-surfaces.mjs'
 
 const NOW = Date.parse('2026-11-19T21:00:00+08:00')
 const ok = (data) => ({ ok: true, data })
@@ -93,4 +93,51 @@ test('负控⑦：dsh-scheduler 有作业被关着 ⇒ 黄并点名', () => {
   const r = row(buildSchedulerSurfaces(i), 'dsh-scheduler')
   assert.equal(r.degraded, true)
   assert.match(r.detail, /关着 1 个：migrated/)
+})
+
+test('负控⑧：台账 ts 是 UTC，行里必须渲染成本地墙钟（不是 UTC 日期）', () => {
+  // 2026-11-18T23:43Z 在 +08 是 **11-19 07:43**。原实现 slice(0,10) 会显示 2026-11-18，
+  // 让人以为那是昨天下午的旧结论 —— 这正是本行要修的显示缺陷。
+  assert.equal(fmtLocal('2026-11-18T23:43:27Z', 480), '2026-11-19 07:43')
+  assert.equal(fmtLocal('2026-11-18T23:43:27Z', 0), '2026-11-18 23:43')
+  assert.equal(fmtLocal('not-a-date', 480), '')
+
+  const i = baseInputs()
+  i.verdicts = ok([{ ts: '2026-11-18T23:43:27Z', gate_rc: 1, routeguard_rc: 1, merged_rc: 1 }])
+  const r = row(buildSchedulerSurfaces(i), 'rust 门禁')
+  assert.match(r.detail, new RegExp(fmtLocal('2026-11-18T23:43:27Z')), '必须显示本地墙钟，而不是 UTC 日期')
+})
+
+test('负控⑨：门禁红但治理侧有未过期认损 ⇒ 黄 + 点名到期日（不是红，也不许绿）', () => {
+  const i = baseInputs()
+  i.verdicts = ok([{ ts: '2026-11-18T23:43:27Z', gate_rc: 1, routeguard_rc: 1, merged_rc: 1 }])
+  i.governance = ok({
+    asOf: new Date(NOW - 3600e3).toISOString(),
+    closedRate: 1,
+    counts: { newlyOpened: 0, newlyClosed: 0, overdue: 0, open: 0, accepted: 1, claimed: 0 },
+    acceptedItems: [{ id: 'rust-gate-merged-rc', source: 'daily-verdicts', expiresAt: '2026-12-19T23:59:59+08:00', acceptDaysLeft: 30 }],
+  })
+  const r = row(buildSchedulerSurfaces(i), 'rust 门禁')
+  assert.equal(r.ok, false, '认损不是绿')
+  assert.equal(r.degraded, true, '认损必须是黄，不能和「今天炸了」同一个红灯')
+  assert.match(r.detail, /已认损至 2026-12-19/)
+  assert.match(r.detail, /不是绿/)
+})
+
+test('负控⑩：认损过期 / 快照过期 / source 对不上 ⇒ 回落到红（不许拿旧认损挡住）', () => {
+  const mk = (governance) => {
+    const i = baseInputs()
+    i.verdicts = ok([{ ts: '2026-11-18T23:43:27Z', gate_rc: 1, routeguard_rc: 1, merged_rc: 1 }])
+    i.governance = governance
+    return row(buildSchedulerSurfaces(i), 'rust 门禁')
+  }
+  const counts = { newlyOpened: 0, newlyClosed: 0, overdue: 0, open: 0, accepted: 1, claimed: 0 }
+  const expired = mk(ok({ asOf: new Date(NOW - 3600e3).toISOString(), closedRate: 1, counts, acceptedItems: [{ id: 'x', source: 'daily-verdicts', expiresAt: '2026-11-01T00:00:00+08:00', acceptDaysLeft: -18 }] }))
+  assert.equal(expired.degraded, false, '认损过期必须回红')
+
+  const stale = mk(ok({ asOf: new Date(NOW - GOVERNANCE_STALE_MS - 3600e3).toISOString(), closedRate: 1, counts, acceptedItems: [{ id: 'x', source: 'daily-verdicts', expiresAt: '2026-12-19T23:59:59+08:00' }] }))
+  assert.equal(stale.degraded, false, '治理快照过期时认损不可信')
+
+  const otherSource = mk(ok({ asOf: new Date(NOW - 3600e3).toISOString(), closedRate: 1, counts, acceptedItems: [{ id: 'x', source: 'manual', expiresAt: '2026-12-19T23:59:59+08:00' }] }))
+  assert.equal(otherSource.degraded, false, '认损必须按 source 关联，不能张冠李戴')
 })
