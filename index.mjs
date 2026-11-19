@@ -35,6 +35,7 @@ import { parseLoadavg, parseVmStat, parseIostatCpu, parseDf, parseNetstatIb, par
 import { makePoller, startPoller, touchActivity, isIdle, sleep } from './lib/poller.mjs'
 import { plausibleTimestamp, publishNetSample, readJsonEnvelope, saveEnvelopeReplace, capList, capText, egressEnabled, egressInventory } from './lib/safety.mjs'
 import { degradeAuthChannels } from './lib/quota-degrade.mjs'
+import { buildSchedulerSurfaces } from './lib/scheduler-surfaces.mjs'
 import { GIB_BYTES, formatGiB, dfHumanToBytes, parseDiskProbe, deriveDisk, crossCheck, judgeDiskAlert, decideAlert, diskTrendFromFree, formatDiskAlert, parseLocalSnapshots } from './lib/disk.mjs'
 
 export const name = 'dsh-dashboards'
@@ -238,6 +239,7 @@ const ALLOWED_ENDPOINTS = new Set([
   '/dashboards/host-restart',
   '/dashboards/health',
   '/dashboards/superagent',
+  '/dashboards/scheduler',
 ])
 
 /** superagent 调度快照（dsfolder 的 superagent-status --snapshot 每轮原子写入）。 */
@@ -320,6 +322,9 @@ const DEFAULT_WIDGETS = [
   // 各自可跑，但"现在要不要我出手"原先散在四条命令里 —— 没人问就等于没有观测面。
   // 快照由 tick 每 30 分钟原子写入，本插件只读、只呈现，不做任何判定。
   { id: 'superagent', type: 'list', endpoint: '/dashboards/superagent', title: 'superagent 调度', refreshMs: 60000 },
+  // 调度面（2026-11-19）：四个地方各自在安排定时任务，彼此不知道对方存在。
+  // 这张卡把「谁在跑/谁坏了/谁有积压」压成 6 行；每行只读现成产物，读不到就显示判不了。
+  { id: 'scheduler-surfaces', type: 'list', endpoint: '/dashboards/scheduler', title: '调度面', refreshMs: 60000 },
 ]
 
 /** /dashboards/snapshot 单 widget 最坏等待（2026-09-01 per-widget deadline；
@@ -2105,7 +2110,7 @@ function round2(n) { return Math.round(n * 100) / 100 }
 // 2026-10-25：4 → 5，新增 net-summary / net-trend 两张内置卡（A 批）。
 // 2026-10-26：5 → 6，新增 host-restart（宿主重启卡）。
 // 同一个坑第三次提醒：store 存在即完全取代 DEFAULT_WIDGETS，不 bump ⇒ 对已有安装静默不可见。
-const DEFAULT_WIDGETS_VERSION = 9
+const DEFAULT_WIDGETS_VERSION = 10
 
 /**
  * Merge newly added built-in widgets into an existing store **at their declared
@@ -2697,6 +2702,63 @@ export function apply(ctx, config) {
     },
   }
   // endpoint → poller 映射（/dashboards/snapshot 聚合用）
+
+/**
+ * 「调度面」卡片采集器（2026-11-19）。
+ *
+ * 铁律：**每个源单独 try**，读不到就 `{ok:false}` ⇒ 卡片显示"判不了"，绝不当成 0/绿。
+ * 这里只读现成产物，不重算 backlog、不重跑门禁、不重算治理（判据各有唯一生产者）。
+ */
+function collectSchedulerSurfaces() {
+  const root = process.env.DASHBOARDS_SCHEDULER_ROOT || homedir()
+  const tryJson = (file) => {
+    try {
+      if (!existsSync(file)) return { ok: false, error: `缺文件 ${file}` }
+      return { ok: true, data: JSON.parse(readFileSync(file, 'utf8')) }
+    } catch (e) { return { ok: false, error: `解析失败 ${file}: ${e.message}` } }
+  }
+  const tryLines = (file) => {
+    try {
+      if (!existsSync(file)) return { ok: false, error: `缺文件 ${file}` }
+      const out = []
+      for (const line of readFileSync(file, 'utf8').split('\n')) {
+        if (!line.trim()) continue
+        try { out.push(JSON.parse(line)) } catch { /* 坏行只跳过该行；末行若坏会自然落到"判不了" */ }
+      }
+      return { ok: true, data: out }
+    } catch (e) { return { ok: false, error: `读取失败 ${file}: ${e.message}` } }
+  }
+  const dsfolder = process.env.DASHBOARDS_DSFOLDER || join(homedir(), 'syncfolder/project/dsfolder')
+  // 治理快照：取最新一份（governance-cases.mjs report --json --out 写）
+  let governance = { ok: false, error: '缺治理快照' }
+  try {
+    const govFile = join(root, '.dsh/governance/summary.json')
+    governance = tryJson(govFile)
+  } catch (e) { governance = { ok: false, error: String(e.message ?? e) } }
+  // 夜间提醒状态：取最新一份 nightly-pending-*.json
+  let nightlyPending = { ok: false, error: '缺 nightly-pending 状态' }
+  try {
+    const dir = join(root, '.dsh/scheduler-reports')
+    if (existsSync(dir)) {
+      const files = readdirSync(dir).filter((n) => /^nightly-pending-\d{8}\.json$/.test(n)).sort()
+      if (files.length) nightlyPending = tryJson(join(dir, files[files.length - 1]))
+      else nightlyPending = { ok: false, error: '目录里没有 nightly-pending-*.json' }
+    }
+  } catch (e) { nightlyPending = { ok: false, error: String(e.message ?? e) } }
+
+  return buildSchedulerSurfaces({
+    now: Date.now(),
+    jobs: tryJson(join(root, '.dsh/storages/dsh-scheduler/jobs.json')),
+    registry: tryJson(join(dsfolder, '.scheduler/registry.json')),
+    schedule: tryJson(join(root, '.dsh/storages/schedule.json')),
+    nightlyPending,
+    verdicts: tryLines(join(dsfolder, '.rust-los-gov/daily-verdicts.jsonl')),
+    governance,
+  })
+}
+
+  const schedulerSurfaces = makePoller({ id: 'scheduler-surfaces', collect: () => collectSchedulerSurfaces(), intervalMs: 60000, timeoutMs: 8000 })
+
   const pollerByEndpoint = {
     '/dashboards/los/usage': losUsage,
     '/dashboards/los/trends': losTrends,
@@ -2724,9 +2786,11 @@ export function apply(ctx, config) {
     '/dashboards/z4pro': z4pro,
     '/dashboards/host-restart': hostRestart,
     '/dashboards/health': healthPanel,
+    '/dashboards/scheduler': schedulerSurfaces,
   }
 
   const timers = [
+    startPoller(schedulerSurfaces, 60000),
     startPoller(losUsage, cfg.losPollMs),
     startPoller(losTrends, Math.max(cfg.losPollMs, 120000)),
     startPoller(losMetrics, Math.max(cfg.losPollMs, 120000)),
