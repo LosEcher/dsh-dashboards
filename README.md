@@ -1,6 +1,6 @@
 # dsh-dashboards
 
-DSH 看板插件：在会话区注册「看板」tab（`conversation.view`），widget 网格展示：
+DSH 看板插件：**应用级面板**（中心列 `main` 里的一块，侧栏有一行「看板」，侧栏折叠时贴着侧栏的 dock 按钮也能进），按 widget 配置展示：
 
 - **los 第一方**：LLM 用量/成本（`/usage/summary`）、provider 延迟趋势（`/metrics/trends`）、任务统计（`/metrics` Prometheus）、**执行节点矩阵**（`/nodes`，含 load/mem 快照与心跳）
 - **macOS 原生探针**（零安装）：loadavg / 内存（vm_stat，含可回收缓存口径）/ CPU（iostat）/ 磁盘（df）/ 网络速率（netstat 差分）/ 进程数，内存滚动 120 点短趋势
@@ -12,7 +12,28 @@ DSH 看板插件：在会话区注册「看板」tab（`conversation.view`），
 ## 架构
 
 - **host 半包**（`index.mjs`）：`ctx.webServer` 挂 `/dashboards/*` 同源聚合 API；每后端独立轮询缓存（single-flight）；los 双 token 解析链（Bearer 用量 + `x-los-operator-token` 节点，均不写明文，从环境/credentials/losEnvFile 读取）；widget 配置存 `~/.dsh/storages/dsh-dashboards/widgets.json`（PUT 校验 endpoint 白名单防注入）。
-- **client 半包**（`src/client/`）：注册 `conversation.view` tab（id=`dashboard`，order=90，locale NS `dashboard` zh/en），按 widget 配置渲染 stat/matrix/chart/list 卡片；样式只用 `--dsw-alias-*` 白名单令牌。
+- **client 半包**（`src/client/`）：注册三处座位 —— `main`（key=`dashboard`，面板本体）、`sidebar.panellist`（侧栏一行，order=5）、`shell.leading.actions`（侧栏折叠时的入口）；locale NS `dashboard` zh/en。样式只用 `--dsw-alias-*` 白名单令牌。
+
+## 布局契约（2026-11-19 改版）
+
+面板从 `conversation.view` 搬到 `main` 之后，**滚动由面板自己负责**：中心列 `.centerCol` 是
+「定高 + `overflow: hidden`」的 flex 列，只裁切不滚动（会话标签里能滚是因为会话壳自带滚动容器）。
+所以 `.root` 必须写 `height: 100%; min-height: 0; overflow-y: auto`，否则超出一屏的内容既看不见也
+滚不动，而且**不会报错**（实测：内容 2845px / 可见 900px，滚轮前后 `scrollTop` 恒 0）。
+
+信息结构（改这些等于改"人先看到什么"，所以都在 lib/ 里带 test）：
+
+| 层 | 实现 | 判据 |
+| --- | --- | --- |
+| 顶部状态条 | `lib/summary.mjs` 的 `buildStrip()`：宿主 / 服务 / 调度 / 磁盘 / 网络，各一个词 + 一个数 + 一个状态点 | 缺数据渲染 `—` + 灰点（V2：读不到 ≠ 是 0）；时长渲染成词（V1）；负时长夹到 0 |
+| 分段 | `lib/groups.mjs` 的 `groupWidgets()`：①现在有没有事 ②机队与网络 ③用量与花费 ④本机资源 ⑤跨项目与外部输入 | **新加内置卡必须在这里登记**；未登记的按类型兜底，绝不丢卡；段内保持 store 顺序 |
+| 段展开态 | 首屏只展开第一段，其余收起；展开集合存 localStorage `dsh-dashboards:open-groups:v1` | 刷新后保持；编辑模式强制全展开（否则收起的段里点不到 ✕） |
+| 长卡折叠 | 正文 > 240px 出「展开」，底部有渐隐遮罩表示"还有下文" | 展开是本次阅读的临时动作，不写回 store |
+| 宽表跨列 | `matrix` / `surge` / `usage` 卡在段宽 ≥700px 时占两列（容器查询） | 不支持容器查询时退化成单列，不会溢出 |
+
+为什么不用 CSS 多列（原实现）：多列是**竖着填满再换列**，配置里第 9 张卡可能出现在第 2 张卡
+左边；换成 grid 后阅读顺序是左上→右上→下一行。代价是行高按该行最高卡对齐，所以长卡必须折叠，
+否则一屏被 651/740px 的高卡撑出大片空白。
 
 ## API
 
@@ -192,4 +213,4 @@ DSH_SOURCE=/path/to/deepseek-harness node scripts/build.mjs   # client bundle（
 
 - 插件树：`include:dashboards` fiberPhase=active
 - `curl http://127.0.0.1:3080/dashboards/status`
-- 会话区切到「看板」tab 查看 widget 网格
+- 侧栏点「看板」（或折叠侧栏后点 dock 按钮）查看面板；滚轮能滚到底、长卡有「展开」、段标题能点开/收起

@@ -1,7 +1,22 @@
 /* dsh-dashboards — 看板 tab 样式。只使用 --dsw-alias-* 白名单令牌，随浅/深主题。 */
 
 .root {
-  padding: 4px 2px 24px;
+  /* 看板是 `main` 座位里的面板，必须**自己**建滚动容器：中心列 `.centerCol` 是
+     定高、`overflow: hidden` 的 flex 列（ui-layout 的 AppFrame.module.css），它只
+     负责裁切、不负责滚动；`main` 座位的 occupant 才是滚动者。
+     2026-11-19 实测（1440x900、25 张卡）：内容高 2781px、可见 900px，滚轮前后
+     document.scrollingElement.scrollTop 与所有后代 scrollTop 恒为 0 —— 后三分之
+     二的信息滚不动也够不到。这与 dsh-workspace-board `.root{height:100%;
+     overflow:auto}` 是同一形态（它在 main 座位里能滚，正是因为它自己声明了滚动）。 */
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* 底部留白让开 shell 的固定浮层（桌宠 336x58 钉在右下角、z-index 41）：
+     24px 不够，最后一张卡的下两行会被浮层永久盖住。
+     顶部不留 padding：吸顶 header 必须贴在滚动口上沿，否则 padding-top 那几像素
+     会漏出上一张卡的文字（实测 4px 就能看见「…lt-its」这种残行）。 */
+  padding: 0 2px 88px;
   /* 看板用满会话区宽度（列数由 column-width 自适应，宽屏更多列） */
   max-width: none;
 }
@@ -11,7 +26,14 @@
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
-  margin-bottom: 10px;
+  /* 滚到第二屏后刷新/编辑按钮不该消失：顶栏吸顶，底色取中心列自身的地色
+     （与 dsh-memory-evolve 的 sticky thead 同令牌用法）。 */
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 4px 0 6px;
+  margin-bottom: 4px;
+  background: var(--dsw-alias-bg-base);
 }
 
 .title {
@@ -40,12 +62,168 @@
   outline-offset: 1px;
 }
 
-/* 瀑布流：CSS 多列（column-width 自动列数）。原生 grid masonry 仅 Firefox
-   支持、Chrome/WebKit 未落地（2026），多列是唯一全浏览器纯 CSS 方案，
-   且对实时刷新友好（无 JS 重排、卡片高度变化不抖动）。 */
+/* 每段一个网格。为什么从 CSS 多列换掉（2026-11-19 实测）：多列是**竖着填满再
+   换列**，于是配置里第 9 张卡可能出现在第 2 张卡的左边，人改的顺序和看到的顺序
+   不是一回事；改成 grid 后阅读顺序是左上→右上→下一行。
+   行高按该行最高的卡对齐，所以卡片正文必须有折叠（CARD_BODY_MAX=320px），
+   否则 651/740px 的高卡会把整行撑出大片空白。 */
 .grid {
-  column-width: 320px;
-  column-gap: 10px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 10px;
+  align-items: start;
+  /* 给下面的 @container 用：只有"这一段"够宽时，宽表卡才跨两列 */
+  container-type: inline-size;
+}
+
+/* 宽表卡（matrix / surge）占两列：实测 353px 的卡要装 538/411px 的表，
+   原来只能横向切掉右侧几列。容器查询不支持的老浏览器里这条不生效，
+   退化成单列（仍是现在的样子），不会溢出。 */
+@container (min-width: 700px) {
+  .span2 {
+    grid-column: span 2;
+  }
+}
+
+/* ── 顶部状态条：5 个系统面各一格 ─────────────────────────────────── */
+.strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 2px 0 10px;
+}
+
+.fact {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.factLabel {
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.factValue {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--dsw-alias-label-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.factHint {
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* ── 分段标题（可点开/收起）────────────────────────────────────────── */
+.group {
+  margin-top: 2px;
+}
+
+.groupHead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  margin: 0 0 6px;
+  padding: 6px 2px;
+  border: none;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+  background: none;
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.groupHead:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.groupHead:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
+}
+
+.groupChevron {
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.groupTitle {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.groupCount {
+  font-size: 10px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.groupHint {
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* 折叠的卡要在底部"看得出来被截断"：不是把内容删了，而是还有下文。
+   渐变挂在不滚动的外层（bodyWrap），所以它固定在卡片下沿，不会随内层滚动跑掉。 */
+.bodyWrap {
+  position: relative;
+}
+
+.bodyFaded::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 28px;
+  background: linear-gradient(to bottom, transparent, var(--dsw-alias-bg-layer-1));
+  pointer-events: none;
+}
+
+/* 长卡折叠：只裁纵向（横向滚动是宽表格的既有能力，别一起关掉） */
+.cardBodyClamped {
+  max-height: 240px;
+  overflow-y: hidden;
+}
+
+.cardMore {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+.btnSmall {
+  padding: 1px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.btnSmall:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.btnSmall:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
 }
 
 .card {
@@ -56,9 +234,6 @@
   min-width: 0;
   /* 内容（宽表格）永不溢出到相邻卡片——重叠根因修复 */
   overflow: hidden;
-  /* 瀑布流：卡片不跨列拆断；列内垂直间距用 margin 替代 gap */
-  break-inside: avoid;
-  margin-bottom: 10px;
 }
 
 .cardHeader {
@@ -205,9 +380,14 @@
   white-space: nowrap;
 }
 
-/* 文本列（节点名+hostLabel 等）允许换行，避免 nowrap 撑爆卡片 */
+/* 文本列（节点名+hostLabel 等）允许换行，避免 nowrap 撑爆卡片。
+   `overflow-wrap: anywhere` 是关键：详情里常有 `2026-11-19T14:49:55.804Z`、
+   `merged_rc=1（gate=1 routeguard=1）` 这类不可断长 token，只写 `white-space:
+   normal` 时它们的 **min-content 宽度**仍把表格撑出卡片（实测 463 > 353，
+   详情列被切掉右半）。允许任意断点后表格才能缩回卡宽。 */
 .table td.wrap {
   white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .hostSub {

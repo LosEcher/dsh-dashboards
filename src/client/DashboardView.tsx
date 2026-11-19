@@ -5,18 +5,54 @@
  *
  * Theme-aware: only --dsw-alias-* design tokens (light/dark safe).
  */
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ConvViewProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { MarkdownText, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
 // 词表唯一实现在 host 侧 lib/format.mjs（V1：新鲜度渲染成词、未来时间夹到 0）。
 // 渲染层不再自建一份 —— 2026-10-28 实测两套实现已给出不同说法（`3m` vs `3 分钟前`）。
 import { ago as formatAgo } from '../../lib/format.mjs'
+// 分组与状态条都是纯函数（在 lib/ 里、有 test/ 咬住）：分组决定首屏看到什么，
+// 在 JSX 里手写一张 map 就只能靠肉眼维护。
+import { groupWidgets } from '../../lib/groups.mjs'
+import { buildStrip } from '../../lib/summary.mjs'
 import css from './DashboardView.module.css'
+
+/** 卡片正文超过这个高度就折叠（实测：执行节点 651px、节点信誉 740px）。
+ *  240 而不是更大：grid 的行高由该行最高的卡决定，卡越高，同排矮卡下面的
+ *  空洞越大（实测 320 时首屏有 150–180px 的空洞）；240 ≈ 6 行表格，够读概览。 */
+const CARD_BODY_MAX = 240
+/** 展开状态记在 localStorage：刷新/换面板后不该每次重新点一遍。 */
+const OPEN_GROUPS_KEY = 'dsh-dashboards:open-groups:v1'
+/** 宽表类型给两列宽（5 列表格塞进 340px 会横向被切，实测 353→538）。 */
+const WIDE_TYPES = new Set(['matrix', 'surge', 'usage'])
+
+function readOpenGroups(): string[] | null {
+  try {
+    const raw = window.localStorage.getItem(OPEN_GROUPS_KEY)
+    if (!raw) return null
+    const arr = JSON.parse(raw) as unknown
+    if (!Array.isArray(arr)) return null
+    return arr.filter((x): x is string => typeof x === 'string')
+  } catch {
+    return null
+  }
+}
+
+function writeOpenGroups(keys: string[]): void {
+  try {
+    window.localStorage.setItem(OPEN_GROUPS_KEY, JSON.stringify(keys))
+  } catch {
+    // 隐私模式禁用 localStorage 时只是不记忆，不影响看板本身
+  }
+}
 
 export interface WidgetConfig {
   id: string
+  // 与 host 侧 DEFAULT_WIDGETS 的 type 词表对齐（少一个成员，类型就名不副实；
+  // esbuild 不查类型，所以这行只能靠人维持——2026-11-19 补齐 quota/usage/reconcile）。
   type: 'stat' | 'matrix' | 'chart' | 'list' | 'feed' | 'surge' | 'packy' | 'tasks' | 'disk' | 'host'
+    | 'quota' | 'usage' | 'reconcile'
   endpoint: string
   title: string
   refreshMs: number
@@ -1070,7 +1106,7 @@ function ListCard({ data }: { data: unknown }) {
                 <span className={rowCls(r)}>{rowText(r)}</span>
               </td>
               <td className={css.num}>{typeof r.latencyMs === 'number' && r.latencyMs >= 0 ? `${r.latencyMs}ms` : '—'}</td>
-              <td className={css.muted}>{r.detail ?? '—'}</td>
+              <td className={`${css.muted} ${css.wrap}`}>{r.detail ?? '—'}</td>
             </tr>
           ))}
         </tbody>
@@ -1306,6 +1342,32 @@ function phaseLabel(phase: string): string {
   }
 }
 
+/**
+ * 顶部「一句话状态条」：5 个系统面各一个词 + 一个数 + 一个状态点。
+ *
+ * 它不是第二份真相：取数全部复用**同一份快照**里那 5 张卡的 data（lib/summary.mjs），
+ * 数没有就渲染 `—`（灰点），不会把"读不到"画成"是 0"。
+ */
+function SummaryStrip({ widgets, t }: { widgets: SnapshotWidget[]; t: (k: string) => string }) {
+  const dataById: Record<string, unknown> = {}
+  for (const w of widgets) dataById[w.id] = w.snap?.data
+  const facts = buildStrip(dataById)
+  return (
+    <div className={css.strip} role="list" aria-label={t('strip.label')}>
+      {facts.map((f) => (
+        <div key={f.key} className={css.fact} role="listitem" title={f.hint || undefined}>
+          <span className={css.factLabel}>{t(`strip.${f.key}`)}</span>
+          <span className={css.factValue}>
+            <StateDot state={f.state as StateDotState} size={8} />
+            {f.value}
+          </span>
+          {f.hint ? <span className={css.factHint}>{f.hint}</span> : null}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
   widget: WidgetConfig
   snap?: Snapshot
@@ -1316,8 +1378,19 @@ function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
 }) {
   const d = snap?.data as unknown
   const hasError = !!(snap?.error || (d as { error?: string } | null)?.error)
+  // 长卡折叠：正文实测高度超过阈值才出「展开」。展开态不写回 store——
+  // 它是本次阅读的临时动作，不是配置。
+  const bodyRef = useRef<HTMLDivElement | null>(null)
+  const [expanded, setExpanded] = useState(false)
+  const [tall, setTall] = useState(false)
+  useEffect(() => {
+    const el = bodyRef.current
+    if (!el || expanded) return
+    setTall(el.scrollHeight > CARD_BODY_MAX + 24)
+  }, [snap, widget.type, expanded])
+  const wide = WIDE_TYPES.has(widget.type)
   return (
-    <section className={`${css.card} ${removing ? css.cardRemoving : ''}`}>
+    <section className={`${css.card} ${wide ? css.span2 : ''} ${removing ? css.cardRemoving : ''}`}>
       <header className={css.cardHeader}>
         <p className={css.cardTitle}>{widget.title}</p>
         <span className={css.cardMeta}>
@@ -1335,7 +1408,8 @@ function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
           ) : null}
         </span>
       </header>
-      <div className={css.cardBody}>
+      <div className={`${css.bodyWrap} ${tall && !expanded ? css.bodyFaded : ''}`}>
+        <div ref={bodyRef} className={`${css.cardBody} ${tall && !expanded ? css.cardBodyClamped : ''}`}>
         {hasError ? (
           <p className={css.error}>⚠️ {snap?.error || (d as { error?: string }).error}</p>
         ) : widget.type === 'tasks' ? (
@@ -1367,7 +1441,15 @@ function WidgetCard({ widget, snap, t, editing, removing, onRemove }: {
         ) : (
           <p className={css.muted}>{t('noData')}</p>
         )}
+        </div>
       </div>
+      {tall ? (
+        <div className={css.cardMore}>
+          <button type="button" className={css.btnSmall} aria-expanded={expanded} onClick={() => setExpanded((v) => !v)}>
+            {expanded ? t('card.collapse') : t('card.expandAll')}
+          </button>
+        </div>
+      ) : null}
     </section>
   )
 }
@@ -1385,6 +1467,29 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
   const [reloadKey, setReloadKey] = useState(0)
   // 最近一次成功的数据（fetch 瞬时失败时保留旧数据渲染，不整页红字）
   const widgetsRef = useRef<SnapshotWidget[] | null>(null)
+
+  // ── 分组（段）+ 展开态：首屏只展开第一段，其余收起；展开集合记 localStorage ──
+  // 分组是纯函数（lib/groups.mjs，带 test/）：卡片 id → 段是契约，不是样式。
+  const grouped = useMemo(() => groupWidgets(widgets ?? []), [widgets])
+  const [openGroups, setOpenGroups] = useState<string[] | null>(() => readOpenGroups())
+  const openSet = useMemo(() => {
+    // null = 从没手动展/收过：只展开第一段（"现在有没有事"）
+    if (openGroups) return new Set(openGroups)
+    return new Set(grouped.length > 0 ? [grouped[0].key] : [])
+  }, [openGroups, grouped])
+  const toggleGroup = useCallback((key: string) => {
+    setOpenGroups((prev) => {
+      const base = prev ?? (grouped.length > 0 ? [grouped[0].key] : [])
+      const next = base.includes(key) ? base.filter((k) => k !== key) : [...base, key]
+      writeOpenGroups(next)
+      return next
+    })
+  }, [grouped])
+  const setAllGroups = useCallback((open: boolean) => {
+    const next = open ? grouped.map((g) => g.key) : []
+    setOpenGroups(next)
+    writeOpenGroups(next)
+  }, [grouped])
 
   // ── 编辑模式：widget 移除 + 探针目标增删（PUT /dashboards/widgets + /probe-targets） ──
   const [editing, setEditing] = useState(false)
@@ -1578,11 +1683,17 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
     }
   }, [reloadKey])
 
+  const allOpen = grouped.length > 0 && grouped.every((g) => openSet.has(g.key))
   return (
     <div className={css.root}>
       <header className={css.header}>
         <span className={css.title}>📊 {localeT('view.dashboard')}</span>
         <button className={css.btn} onClick={() => setReloadKey((k) => k + 1)} aria-label="刷新">↻</button>
+        {grouped.length > 1 ? (
+          <button className={css.btn} onClick={() => setAllGroups(!allOpen)} aria-label={allOpen ? localeT('group.collapseAll') : localeT('group.expandAll')}>
+            {allOpen ? localeT('group.collapseAll') : localeT('group.expandAll')}
+          </button>
+        ) : null}
         {editing ? (
           <>
             <button className={`${css.btn} ${css.btnPrimary}`} onClick={() => void saveAll()} disabled={saving}>
@@ -1630,19 +1741,43 @@ export function DashboardView(props: ConvViewProps): React.JSX.Element {
       {!configError && !widgets && <p className={css.muted}>{localeT('pending')}</p>}
       {widgets && widgets.length === 0 && <p className={css.muted}>{localeT('widgets.empty')}</p>}
       {widgets && widgets.length > 0 && (
-        <div className={css.grid}>
-          {widgets.map((w) => (
-            <WidgetCard
-              key={w.id}
-              widget={w}
-              snap={w.snap}
-              t={localeT}
-              editing={editing}
-              removing={removedIds.has(w.id)}
-              onRemove={() => toggleRemove(w.id)}
-            />
-          ))}
-        </div>
+        <>
+          <SummaryStrip widgets={widgets} t={localeT} />
+          {grouped.map((g) => {
+            // 编辑模式下强制展开：否则收起的段里那些卡根本点不到 ✕
+            const open = editing || openSet.has(g.key)
+            return (
+              <section key={g.key} className={css.group}>
+                <button
+                  type="button"
+                  className={css.groupHead}
+                  aria-expanded={open}
+                  onClick={() => toggleGroup(g.key)}
+                >
+                  <span className={css.groupChevron} aria-hidden="true">{open ? '▾' : '▸'}</span>
+                  <span className={css.groupTitle}>{localeT(`group.${g.key}`)}</span>
+                  <span className={css.groupCount}>{g.items.length}</span>
+                  <span className={css.groupHint}>{localeT(`groupHint.${g.key}`)}</span>
+                </button>
+                {open ? (
+                  <div className={css.grid}>
+                    {g.items.map((w) => (
+                      <WidgetCard
+                        key={w.id}
+                        widget={w}
+                        snap={w.snap}
+                        t={localeT}
+                        editing={editing}
+                        removing={removedIds.has(w.id)}
+                        onRemove={() => toggleRemove(w.id)}
+                      />
+                    ))}
+                  </div>
+                ) : null}
+              </section>
+            )
+          })}
+        </>
       )}
     </div>
   )
